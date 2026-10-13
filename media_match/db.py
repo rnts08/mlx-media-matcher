@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS files (
     phash TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     keywords TEXT NOT NULL DEFAULT '',
+    embedding BLOB,
     scanned_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
@@ -57,8 +58,14 @@ class Database:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         self._fts_available = self._setup_fts()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
+        if "embedding" not in columns:
+            self.conn.execute("ALTER TABLE files ADD COLUMN embedding BLOB")
 
     def _setup_fts(self) -> bool:
         try:
@@ -143,6 +150,33 @@ class Database:
 
     def count_files(self) -> int:
         return self.conn.execute("SELECT COUNT(*) AS n FROM files").fetchone()["n"]
+
+    # -- CLIP embeddings ------------------------------------------------------
+
+    def files_missing_embedding(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, path FROM files WHERE embedding IS NULL ORDER BY path"
+        ).fetchall()
+
+    def set_embeddings(self, vectors: list[tuple[int, bytes]]) -> None:
+        self.conn.executemany(
+            "UPDATE files SET embedding = ? WHERE id = ?",
+            [(blob, fid) for fid, blob in vectors],
+        )
+        self.conn.commit()
+
+    def all_embeddings(self) -> tuple[list[int], list[bytes]]:
+        """(file ids, raw float32 embedding blobs) for indexed files that have one."""
+        rows = self.conn.execute(
+            "SELECT id, embedding FROM files WHERE embedding IS NOT NULL ORDER BY id"
+        ).fetchall()
+        return [r["id"] for r in rows], [r["embedding"] for r in rows]
+
+    def embedding_for_path(self, path: str) -> bytes | None:
+        row = self.conn.execute(
+            "SELECT embedding FROM files WHERE path = ?", (path,)
+        ).fetchone()
+        return row["embedding"] if row else None
 
     # -- search -------------------------------------------------------------
 
