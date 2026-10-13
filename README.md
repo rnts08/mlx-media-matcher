@@ -48,6 +48,13 @@ Notes:
 ## Phase 2
 The same as above, but on video files. 
 
+## Spike: CLIP (branch `spike/clip`)
+
+An alternative/complementary CLIP-embedding engine (pure MLX, ~490 img/s):
+`media-match embed`, `media-match search --clip "..."`,
+`media-match similar IMAGE`. See `docs/clip-spike.md` for the comparison
+against the generative-VLM approach and the recommended hybrid.
+
 ## Goal
 The goal is to group images of different people and objects together and to be able to find the best version of an image that might be duplicated in the tree the program is working on. 
 

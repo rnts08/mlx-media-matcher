@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=2.0",
     "pillow>=10.0",
     "pillow-heif>=0.16",
+    "regex>=2024.0",
 ]
 
 [project.scripts]
