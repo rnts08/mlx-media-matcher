@@ -59,7 +59,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = Database(db_path_for(root, args.db))
     db.set_meta("root", root)
-    db.set_meta("model", args.model)
+    db.set_meta("clip_model", args.clip_model)
+    if args.describe:
+        db.set_meta("vlm_model", args.model)
 
     paths = _iter_images(root)
     if args.limit:
@@ -84,44 +86,90 @@ def cmd_scan(args: argparse.Namespace) -> int:
     skipped = len(paths) - len(to_process)
     print(f"{len(paths)} images found, {skipped} up to date, {len(to_process)} to analyze")
 
-    describer = None
-    if not args.no_describe:
-        from .vision import Describer
+    # Phase A: content hash + perceptual hash + CLIP embedding
+    from .clip import ClipEncoder
+    from .clip_processor import process_image
 
-        describer = Describer(model_id=args.model)
-
+    encoder = ClipEncoder(model_id=args.clip_model, batch_size=args.batch)
     errors = 0
-    for n, path in enumerate(to_process, 1):
+    analyzed = 0
+    prepared: list[tuple] = []
+    for path in to_process:
         try:
             stat = os.stat(path)
+            existing = db.get_file(path)
+            # keep captions of unchanged files (e.g. --reanalyze); drop stale ones
+            unchanged = (
+                existing is not None
+                and existing["size"] == stat.st_size
+                and abs(existing["mtime"] - stat.st_mtime) < 1e-6
+            )
             with Image.open(path) as img:
                 width, height = img.size
                 digest_phash = hash_to_hex(phash(img))
-            description, keywords = "", []
-            if describer:
-                print(f"[{n}/{len(to_process)}] describing {os.path.relpath(path, root)}",
-                      file=sys.stderr)
-                description, keywords = describer.describe(path)
-            else:
-                print(f"[{n}/{len(to_process)}] hashing {os.path.relpath(path, root)}",
-                      file=sys.stderr)
-            db.upsert_file(
-                path=path,
-                size=stat.st_size,
-                mtime=stat.st_mtime,
-                sha1=_sha1_of(path),
-                width=width,
-                height=height,
-                phash=digest_phash,
-                description=description,
-                keywords=", ".join(keywords),
-            )
+                processed = process_image(img.convert("RGB"))
+            prepared.append((
+                path, stat.st_size, stat.st_mtime, _sha1_of(path), width, height,
+                digest_phash, processed,
+                existing["description"] if unchanged else "",
+                existing["keywords"] if unchanged else "",
+            ))
         except Exception as exc:  # noqa: BLE001 - keep scanning past bad files
             errors += 1
             print(f"  ERROR {path}: {exc}", file=sys.stderr)
 
-    print(f"Done: analyzed {len(to_process) - errors}, errors {errors}, "
-          f"index has {db.count_files()} files ({db.path})")
+    for start in range(0, len(prepared), args.batch):
+        chunk = prepared[start : start + args.batch]
+        try:
+            vectors = encoder.embed_images([item[7] for item in chunk])
+        except Exception as exc:  # noqa: BLE001
+            errors += len(chunk)
+            print(f"  ERROR embedding batch: {exc}", file=sys.stderr)
+            continue
+        for item, vector in zip(chunk, vectors):
+            db.upsert_file(
+                path=item[0], size=item[1], mtime=item[2], sha1=item[3],
+                width=item[4], height=item[5], phash=item[6],
+                description=item[8], keywords=item[9],
+                embedding=vector.tobytes(),
+            )
+            analyzed += 1
+    encoder.unload()
+
+    # Phase B: optional VLM captions, best version of each duplicate group only
+    if args.describe:
+        records = db.all_files()
+        group_best: dict[int, int] = {}
+        for group in find_duplicate_groups(records):
+            for member in [group.best] + [rec for rec, _ in group.others]:
+                group_best[member.id] = group.best.id
+        pending = [r for r in records if not r.description]
+        to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
+        shadowed = len(pending) - len(to_describe)
+        if shadowed:
+            print(f"{shadowed} undescribed duplicate(s) skipped; "
+                  f"their best-resolution version is described instead")
+
+        if to_describe:
+            from .vision import Describer
+
+            describer = Describer(model_id=args.model)
+            for n, record in enumerate(to_describe, 1):
+                print(f"[{n}/{len(to_describe)}] describing "
+                      f"{os.path.relpath(record.path, root)}", file=sys.stderr)
+                try:
+                    description, keywords = describer.describe(record.path)
+                    db.set_description(record.id, description, ", ".join(keywords))
+                except Exception as exc:  # noqa: BLE001
+                    errors += 1
+                    print(f"  ERROR {record.path}: {exc}", file=sys.stderr)
+            describer.unload()
+
+    described = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE description != ''"
+    ).fetchone()["n"]
+    print(f"Done: analyzed {analyzed}, errors {errors}. Index: "
+          f"{db.count_files()} files, {described} described ({db.path})")
     db.close()
     return 0
 
@@ -136,7 +184,18 @@ def cmd_search(args: argparse.Namespace) -> int:
         terms.extend(args.object.split())
     terms.extend(args.query)
 
-    if args.clip:
+    if args.clip and args.fts:
+        print("use either --clip or --fts, not both")
+        db.close()
+        return 2
+
+    use_clip = args.clip
+    if not use_clip and not args.fts:
+        # default to CLIP when embeddings are available, keywords otherwise
+        _, blobs = db.all_embeddings()
+        use_clip = bool(blobs)
+
+    if use_clip:
         return _clip_search(db, " ".join(terms), args.limit)
 
     records = db.search(terms, limit=args.limit)
@@ -358,8 +417,12 @@ def cmd_stats(args: argparse.Namespace) -> int:
     ).fetchone()["n"]
     print(f"index:  {db.path}")
     print(f"root:   {db.get_meta('root', root)}")
-    print(f"model:  {db.get_meta('model', '(not set)')}")
-    print(f"files:  {total} ({described} described)")
+    print(f"clip:   {db.get_meta('clip_model', '(not set)')}")
+    print(f"vlm:    {db.get_meta('vlm_model', '(not used)')}")
+    embedded = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE embedding IS NOT NULL"
+    ).fetchone()["n"]
+    print(f"files:  {total} ({described} described, {embedded} embedded)")
     db.close()
     return 0
 
@@ -383,11 +446,15 @@ def main(argv: list[str] | None = None) -> int:
 
     p_scan = sub.add_parser("scan", help="analyze new/changed images in a folder")
     _add_common(p_scan)
+    p_scan.add_argument("--describe", action="store_true",
+                        help="also caption images with the vision model "
+                             "(best version of each duplicate group only)")
     p_scan.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"MLX vision model (default: {DEFAULT_MODEL})")
+                        help=f"MLX vision model for --describe (default: {DEFAULT_MODEL})")
+    p_scan.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
+                        help=f"CLIP model for embeddings (default: {DEFAULT_CLIP_MODEL})")
+    p_scan.add_argument("--batch", type=int, default=16, help="CLIP batch size")
     p_scan.add_argument("--limit", type=int, help="only scan first N images")
-    p_scan.add_argument("--no-describe", action="store_true",
-                        help="skip the vision model; only hash (no search)")
     p_scan.add_argument("--reanalyze", action="store_true",
                         help="re-analyze files even if unchanged")
     p_scan.set_defaults(func=cmd_scan)
@@ -398,7 +465,9 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--person", help="terms describing a person, e.g. 'woman red jacket'")
     p_search.add_argument("--object", help="terms describing an object, e.g. 'bicycle'")
     p_search.add_argument("--clip", action="store_true",
-                          help="CLIP embedding search instead of keyword/FTS search")
+                          help="force CLIP embedding search (default when embeddings exist)")
+    p_search.add_argument("--fts", action="store_true",
+                          help="force keyword/full-text search over captions")
     p_search.add_argument("--limit", type=int, default=50)
     p_search.set_defaults(func=cmd_search)
 

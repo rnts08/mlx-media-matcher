@@ -111,21 +111,24 @@ class Database:
         phash: str,
         description: str,
         keywords: str,
+        embedding: bytes | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO files(path, size, mtime, sha1, width, height, phash,
-                              description, keywords)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              description, keywords, embedding)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 size = excluded.size, mtime = excluded.mtime,
                 sha1 = excluded.sha1, width = excluded.width,
                 height = excluded.height, phash = excluded.phash,
                 description = excluded.description,
                 keywords = excluded.keywords,
+                embedding = excluded.embedding,
                 scanned_at = datetime('now')
             """,
-            (path, size, mtime, sha1, width, height, phash, description, keywords),
+            (path, size, mtime, sha1, width, height, phash, description,
+             keywords, embedding),
         )
         if self._fts_available:
             row = self.conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
@@ -152,6 +155,19 @@ class Database:
         return self.conn.execute("SELECT COUNT(*) AS n FROM files").fetchone()["n"]
 
     # -- CLIP embeddings ------------------------------------------------------
+
+    def set_description(self, file_id: int, description: str, keywords: str) -> None:
+        self.conn.execute(
+            "UPDATE files SET description = ?, keywords = ? WHERE id = ?",
+            (description, keywords, file_id),
+        )
+        if self._fts_available:
+            self.conn.execute("DELETE FROM files_fts WHERE rowid = ?", (file_id,))
+            self.conn.execute(
+                "INSERT INTO files_fts(rowid, description, keywords) VALUES(?, ?, ?)",
+                (file_id, description, keywords),
+            )
+        self.conn.commit()
 
     def files_missing_embedding(self) -> list[sqlite3.Row]:
         return self.conn.execute(

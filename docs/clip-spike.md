@@ -1,4 +1,9 @@
-# CLIP spike (branch `spike/clip`)
+# CLIP spike (branch `spike/clip` — merged into `main`)
+
+> Status: merged. `scan` now produces CLIP embeddings by default and VLM
+> captions are opt-in via `--describe` (best version of each duplicate group
+> only); `search` defaults to CLIP when embeddings exist, `--fts` forces
+> keyword search. This document records the investigation that led there.
 
 Question: how would Phase 1 (find a person, find an object, group duplicates
 across resolution) work with CLIP instead of a generative vision model?
