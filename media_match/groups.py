@@ -5,11 +5,17 @@ near-identical (pHash hamming distance <= threshold). pHash is resolution
 independent, so thumbnails group with their full-resolution originals. Within
 a group, the largest image (by pixel count) is the "best version" (primary);
 everything else is a duplicate/variant.
+
+`find_similarity_groups` groups more loosely via CLIP embedding cosine
+similarity: it also links different photos of the same subject, not only
+re-encodes of the same photo.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+import numpy as np
 
 from .db import FileRecord
 from .hashing import hamming_pairs, hex_to_hash
@@ -83,6 +89,56 @@ def find_duplicate_groups(
         ]
         others.sort(key=lambda t: -_megapixels(t[0]))
         groups.append(DuplicateGroup(best=records[best_idx], others=others))
+
+    groups.sort(key=lambda g: -g.size)
+    return groups
+
+
+@dataclass
+class SimilarGroup:
+    best: FileRecord
+    others: list[tuple[FileRecord, float]] = field(default_factory=list)
+
+    @property
+    def size(self) -> int:
+        return len(self.others) + 1
+
+
+def find_similarity_groups(
+    records: list[FileRecord], embeddings: np.ndarray, threshold: float = 0.85
+) -> list[SimilarGroup]:
+    """Group files whose CLIP embeddings are cosine-similar >= threshold."""
+    n = len(records)
+    if n < 2:
+        return []
+    uf = _UnionFind(n)
+    chunk = max(1, min(n, 4096 * 1024 // max(n, 1) or 1))
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        sims = embeddings[start:stop] @ embeddings.T
+        rows, cols = np.nonzero(sims >= threshold)
+        for r, c in zip(rows, cols):
+            i, j = start + int(r), int(c)
+            if i < j:
+                uf.union(i, j)
+
+    clusters: dict[int, list[int]] = {}
+    for i in range(n):
+        clusters.setdefault(uf.find(i), []).append(i)
+
+    groups: list[SimilarGroup] = []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        best_idx = max(members, key=lambda i: (_megapixels(records[i]), records[i].size))
+        best_vec = embeddings[best_idx]
+        others = [
+            (records[i], float(embeddings[i] @ best_vec))
+            for i in members
+            if i != best_idx
+        ]
+        others.sort(key=lambda t: -_megapixels(t[0]))
+        groups.append(SimilarGroup(best=records[best_idx], others=others))
 
     groups.sort(key=lambda g: -g.size)
     return groups

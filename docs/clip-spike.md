@@ -3,7 +3,9 @@
 > Status: merged. `scan` now produces CLIP embeddings by default and VLM
 > captions are opt-in via `--describe` (best version of each duplicate group
 > only); `search` defaults to CLIP when embeddings exist, `--fts` forces
-> keyword search. This document records the investigation that led there.
+> keyword search, and `similar` groups a tree by embedding similarity (or
+> takes `--image` for a single-image query). This document records the
+> investigation that led there.
 
 Question: how would Phase 1 (find a person, find an object, group duplicates
 across resolution) work with CLIP instead of a generative vision model?

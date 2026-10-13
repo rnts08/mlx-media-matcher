@@ -243,3 +243,16 @@ def db_path_for(root: str, override: str | None = None) -> str:
     if override:
         return override
     return os.path.join(os.path.abspath(root), DEFAULT_DB_NAME)
+
+
+def open_db(root: str, override: str | None = None, create: bool = True) -> "Database | None":
+    """Open the index for a media tree.
+
+    Read-only commands should pass create=False: an absent index then yields
+    None (so the caller can print "run scan first") instead of silently
+    creating an empty database in the wrong place.
+    """
+    path = db_path_for(root, override)
+    if not create and not os.path.exists(path):
+        return None
+    return Database(path)

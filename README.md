@@ -26,8 +26,11 @@ python3 -m venv .venv
 .venv/bin/media-match search ~/Pictures --object bicycle
 .venv/bin/media-match search ~/Pictures "birthday cake" --fts
 
-# 3. find images visually similar to a given image (indexed or standalone)
-.venv/bin/media-match similar ~/Pictures/some-photo.jpg ~/Pictures
+# 3. semantic near-duplicate groups across the tree (CLIP cosine similarity;
+#    also links different photos of the same subject, unlike `duplicates`)
+.venv/bin/media-match similar ~/Pictures
+# ...or nearest neighbors of one image (indexed, or any standalone file)
+.venv/bin/media-match similar ~/Pictures --image /tmp/some-photo.jpg
 
 # 4. list duplicate groups; the best-resolution version is marked with *
 .venv/bin/media-match duplicates ~/Pictures

@@ -8,8 +8,8 @@ import json
 import os
 import sys
 
-from .db import Database, FileRecord, db_path_for
-from .groups import find_duplicate_groups
+from .db import Database, FileRecord, db_path_for, open_db
+from .groups import find_duplicate_groups, find_similarity_groups
 from .hashing import hash_to_hex, phash
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
@@ -176,7 +176,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
-    db = Database(db_path_for(root, args.db))
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
     terms: list[str] = []
     if args.person:
         terms.extend(args.person.split())
@@ -249,7 +253,11 @@ def cmd_embed(args: argparse.Namespace) -> int:
     import time
 
     root = os.path.abspath(args.root)
-    db = Database(db_path_for(root, args.db))
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
 
     if args.recompute:
         rows = db.conn.execute("SELECT id, path FROM files ORDER BY path").fetchall()
@@ -309,51 +317,81 @@ def cmd_similar(args: argparse.Namespace) -> int:
 
     _register_heif()
     root = os.path.abspath(args.root)
-    db = Database(db_path_for(root, args.db))
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — run 'media-match scan {root}' first.")
+        return 1
     ids, matrix = _load_embedding_matrix(db)
     if matrix is None:
-        print("No CLIP embeddings yet. Run 'media-match embed' first.")
+        print("No CLIP embeddings in the index. Run 'media-match embed' first.")
         db.close()
         return 1
 
-    from .clip import ClipEncoder
+    id_to_record = {r.id: r for r in db.all_files()}
 
-    target = os.path.abspath(args.image)
-    stored = db.embedding_for_path(target)
-    if stored is not None:
-        query = np.frombuffer(stored, dtype=np.float32)
-        source = "indexed embedding"
-    else:
-        query = ClipEncoder().embed_image_paths([target])[0]
-        source = "computed on the fly"
-    sims = matrix @ query
+    if args.image:
+        from .clip import ClipEncoder
 
-    target_row = db.conn.execute(
-        "SELECT id FROM files WHERE path = ?", (target,)
-    ).fetchone()
-    exclude_id = target_row["id"] if target_row else None
+        target = os.path.abspath(args.image)
+        stored = db.embedding_for_path(target)
+        if stored is not None:
+            query = np.frombuffer(stored, dtype=np.float32)
+            source = "indexed embedding"
+        else:
+            _register_heif()
+            query = ClipEncoder().embed_image_paths([target])[0]
+            source = "computed on the fly"
+        sims = matrix @ query
 
-    order = np.argsort(-sims)
-    shown = 0
-    print(f"Images similar to {target} ({source}):")
-    for idx in order:
-        row = db.conn.execute(
-            "SELECT * FROM files WHERE id = ?", (ids[idx],)
+        exclude_row = db.conn.execute(
+            "SELECT id FROM files WHERE path = ?", (target,)
         ).fetchone()
-        if row["id"] == exclude_id:
-            continue
-        print(f"  {sims[idx]:.3f}  {row['path']}  "
-              f"({row['width']}x{row['height']}, {_mp(row['width'], row['height'])})")
-        shown += 1
-        if shown >= args.limit:
-            break
+        exclude_id = exclude_row["id"] if exclude_row else None
+
+        order = np.argsort(-sims)
+        shown = 0
+        print(f"Images similar to {target} ({source}):")
+        for idx in order:
+            record = id_to_record[ids[idx]]
+            if record.id == exclude_id:
+                continue
+            print(f"  {sims[idx]:.3f}  {record.path}  "
+                  f"({record.width}x{record.height}, {_mp(record.width, record.height)})")
+            shown += 1
+            if shown >= args.limit:
+                break
+        db.close()
+        return 0
+
+    records = [id_to_record[i] for i in ids]
+    groups = find_similarity_groups(records, matrix, threshold=args.threshold)
+    if not groups:
+        print(f"No semantic duplicate groups at cosine threshold {args.threshold}.")
+        db.close()
+        return 0
+
+    total = sum(g.size for g in groups)
+    print(f"{len(groups)} semantic group(s), {total} files "
+          f"(cosine >= {args.threshold}; best version marked with *)\n")
+    for n, group in enumerate(groups, 1):
+        b = group.best
+        print(f"Group {n} ({group.size} files)")
+        print(f"  * {b.path}  ({b.width}x{b.height}, {_mp(b.width, b.height)}) [best]")
+        for record, sim in group.others:
+            print(f"    {record.path}  ({record.width}x{record.height}, "
+                  f"{_mp(record.width, record.height)}) similarity={sim:.3f}")
+        print()
     db.close()
     return 0
 
 
 def cmd_duplicates(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
-    db = Database(db_path_for(root, args.db))
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
     groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
     if not groups:
         print("No duplicate groups found.")
@@ -395,7 +433,11 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
 
 def cmd_tags(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
-    db = Database(db_path_for(root, args.db))
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
     counts = db.keyword_counts(limit=args.limit)
     if not counts:
         print("No keywords indexed yet. Run 'scan' first.")
@@ -410,7 +452,11 @@ def cmd_tags(args: argparse.Namespace) -> int:
 
 def cmd_stats(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
-    db = Database(db_path_for(root, args.db))
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
     total = db.count_files()
     described = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
@@ -480,12 +526,18 @@ def main(argv: list[str] | None = None) -> int:
                          help="recompute embeddings even if present")
     p_embed.set_defaults(func=cmd_embed)
 
-    p_sim = sub.add_parser("similar", help="find images visually similar to a given image")
-    p_sim.add_argument("image", help="image file to compare against the index")
-    p_sim.add_argument("root", nargs="?", default=".",
-                       help="media tree index to search (default: current directory)")
-    p_sim.add_argument("--db", help="index database path (default: <root>/.media-match.db)")
-    p_sim.add_argument("--limit", type=int, default=10)
+    p_sim = sub.add_parser(
+        "similar",
+        help="group the tree by CLIP similarity, or find neighbors of one image",
+    )
+    _add_common(p_sim)
+    p_sim.add_argument("--image",
+                       help="compare a single image against the index instead "
+                            "of grouping the whole tree")
+    p_sim.add_argument("--threshold", type=float, default=0.85,
+                       help="min cosine similarity for tree grouping (default: 0.85)")
+    p_sim.add_argument("--limit", type=int, default=10,
+                       help="max neighbors to show with --image")
     p_sim.set_defaults(func=cmd_similar)
 
     p_dup = sub.add_parser("duplicates", help="group duplicates; best resolution wins")
