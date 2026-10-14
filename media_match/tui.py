@@ -14,7 +14,12 @@ group. Keys:
     p                     open the file under the bar in Preview.app
     x                     move the file under the bar to the Trash (y/n)
     enter                 execute: trash every unkept file of every group (y/n)
-    y / n                 answer the prompt shown at the bottom (x/enter/quit)
+    e                     execute the decisions made so far: trash the unkept
+                          files of every group from the first up to and
+                          including the group under the bar (y/n), then stay
+                          in the review so the remaining groups can continue
+    y / n                 answer the prompt shown at the bottom
+                          (x/enter/e/quit)
     q / esc               quit without executing — but asks y/N first whenever
                           files are still marked for the Trash
 
@@ -23,7 +28,9 @@ the bottom; only the group list scrolls. The algorithm's best-resolution file
 of each group starts selected. Selected files survive `enter`; everything else
 goes to the OS Trash (never unlinked). Groups marked as kept with `a` / `A`
 (or whose keeper was deselected, or whose keeper was trashed with x) are left
-untouched; `space` on a file reactivates its group.
+untouched; `space` on a file reactivates its group. `e` commits the work done
+so far (useful when quitting halfway through a long list): the already-made
+decisions are executed, their groups become "done", and the review continues.
 
 `CleanSession` is a pure state machine (keys in, state out) so it can be
 unit-tested without a terminal; `run_tui` drives it in a real terminal.
@@ -61,6 +68,7 @@ def _default_trasher(record: FileRecord) -> None:
 class GroupState:
     files: list[FileRecord]
     keeper_id: int | None
+    done: bool = False  # its decisions were already executed (key e / enter)
 
     @property
     def size(self) -> int:
@@ -92,6 +100,7 @@ class CleanSession:
         ]
         self.cursor = 0
         self.confirm: tuple[str, list[FileRecord]] | None = None
+        self.confirm_gi: int | None = None  # group cutoff for the `e` confirm
         self.done = False
         self.x_trashed: list[FileRecord] = []
         self.batch_trashed: list[FileRecord] = []
@@ -180,11 +189,13 @@ class CleanSession:
         label = "Preview" if app == "preview" else "Quick Look"
         self.status = f"Opened {os.path.basename(record.path)} in {label}."
 
-    def pending_trash(self) -> list[FileRecord]:
+    def pending_trash(
+        self, groups: list[GroupState] | None = None
+    ) -> list[FileRecord]:
         return [
             record
-            for group in self.groups
-            if group.keeper_id is not None  # deselected groups are left untouched
+            for group in (self.groups if groups is None else groups)
+            if group.keeper_id is not None  # deselected groups are untouched
             for record in group.files
             if record.id != group.keeper_id
         ]
@@ -230,6 +241,59 @@ class CleanSession:
             self.db.delete_files([r.id for r in self.batch_trashed])
         self.done = True
 
+    def _execute_to_cursor(self, gi: int, pending: list[FileRecord]) -> None:
+        """Execute the decisions of groups[0..gi] and keep reviewing.
+
+        Used by the `e` key: commit the work done so far (e.g. before
+        quitting halfway through a long list) without ending the session.
+        """
+        trashed = 0
+        size = 0
+        before = self.flat_files()
+        anchor = before[self.cursor].id if before else None
+        for record in pending:
+            try:
+                self.trasher(record)
+            except Exception as exc:  # noqa: BLE001
+                self.errors.append(f"{record.path}: {exc}")
+                continue
+            self.batch_trashed.append(record)
+            self._forget(record)
+            trashed += 1
+            size += record.size  # file is already in the Trash; use index size
+        if self.db is not None and trashed:
+            self.db.delete_files([r.id for r in self.batch_trashed[-trashed:]])
+        for group in self.groups[: gi + 1]:
+            # only groups with nothing pending left are actually completed
+            group.done = not self.pending_trash([group])
+        # re-anchor the bar: it stays on its file if that file survived;
+        # otherwise (it was one of the trashed copies) jump to the first
+        # group still waiting for a decision, so the review continues
+        flat = self.flat_files()
+        if flat:
+            survivors = [r.id for r in flat]
+            if anchor in survivors:
+                self.cursor = survivors.index(anchor)
+            else:
+                first_open = next(
+                    (i for i, g in enumerate(self.groups) if not g.done), None
+                )
+                target = (
+                    first_open
+                    if first_open is not None
+                    else len(self.groups) - 1
+                )
+                self.cursor = min(
+                    self._flat_group_ranges()[target][0], len(flat) - 1
+                )
+        failed = len(pending) - trashed
+        note = f" ({failed} failed)" if failed else ""
+        remaining = sum(1 for g in self.groups if self.pending_trash([g]))
+        self.status = (
+            f"Trashed {trashed} file(s) ({human_size(size)}){note} from the "
+            f"first {gi + 1} group(s); {remaining} group(s) still marked."
+        )
+
     def handle(self, key: str) -> None:
         if self.confirm:
             kind, payload = self.confirm
@@ -239,12 +303,14 @@ class CleanSession:
                     self._trash_now(payload[0])
                 elif kind == "quit":
                     self.done = True
+                elif kind == "partial":
+                    self._execute_to_cursor(self.confirm_gi or 0, payload)
                 else:
                     self._execute(payload)
             elif kind == "quit":
                 self.status = (
                     f"Not exiting — {len(payload)} file(s) still marked for "
-                    "the Trash. enter executes, q quits."
+                    "the Trash. e = to the bar, enter = all, q = quit."
                 )
             else:
                 self.status = "Cancelled; nothing changed."
@@ -280,6 +346,17 @@ class CleanSession:
                 self.status = "Nothing to trash — every file is kept."
             else:
                 self.confirm = ("execute", pending)
+        elif key == "e":
+            gi = self.group_of_flat(self.cursor) if files else -1
+            pending = self.pending_trash(self.groups[: gi + 1])
+            if gi < 0 or not pending:
+                self.status = (
+                    "Nothing pending in the groups up to the bar — "
+                    "nothing to execute."
+                )
+            else:
+                self.confirm_gi = gi
+                self.confirm = ("partial", pending)
         elif key == "q":
             pending = self.pending_trash()
             if pending:
@@ -301,8 +378,10 @@ class CleanSession:
             "",
             f"{_DIM}j/k or ↑/↓ move · h/l or ←/→ group · space keep file · "
             f"a keep group · A keep all{_RESET}",
-            f"{_DIM}v Quick Look · p Preview · x trash file · enter dedupe · "
-            f"q/esc quit · y/n confirm{_RESET}",
+            f"{_DIM}v Quick Look · p Preview · x trash file · "
+            f"enter execute all · e execute to bar{_RESET}",
+            f"{_DIM}q/esc quit · y/n answer prompts — e commits the work done "
+            f"so far, then keeps reviewing{_RESET}",
             "",
         ]
 
@@ -312,12 +391,18 @@ class CleanSession:
         cursor_record_id = flat[self.cursor].id if flat else None
         for gi, group in enumerate(self.groups):
             kept = group.keeper_id is None
-            if kept:
-                tail = "kept"
-            else:
-                extra = sum(
+            extra = (
+                0
+                if kept
+                else sum(
                     file_size(r) for r in group.files if r.id != group.keeper_id
                 )
+            )
+            if group.done and extra == 0:
+                tail = "done"
+            elif kept:
+                tail = "kept"
+            else:
                 tail = f"{human_size(extra)} pending"
             body.append(
                 f"{_DIM}Group {gi + 1}/{len(self.groups)} — {group.size} "
@@ -354,6 +439,14 @@ class CleanSession:
                 footer.append(
                     f"{_BOLD}Exit without executing? {len(payload)} file(s) "
                     f"({human_size(size)}) are still marked for the Trash. "
+                    f"[y/N]{_RESET}"
+                )
+            elif kind == "partial":
+                size = sum(file_size(r) for r in payload)
+                footer.append(
+                    f"{_BOLD}Trash {len(payload)} unkept file(s) "
+                    f"({human_size(size)}) from the first "
+                    f"{(self.confirm_gi or 0) + 1} group(s) (up to the bar)? "
                     f"[y/N]{_RESET}"
                 )
             else:

@@ -73,6 +73,8 @@ commands never create it — run `scan` first.
 #      a     = keep this whole group       A = keep every file
 #      v     = Quick Look the file       p = open it in Preview.app
 #      x     = trash this file now (y/n) enter = trash all unkept files (y/n)
+#      e     = trash only the decisions made so far — every group up to and
+#              including the bar's group (y/n) — then keep reviewing
 #      q/esc = quit; asks y/N first if files are still marked for the Trash
 #    The algorithm's best copy of each group starts selected. Without a
 #    terminal it falls back to line-based prompts.
@@ -103,7 +105,7 @@ Group 1 (2 files)
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85) |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file) | `--limit` |
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json` |
-| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold` |
+| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold` |
 | `tags [root]` | keyword counts from captions | `--limit` |
 | `stats [root]` | index info: models, described/embedded coverage | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
