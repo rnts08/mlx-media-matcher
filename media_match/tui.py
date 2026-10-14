@@ -7,6 +7,9 @@ group. Keys:
     h / left, l / right   jump to the previous / next group
     space                 keep the file under the bar (unselects the group's
                           others; pressing again deselects -> group untouched)
+    a                     keep every file of the current group (nothing from
+                          it will be trashed)
+    A                     keep every file of every group
     v                     open the file under the bar in Quick Look
     p                     open the file under the bar in Preview.app
     x                     move the file under the bar to the Trash (y/n)
@@ -15,8 +18,9 @@ group. Keys:
 
 The algorithm's best-resolution file of each group starts selected. Selected
 files survive `enter`; everything else goes to the OS Trash (never unlinked).
-Groups whose keeper was deselected (or whose keeper was trashed with x) are
-left untouched.
+Groups marked as kept with `a` / `A` (or whose keeper was deselected, or whose
+keeper was trashed with x) are left untouched; `space` on a file reactivates
+its group.
 
 `CleanSession` is a pure state machine (keys in, state out) so it can be
 unit-tested without a terminal; `run_tui` drives it in a real terminal.
@@ -28,7 +32,7 @@ import os
 import select
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .cleanup import file_size, human_size, open_in_viewer
 from .db import Database, FileRecord
@@ -134,12 +138,35 @@ class CleanSession:
         record = files[self.cursor]
         gi = self.group_of_flat(self.cursor)
         group = self.groups[gi]
+        was_kept = group.keeper_id is None
         group.keeper_id = None if group.keeper_id == record.id else record.id
         name = os.path.basename(record.path)
+        if group.keeper_id == record.id:
+            self.status = (
+                f"Keeping {name}; the group's other {group.size - 1} file(s) "
+                "are now marked for trash."
+                if was_kept
+                else f"Keeping {name}."
+            )
+        else:
+            self.status = f"Deselected {name}; this group will be left untouched."
+
+    def keep_group(self) -> None:
+        """Mark every file of the group under the bar as kept."""
+        if not self.groups:
+            return
+        group = self.groups[self.group_of_flat(self.cursor)]
+        group.keeper_id = None
         self.status = (
-            f"Keeping {name}." if group.keeper_id == record.id
-            else f"Deselected {name}; this group will be left untouched."
+            f"Keeping all {group.size} file(s) of this group; "
+            "nothing here will be trashed."
         )
+
+    def keep_all(self) -> None:
+        """Mark every file of every group as kept."""
+        for group in self.groups:
+            group.keeper_id = None
+        self.status = "Keeping every file; nothing will be trashed."
 
     def open_viewer(self, app: str) -> None:
         files = self.flat_files()
@@ -204,7 +231,7 @@ class CleanSession:
         if self.confirm:
             kind, payload = self.confirm
             self.confirm = None
-            if key == "y":
+            if key.lower() == "y":
                 if kind == "x":
                     self._trash_now(payload[0])
                 else:
@@ -214,6 +241,8 @@ class CleanSession:
             return
 
         files = self.flat_files()
+        if key != "A":  # A (keep everything) is case-sensitive; the rest is not
+            key = key.lower()
         if key in ("j", "down"):
             self.move(1)
         elif key in ("k", "up"):
@@ -224,6 +253,10 @@ class CleanSession:
             self.jump_group(1)
         elif key == "space":
             self.toggle_keep()
+        elif key == "a":
+            self.keep_group()
+        elif key == "A":
+            self.keep_all()
         elif key == "v":
             self.open_viewer("quicklook")
         elif key == "p":
@@ -234,7 +267,7 @@ class CleanSession:
         elif key == "enter":
             pending = self.pending_trash()
             if not pending:
-                self.status = "Nothing to trash — every group has a keeper."
+                self.status = "Nothing to trash — every file is kept."
             else:
                 self.confirm = ("execute", pending)
         elif key == "q":
@@ -254,18 +287,26 @@ class CleanSession:
         flat = self.flat_files()
         cursor_record_id = flat[self.cursor].id if flat else None
         for gi, group in enumerate(self.groups):
-            extra = sum(file_size(r) for r in group.files if r.id != group.keeper_id)
+            kept = group.keeper_id is None
+            if kept:
+                tail = "kept"
+            else:
+                extra = sum(
+                    file_size(r) for r in group.files if r.id != group.keeper_id
+                )
+                tail = f"{human_size(extra)} pending"
             rows.append(
-                f"{_DIM}Group {gi + 1}/{len(self.groups)} — {group.size} file(s), "
-                f"{human_size(extra)} pending{_RESET}"
+                f"{_DIM}Group {gi + 1}/{len(self.groups)} — {group.size} "
+                f"file(s), {tail}{_RESET}"
             )
             for record in group.files:
                 is_cursor = record.id == cursor_record_id
-                is_keeper = record.id == group.keeper_id
-                if is_keeper:
-                    mark, style = f"{_GREEN}✔ keep{_RESET}      ", _GREEN
-                else:
-                    mark, style = f"{_RED}→ trash{_RESET}    ", _RED
+                is_keeper = kept or record.id == group.keeper_id
+                mark = (
+                    f"{_GREEN}✔ keep{_RESET}      "
+                    if is_keeper
+                    else f"{_RED}→ trash{_RESET}    "
+                )
                 arrow = "❯" if is_cursor else " "
                 name = os.path.relpath(record.path, self.root)
                 meta = (f"{record.width}x{record.height}, "
@@ -291,8 +332,9 @@ class CleanSession:
                 )
         else:
             rows.append(f"{_DIM}j/k or ↑/↓ move · h/l or ←/→ group · "
-                        f"space keep · v Quick Look · p Preview · "
-                        f"x trash file · enter dedupe · q quit{_RESET}")
+                        f"space keep · a keep group · A keep all{_RESET}")
+            rows.append(f"{_DIM}v Quick Look · p Preview · x trash file · "
+                        f"enter dedupe · q quit{_RESET}")
         rows.append(f"{self.status}")
 
         # window the rows to the terminal height, keeping the cursor visible
@@ -336,7 +378,7 @@ def _read_key() -> str:
         return "space"
     if ch in ("\r", "\n"):
         return "enter"
-    return ch.lower()
+    return ch  # case is preserved: handle() decides what is case-sensitive
 
 
 def run_tui(

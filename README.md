@@ -70,6 +70,7 @@ commands never create it — run `scan` first.
 # 5. review duplicates and move rejected copies to the OS Trash.
 #    Opens a visual bar UI (arrow keys or hjkl to move):
 #      space = keep the file under the bar (unselects the group's others)
+#      a     = keep this whole group       A = keep every file
 #      v     = Quick Look the file       p = open it in Preview.app
 #      x     = trash this file now (y/n) enter = trash all unkept files (y/n)
 #      q     = quit without doing anything
@@ -102,7 +103,7 @@ Group 1 (2 files)
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85) |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file) | `--limit` |
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json` |
-| `clean [root]` | review duplicate groups in a visual bar UI (hjkl/arrows, space=keep, v=Quick Look, p=Preview, x=trash file, enter=dedupe) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold` |
+| `clean [root]` | review duplicate groups in a visual bar UI (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold` |
 | `tags [root]` | keyword counts from captions | `--limit` |
 | `stats [root]` | index info: models, described/embedded coverage | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
