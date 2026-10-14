@@ -9,6 +9,8 @@ dependencies = [
     "pillow>=10.0",
     "pillow-heif>=0.16",
     "regex>=2024.0",
+    "send2trash>=2.0",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
