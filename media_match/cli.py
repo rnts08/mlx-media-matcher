@@ -633,12 +633,14 @@ def main(argv: list[str] | None = None) -> int:
         help="review duplicate groups and move rejected copies to the Trash",
         description=(
             "Review duplicate groups and move rejected copies to the OS Trash. "
-            "Opens a visual bar UI: j/k or arrow keys move the bar, h/l jump "
-            "between groups, space keeps the file under the bar (unselects the "
+            "Opens a visual bar UI with the key legend pinned at the top of "
+            "the screen: j/k or arrow keys move the bar, h/l jump between "
+            "groups, space keeps the file under the bar (unselects the "
             "group's others), a keeps the whole current group, A keeps every "
             "file, v opens it in Quick Look, p in Preview.app, x trashes the "
             "current file, enter executes the deduplication (x and enter ask "
-            "y/n first), q or esc quits. Without a TTY it falls back to "
+            "y/n first), q or esc quits but asks y/n first whenever files are "
+            "still marked for the Trash. Without a TTY it falls back to "
             "line-based prompts."
         ),
     )

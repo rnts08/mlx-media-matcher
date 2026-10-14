@@ -14,13 +14,16 @@ group. Keys:
     p                     open the file under the bar in Preview.app
     x                     move the file under the bar to the Trash (y/n)
     enter                 execute: trash every unkept file of every group (y/n)
-    q / esc               quit without executing
+    y / n                 answer the prompt shown at the bottom (x/enter/quit)
+    q / esc               quit without executing — but asks y/N first whenever
+                          files are still marked for the Trash
 
-The algorithm's best-resolution file of each group starts selected. Selected
-files survive `enter`; everything else goes to the OS Trash (never unlinked).
-Groups marked as kept with `a` / `A` (or whose keeper was deselected, or whose
-keeper was trashed with x) are left untouched; `space` on a file reactivates
-its group.
+The full key legend is pinned at the top of the screen and the status line at
+the bottom; only the group list scrolls. The algorithm's best-resolution file
+of each group starts selected. Selected files survive `enter`; everything else
+goes to the OS Trash (never unlinked). Groups marked as kept with `a` / `A`
+(or whose keeper was deselected, or whose keeper was trashed with x) are left
+untouched; `space` on a file reactivates its group.
 
 `CleanSession` is a pure state machine (keys in, state out) so it can be
 unit-tested without a terminal; `run_tui` drives it in a real terminal.
@@ -234,8 +237,15 @@ class CleanSession:
             if key.lower() == "y":
                 if kind == "x":
                     self._trash_now(payload[0])
+                elif kind == "quit":
+                    self.done = True
                 else:
                     self._execute(payload)
+            elif kind == "quit":
+                self.status = (
+                    f"Not exiting — {len(payload)} file(s) still marked for "
+                    "the Trash. enter executes, q quits."
+                )
             else:
                 self.status = "Cancelled; nothing changed."
             return
@@ -271,19 +281,33 @@ class CleanSession:
             else:
                 self.confirm = ("execute", pending)
         elif key == "q":
-            self.done = True
+            pending = self.pending_trash()
+            if pending:
+                # files are still marked for the Trash: leaving now would
+                # silently discard the session's decisions — confirm first
+                self.confirm = ("quit", pending)
+            else:
+                self.done = True
 
     # -- rendering --------------------------------------------------------------
 
     def render(self, width: int = 100, height: int = 30) -> str:
-        rows: list[str] = []  # (style, text) flattened to styled strings
         total_files = sum(g.size for g in self.groups)
-        rows.append(
+        # Fixed chrome: title + the key legend, pinned at the top of the screen
+        # so the hotkeys never scroll out of view.
+        top = [
             f"{_BOLD}media-match clean{_RESET} — {os.path.abspath(self.root)}  "
-            f"({len(self.groups)} group(s), {total_files} file(s))"
-        )
-        rows.append("")
+            f"({len(self.groups)} group(s), {total_files} file(s))",
+            "",
+            f"{_DIM}j/k or ↑/↓ move · h/l or ←/→ group · space keep file · "
+            f"a keep group · A keep all{_RESET}",
+            f"{_DIM}v Quick Look · p Preview · x trash file · enter dedupe · "
+            f"q/esc quit · y/n confirm{_RESET}",
+            "",
+        ]
 
+        # Scrolling region: the duplicate groups.
+        body: list[str] = []
         flat = self.flat_files()
         cursor_record_id = flat[self.cursor].id if flat else None
         for gi, group in enumerate(self.groups):
@@ -295,7 +319,7 @@ class CleanSession:
                     file_size(r) for r in group.files if r.id != group.keeper_id
                 )
                 tail = f"{human_size(extra)} pending"
-            rows.append(
+            body.append(
                 f"{_DIM}Group {gi + 1}/{len(self.groups)} — {group.size} "
                 f"file(s), {tail}{_RESET}"
             )
@@ -314,54 +338,62 @@ class CleanSession:
                 line = f" {arrow} {mark} {name}  ({meta})"
                 if is_cursor:
                     line = f" {arrow} {_REVERSE}{mark} {name}  ({meta}){_RESET}"
-                rows.append(line)
-        rows.append("")
+                body.append(line)
 
+        # Fixed footer: prompt (if confirming) + status line, pinned at bottom.
+        footer: list[str] = []
         if self.confirm:
             kind, payload = self.confirm
             if kind == "x":
-                rows.append(
+                footer.append(
                     f"{_BOLD}Move {os.path.basename(payload[0].path)} to the "
                     f"Trash? [y/N]{_RESET}"
                 )
+            elif kind == "quit":
+                size = sum(file_size(r) for r in payload)
+                footer.append(
+                    f"{_BOLD}Exit without executing? {len(payload)} file(s) "
+                    f"({human_size(size)}) are still marked for the Trash. "
+                    f"[y/N]{_RESET}"
+                )
             else:
                 size = sum(file_size(r) for r in payload)
-                rows.append(
+                footer.append(
                     f"{_BOLD}Trash {len(payload)} unkept file(s) "
                     f"({human_size(size)})? [y/N]{_RESET}"
                 )
-        else:
-            rows.append(f"{_DIM}j/k or ↑/↓ move · h/l or ←/→ group · "
-                        f"space keep · a keep group · A keep all{_RESET}")
-            rows.append(f"{_DIM}v Quick Look · p Preview · x trash file · "
-                        f"enter dedupe · q quit{_RESET}")
-        rows.append(f"{self.status}")
+        footer.append(self.status)
 
-        # window the rows to the terminal height, keeping the cursor visible
-        avail = max(4, height - 4)
-        body = rows
-        offset = 0
+        # window the group list to the terminal height, keeping the bar visible
+        avail = max(1, height - len(top) - 1 - len(footer))
         if len(body) > avail:
             cursor_row = next(
                 (i for i, r in enumerate(body)
                  if "❯" in r), 0
             )
-            if cursor_row >= avail:
-                offset = cursor_row - avail + 1
+            offset = 0 if cursor_row < avail else cursor_row - avail + 1
             body = body[offset : offset + avail]
-        clipped = [r if len(r) < width else r[: width - 1] for r in body]
+
+        rows = top + body + [""] + footer
+        clipped = [r if len(r) < width else r[: width - 1] for r in rows]
         return "\r\n".join(clipped)
 
 
 # -- terminal plumbing ----------------------------------------------------------
 
+_pending = b""  # bytes an ESC probe swallowed, replayed by the next _read_key
+
 
 def _read_key() -> str:
+    global _pending
     # Read bytes straight from the fd: raw mode + no Python buffering, and a
     # bare ESC can be distinguished from an escape sequence with a short
     # select (read(2) would block forever waiting for bytes that never come).
     fd = sys.stdin.fileno()
-    data = os.read(fd, 1)
+    if _pending:
+        data, _pending = _pending[:1], _pending[1:]
+    else:
+        data = os.read(fd, 1)
     if not data:
         return "q"
     if data == b"\x1b":
@@ -372,7 +404,10 @@ def _read_key() -> str:
             return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
                 rest[1:2].decode("ascii", "replace"), ""
             )
-        return "q"  # bare ESC
+        # not an escape sequence: bare ESC quits, but any bytes it swallowed
+        # (esc pressed right before another key) are replayed on the next call
+        _pending = rest
+        return "q"
     ch = data.decode("utf-8", "replace")
     if ch == " ":
         return "space"
