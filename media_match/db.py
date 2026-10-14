@@ -194,6 +194,17 @@ class Database:
         ).fetchone()
         return row["embedding"] if row else None
 
+    def delete_files(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        self.conn.execute(f"DELETE FROM files WHERE id IN ({marks})", ids)
+        if self._fts_available:
+            self.conn.execute(
+                f"DELETE FROM files_fts WHERE rowid IN ({marks})", ids
+            )
+        self.conn.commit()
+
     # -- search -------------------------------------------------------------
 
     def search(self, terms: list[str], limit: int = 50) -> list[sqlite3.Row]:

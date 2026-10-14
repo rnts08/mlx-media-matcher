@@ -431,6 +431,69 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    from .cleanup import (
+        confirm,
+        file_size,
+        human_size,
+        interactive_select,
+        print_plan,
+        trash_files,
+    )
+
+    groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
+    if not groups:
+        print("No duplicate groups found.")
+        db.close()
+        return 0
+
+    total_files = sum(g.size for g in groups)
+    print(f"{len(groups)} duplicate group(s), {total_files} files involved")
+
+    if args.dry_run:
+        trash = print_plan(groups, root, print, trash_word="[would]")
+        size = sum(file_size(r) for r in trash)
+        print(f"\nDry run: {len(trash)} file(s) ({human_size(size)}) would go "
+              f"to the Trash. Nothing was changed.")
+        db.close()
+        return 0
+
+    if args.yes:
+        trash = print_plan(groups, root, print, trash_word="[trash]")
+    else:
+        trash = interactive_select(groups, root)
+
+    if not trash:
+        print("\nNothing selected — no files were changed.")
+        db.close()
+        return 0
+
+    size = sum(file_size(r) for r in trash)
+    print(f"\n{len(trash)} file(s) ({human_size(size)}) selected for the Trash:")
+    for record in trash:
+        print(f"  {os.path.relpath(record.path, root)}")
+
+    if not args.yes and not confirm("Move to the system Trash? [y/N] "):
+        print("Aborted; nothing was changed.")
+        db.close()
+        return 1
+
+    trashed, failed = trash_files(trash)
+    db.delete_files([r.id for r in trashed])
+    print(f"\nMoved {len(trashed)} file(s) to the Trash (recoverable until "
+          f"emptied); removed {len(trashed)} entries from the index. "
+          f"{len(failed)} failed.")
+    db.close()
+    return 0 if not failed else 1
+
+
 def cmd_tags(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -546,6 +609,19 @@ def main(argv: list[str] | None = None) -> int:
                        help="max pHash hamming distance 0-64 (default: 8)")
     p_dup.add_argument("--json", action="store_true", help="machine-readable output")
     p_dup.set_defaults(func=cmd_duplicates)
+
+    p_clean = sub.add_parser(
+        "clean",
+        help="review duplicate groups and move rejected copies to the Trash",
+    )
+    _add_common(p_clean)
+    p_clean.add_argument("--threshold", type=int, default=8,
+                         help="max pHash hamming distance 0-64 (default: 8)")
+    p_clean.add_argument("--yes", action="store_true",
+                         help="trash the algorithm's worse copies without prompting")
+    p_clean.add_argument("--dry-run", action="store_true",
+                         help="show what would be trashed, then exit")
+    p_clean.set_defaults(func=cmd_clean)
 
     p_tags = sub.add_parser("tags", help="list indexed keywords with counts")
     _add_common(p_tags)

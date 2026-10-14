@@ -67,6 +67,13 @@ commands never create it — run `scan` first.
 .venv/bin/media-match similar ~/Pictures
 .venv/bin/media-match similar ~/Pictures --image /tmp/stray.jpg  # one image
 
+# 5. review duplicates and move rejected copies to the OS Trash
+#    (interactive: Enter=keep the best, 1-N=keep a specific copy, a=all,
+#     s=skip, q=quit; nothing is touched without a final confirmation)
+.venv/bin/media-match clean ~/Pictures
+.venv/bin/media-match clean ~/Pictures --dry-run  # preview the plan
+.venv/bin/media-match clean ~/Pictures --yes      # accept all suggestions
+
 # extras
 .venv/bin/media-match tags ~/Pictures    # keyword counts from captions
 .venv/bin/media-match stats ~/Pictures   # index, models, coverage
@@ -90,6 +97,7 @@ Group 1 (2 files)
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85) |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file) | `--limit` |
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json` |
+| `clean [root]` | review duplicate groups interactively and move rejected copies to the system Trash (never deleted outright; index updated) | `--yes`, `--dry-run`, `--threshold` |
 | `tags [root]` | keyword counts from captions | `--limit` |
 | `stats [root]` | index info: models, described/embedded coverage | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
