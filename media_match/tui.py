@@ -25,6 +25,7 @@ unit-tested without a terminal; `run_tui` drives it in a real terminal.
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -314,16 +315,23 @@ class CleanSession:
 
 
 def _read_key() -> str:
-    ch = sys.stdin.read(1)
-    if ch == "":
+    # Read bytes straight from the fd: raw mode + no Python buffering, and a
+    # bare ESC can be distinguished from an escape sequence with a short
+    # select (read(2) would block forever waiting for bytes that never come).
+    fd = sys.stdin.fileno()
+    data = os.read(fd, 1)
+    if not data:
         return "q"
-    if ch == "\x1b":
-        rest = sys.stdin.read(2)
-        if rest == "[":
+    if data == b"\x1b":
+        rest = b""
+        if select.select([fd], [], [], 0.05)[0]:
+            rest = os.read(fd, 2)
+        if rest[:1] == b"[":  # e.g. "[B" for the down arrow
             return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(
-                sys.stdin.read(1), ""
+                rest[1:2].decode("ascii", "replace"), ""
             )
         return "q"  # bare ESC
+    ch = data.decode("utf-8", "replace")
     if ch == " ":
         return "space"
     if ch in ("\r", "\n"):

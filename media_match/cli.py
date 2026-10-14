@@ -476,7 +476,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
             for error in session.errors:
                 print(f"  {error}")
             if moved:
-                size = sum(file_size(r) for r in moved)
+                # files are already gone from disk; use indexed byte sizes
+                size = sum(r.size for r in moved)
                 print(f"Moved {len(moved)} file(s) to the Trash "
                       f"({human_size(size)}; recoverable until emptied); "
                       f"removed {len(moved)} entries from the index. "
@@ -630,6 +631,15 @@ def main(argv: list[str] | None = None) -> int:
     p_clean = sub.add_parser(
         "clean",
         help="review duplicate groups and move rejected copies to the Trash",
+        description=(
+            "Review duplicate groups and move rejected copies to the OS Trash. "
+            "Opens a visual bar UI: j/k or arrow keys move the bar, h/l jump "
+            "between groups, space keeps the file under the bar (unselects the "
+            "group's others), v opens it in Quick Look, p in Preview.app, x "
+            "trashes the current file, enter executes the deduplication (both "
+            "ask y/n first), q or esc quits. Without a TTY it falls back to "
+            "line-based prompts."
+        ),
     )
     _add_common(p_clean)
     p_clean.add_argument("--threshold", type=int, default=8,
