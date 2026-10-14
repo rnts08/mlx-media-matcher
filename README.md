@@ -67,10 +67,14 @@ commands never create it — run `scan` first.
 .venv/bin/media-match similar ~/Pictures
 .venv/bin/media-match similar ~/Pictures --image /tmp/stray.jpg  # one image
 
-# 5. review duplicates and move rejected copies to the OS Trash
-#    (interactive: Enter=keep the best, 1-N=keep a specific copy,
-#     v [N]=view with Quick Look (Finder spacebar), p [N]=view in Preview,
-#     a=all, s=skip, q=quit; nothing is touched without a final confirmation)
+# 5. review duplicates and move rejected copies to the OS Trash.
+#    Opens a visual bar UI (arrow keys or hjkl to move):
+#      space = keep the file under the bar (unselects the group's others)
+#      v     = Quick Look the file       p = open it in Preview.app
+#      x     = trash this file now (y/n) enter = trash all unkept files (y/n)
+#      q     = quit without doing anything
+#    The algorithm's best copy of each group starts selected. Without a
+#    terminal it falls back to line-based prompts.
 .venv/bin/media-match clean ~/Pictures
 .venv/bin/media-match clean ~/Pictures --dry-run  # preview the plan
 .venv/bin/media-match clean ~/Pictures --yes      # accept all suggestions
@@ -98,7 +102,7 @@ Group 1 (2 files)
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85) |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file) | `--limit` |
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json` |
-| `clean [root]` | review duplicate groups interactively and move rejected copies to the system Trash (never deleted outright; index updated); view copies with Quick Look (`v`) or Preview.app (`p`) while reviewing | `--yes`, `--dry-run`, `--threshold` |
+| `clean [root]` | review duplicate groups in a visual bar UI (hjkl/arrows, space=keep, v=Quick Look, p=Preview, x=trash file, enter=dedupe) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold` |
 | `tags [root]` | keyword counts from captions | `--limit` |
 | `stats [root]` | index info: models, described/embedded coverage | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |

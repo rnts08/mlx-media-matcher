@@ -468,7 +468,25 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if args.yes:
         trash = print_plan(groups, root, print, trash_word="[trash]")
     else:
-        trash = interactive_select(groups, root)
+        from .tui import run_tui
+
+        session = run_tui(groups, root=root, db=db)
+        if session is not None:  # visual UI ran (it updates the index itself)
+            moved = session.x_trashed + session.batch_trashed
+            for error in session.errors:
+                print(f"  {error}")
+            if moved:
+                # files are already gone from disk; use indexed byte sizes
+                size = sum(r.size for r in moved)
+                print(f"Moved {len(moved)} file(s) to the Trash "
+                      f"({human_size(size)}; recoverable until emptied); "
+                      f"removed {len(moved)} entries from the index. "
+                      f"{len(session.errors)} failed.")
+            else:
+                print("Nothing changed.")
+            db.close()
+            return 0 if not session.errors else 1
+        trash = interactive_select(groups, root)  # no TTY: line-based prompts
 
     if not trash:
         print("\nNothing selected — no files were changed.")
@@ -613,6 +631,15 @@ def main(argv: list[str] | None = None) -> int:
     p_clean = sub.add_parser(
         "clean",
         help="review duplicate groups and move rejected copies to the Trash",
+        description=(
+            "Review duplicate groups and move rejected copies to the OS Trash. "
+            "Opens a visual bar UI: j/k or arrow keys move the bar, h/l jump "
+            "between groups, space keeps the file under the bar (unselects the "
+            "group's others), v opens it in Quick Look, p in Preview.app, x "
+            "trashes the current file, enter executes the deduplication (both "
+            "ask y/n first), q or esc quits. Without a TTY it falls back to "
+            "line-based prompts."
+        ),
     )
     _add_common(p_clean)
     p_clean.add_argument("--threshold", type=int, default=8,
