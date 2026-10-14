@@ -638,10 +638,11 @@ def main(argv: list[str] | None = None) -> int:
             "groups, space keeps the file under the bar (unselects the "
             "group's others), a keeps the whole current group, A keeps every "
             "file, v opens it in Quick Look, p in Preview.app, x trashes the "
-            "current file, enter executes the deduplication (x and enter ask "
-            "y/n first), q or esc quits but asks y/n first whenever files are "
-            "still marked for the Trash. Without a TTY it falls back to "
-            "line-based prompts."
+            "current file, enter executes the whole deduplication (x, enter "
+            "and e ask y/n first), e executes only the decisions made so far "
+            "up to the bar's group and keeps the review open, q or esc quits "
+            "but asks y/n first whenever files are still marked for the "
+            "Trash. Without a TTY it falls back to line-based prompts."
         ),
     )
     _add_common(p_clean)
