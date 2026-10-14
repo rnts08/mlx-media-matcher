@@ -468,7 +468,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if args.yes:
         trash = print_plan(groups, root, print, trash_word="[trash]")
     else:
-        trash = interactive_select(groups, root)
+        from .tui import run_tui
+
+        session = run_tui(groups, root=root, db=db)
+        if session is not None:  # visual UI ran (it updates the index itself)
+            moved = session.x_trashed + session.batch_trashed
+            for error in session.errors:
+                print(f"  {error}")
+            if moved:
+                size = sum(file_size(r) for r in moved)
+                print(f"Moved {len(moved)} file(s) to the Trash "
+                      f"({human_size(size)}; recoverable until emptied); "
+                      f"removed {len(moved)} entries from the index. "
+                      f"{len(session.errors)} failed.")
+            else:
+                print("Nothing changed.")
+            db.close()
+            return 0 if not session.errors else 1
+        trash = interactive_select(groups, root)  # no TTY: line-based prompts
 
     if not trash:
         print("\nNothing selected — no files were changed.")
