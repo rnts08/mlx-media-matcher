@@ -2,7 +2,8 @@
 
 The algorithm suggests keeping the best-resolution version of each group.
 The user can accept that (per group or for all remaining groups), pick a
-different file to keep, skip groups, or quit. Nothing is touched until a
+different file to keep, view files in the OS image viewer (macOS Quick Look
+or Preview.app), skip groups, or quit. Nothing is touched until a
 final confirmation; files are then moved to the system trash (recoverable),
 never deleted outright.
 """
@@ -10,6 +11,8 @@ never deleted outright.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from collections.abc import Callable
 
 from .db import FileRecord
@@ -33,6 +36,29 @@ def file_size(record: FileRecord) -> int:
 
 def group_files(group: DuplicateGroup) -> list[FileRecord]:
     return [group.best] + [record for record, _ in group.others]
+
+
+def open_in_viewer(paths: list[str], app: str = "quicklook") -> None:
+    """Open image(s) in the OS viewer, without blocking the prompt.
+
+    app="quicklook" is the Finder spacebar panel on macOS (qlmanage -p),
+    showing multiple files side by side; app="preview" opens Preview.app.
+    """
+    if not paths:
+        return
+    if sys.platform == "darwin":
+        if app == "preview":
+            command = ["open", "-a", "Preview", *paths]
+        else:
+            command = ["qlmanage", "-p", *paths]
+    else:
+        command = ["xdg-open", paths[0]]
+    subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def render_group(group: DuplicateGroup, index: int, total: int, root: str,
@@ -60,6 +86,7 @@ def interactive_select(
     root: str,
     input_fn: Callable[[str], str] = input,
     out: Callable[[str], None] = print,
+    viewer: Callable[[list[str], str], None] = open_in_viewer,
 ) -> list[FileRecord]:
     """Prompt once per group; return the files chosen for the trash."""
     trash: list[FileRecord] = []
@@ -67,24 +94,46 @@ def interactive_select(
     for index, group in enumerate(groups, 1):
         render_group(group, index, len(groups), root, out)
         keep = group.best
-        if not accept_all:
+        skip = False
+        while not accept_all:
             try:
                 choice = input_fn(
-                    "  keep? [Enter]=best, 1-N=keep that file, s=skip, "
-                    "a=best for all remaining, q=quit > "
+                    "  keep? [Enter]=best, 1-N=keep that file, "
+                    "v [N]=view (Quick Look), p [N]=view in Preview, "
+                    "s=skip, a=best for all remaining, q=quit > "
                 ).strip().lower()
             except EOFError:
                 choice = "q"
-            if choice == "q":
-                out("Stopping here; earlier selections still apply.")
-                break
-            if choice == "a":
-                accept_all = True
-            elif choice == "s":
+            tokens = choice.split()
+            verb = tokens[0] if tokens else ""
+
+            if verb in ("v", "p"):
+                files = group_files(group)
+                picked = files
+                if len(tokens) > 1 and tokens[1].isdigit() \
+                        and 1 <= int(tokens[1]) <= len(files):
+                    picked = [files[int(tokens[1]) - 1]]
+                app = "preview" if verb == "p" else "quicklook"
+                viewer([f.path for f in picked], app)
+                out(f"  opened {len(picked)} file(s) in the OS viewer "
+                    f"({'Preview' if app == 'preview' else 'Quick Look'})")
                 continue
-            elif choice.isdigit() and 1 <= int(choice) <= len(group_files(group)):
-                keep = group_files(group)[int(choice) - 1]
-        trash.extend(r for r in group_files(group) if r.id != keep.id)
+
+            if verb == "q":
+                out("Stopping here; earlier selections still apply.")
+                return trash
+            if verb == "a":
+                accept_all = True
+            elif verb == "s":
+                skip = True
+                break
+            elif verb.isdigit() and 1 <= int(verb) <= len(group_files(group)):
+                keep = group_files(group)[int(verb) - 1]
+                break
+            else:
+                break  # Enter or unrecognized -> keep the algorithm's pick
+        if not skip:
+            trash.extend(r for r in group_files(group) if r.id != keep.id)
     return trash
 
 
