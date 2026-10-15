@@ -72,6 +72,23 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS media_tags (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    media_id INTEGER NOT NULL,
+    tag TEXT NOT NULL,
+    facet TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mtags_media ON media_tags(kind, media_id);
+CREATE INDEX IF NOT EXISTS idx_mtags_tag ON media_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_mtags_facet ON media_tags(kind, facet);
+
+CREATE TABLE IF NOT EXISTS clusters (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -87,6 +104,9 @@ class FileRecord:
     phash: str
     description: str
     keywords: str
+    raw_keywords: str = ""
+    type: str = ""
+    type_score: float = 0.0
 
 
 @dataclass
@@ -114,6 +134,7 @@ class VideoRecord:
     signature: str
     description: str
     keywords: str
+    raw_keywords: str = ""
     phashes: list[str] = field(default_factory=list)
 
     @property
@@ -132,9 +153,21 @@ class Database:
         self.conn.commit()
 
     def _migrate(self) -> None:
-        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
-        if "embedding" not in columns:
-            self.conn.execute("ALTER TABLE files ADD COLUMN embedding BLOB")
+        file_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
+        for name, decl in (
+            ("embedding", "BLOB"),
+            ("raw_keywords", "TEXT NOT NULL DEFAULT ''"),
+            ("type", "TEXT NOT NULL DEFAULT ''"),
+            ("type_score", "REAL NOT NULL DEFAULT 0"),
+            ("cluster_id", "INTEGER"),
+        ):
+            if name not in file_cols:
+                self.conn.execute(f"ALTER TABLE files ADD COLUMN {name} {decl}")
+        video_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(videos)")}
+        if "raw_keywords" not in video_cols:
+            self.conn.execute(
+                "ALTER TABLE videos ADD COLUMN raw_keywords TEXT NOT NULL DEFAULT ''"
+            )
 
     def _setup_fts(self) -> bool:
         try:
@@ -222,7 +255,8 @@ class Database:
                 id=r["id"], path=r["path"], size=r["size"], mtime=r["mtime"],
                 sha1=r["sha1"], width=r["width"], height=r["height"],
                 phash=r["phash"], description=r["description"],
-                keywords=r["keywords"],
+                keywords=r["keywords"], raw_keywords=r["raw_keywords"],
+                type=r["type"], type_score=r["type_score"],
             )
             for r in rows
         ]
@@ -313,7 +347,7 @@ class Database:
             height=r["height"], fps=r["fps"], codec=r["codec"],
             bitrate=r["bitrate"], frame_count=r["frame_count"],
             signature=r["signature"], description=r["description"],
-            keywords=r["keywords"],
+            keywords=r["keywords"], raw_keywords=r["raw_keywords"],
         )
 
     def all_videos(self) -> list[VideoRecord]:
@@ -482,6 +516,170 @@ class Database:
                     if kw:
                         counts[kw] = counts.get(kw, 0) + 1
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+    # -- tag refinement -----------------------------------------------------
+
+    def rows_for_refinement(self, kind: str) -> list[sqlite3.Row]:
+        """id + current/raw keywords + description, for (re)building tags."""
+        table = "files" if kind == "image" else "videos"
+        return self.conn.execute(
+            f"SELECT id, keywords, raw_keywords, description FROM {table} ORDER BY path"
+        ).fetchall()
+
+    def apply_refinement(
+        self, kind: str, items: list[tuple[int, str, str, str, list[tuple[str, str | None]]]]
+    ) -> None:
+        """Replace refined tags for one media kind.
+
+        Each item is ``(media_id, refined_csv, raw_keywords, description,
+        [(tag, facet), ...])``. ``keywords`` is overwritten with the canonical
+        tags (so FTS search benefits) while the original is kept in
+        ``raw_keywords``; ``media_tags`` and the FTS row are rebuilt.
+        """
+        table = "files" if kind == "image" else "videos"
+        fts = "files_fts" if kind == "image" else "videos_fts"
+        existing = {r["id"] for r in self.conn.execute(f"SELECT id FROM {table}")}
+        self.conn.execute("DELETE FROM media_tags WHERE kind = ?", (kind,))
+        tag_rows: list[tuple[str, int, str, str | None]] = []
+        for media_id, refined, raw, description, pairs in items:
+            if media_id not in existing:
+                continue
+            self.conn.execute(
+                f"UPDATE {table} SET keywords = ?, raw_keywords = ? WHERE id = ?",
+                (refined, raw, media_id),
+            )
+            if self._fts_available:
+                self.conn.execute(f"DELETE FROM {fts} WHERE rowid = ?", (media_id,))
+                self.conn.execute(
+                    f"INSERT INTO {fts}(rowid, description, keywords) VALUES(?, ?, ?)",
+                    (media_id, description, refined),
+                )
+            tag_rows.extend((kind, media_id, tag, facet) for tag, facet in pairs)
+        self.conn.executemany(
+            "INSERT INTO media_tags(kind, media_id, tag, facet) VALUES(?, ?, ?, ?)",
+            tag_rows,
+        )
+        self.conn.commit()
+
+    def has_tags(self, kind: str = "image") -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM media_tags WHERE kind = ?", (kind,)
+        ).fetchone()["n"]
+
+    def tag_counts(self, limit: int = 40, kind: str = "image") -> list[tuple[str, int]]:
+        rows = self.conn.execute(
+            "SELECT tag, COUNT(*) AS n FROM media_tags WHERE kind = ? "
+            "GROUP BY tag ORDER BY n DESC, tag LIMIT ?",
+            (kind, limit),
+        ).fetchall()
+        return [(r["tag"], r["n"]) for r in rows]
+
+    def facet_tag_counts(self, kind: str = "image") -> dict[str, list[tuple[str, int]]]:
+        rows = self.conn.execute(
+            "SELECT facet, tag, COUNT(*) AS n FROM media_tags "
+            "WHERE kind = ? AND facet IS NOT NULL "
+            "GROUP BY facet, tag ORDER BY facet, n DESC",
+            (kind,),
+        ).fetchall()
+        out: dict[str, list[tuple[str, int]]] = {}
+        for r in rows:
+            out.setdefault(r["facet"], []).append((r["tag"], r["n"]))
+        return out
+
+    def facet_counts(self, kind: str = "image") -> list[tuple[str, int]]:
+        rows = self.conn.execute(
+            "SELECT facet, COUNT(DISTINCT media_id) AS n FROM media_tags "
+            "WHERE kind = ? AND facet IS NOT NULL GROUP BY facet ORDER BY n DESC",
+            (kind,),
+        ).fetchall()
+        return [(r["facet"], r["n"]) for r in rows]
+
+    def media_ids_with_facet(self, facet: str, kind: str = "image") -> list[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT media_id FROM media_tags WHERE kind = ? AND facet = ? "
+            "ORDER BY media_id",
+            (kind, facet),
+        ).fetchall()
+        return [r["media_id"] for r in rows]
+
+    # -- image type ---------------------------------------------------------
+
+    def set_types(self, items: list[tuple[int, str, float]]) -> None:
+        self.conn.executemany(
+            "UPDATE files SET type = ?, type_score = ? WHERE id = ?",
+            [(name, score, fid) for fid, name, score in items],
+        )
+        self.conn.commit()
+
+    def files_needing_type(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, path FROM files WHERE embedding IS NOT NULL AND type = '' "
+            "ORDER BY path"
+        ).fetchall()
+
+    def files_with_type(self, name: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM files WHERE type = ? ORDER BY path", (name,)
+        ).fetchall()
+
+    def type_counts(self) -> list[tuple[str, int]]:
+        rows = self.conn.execute(
+            "SELECT type, COUNT(*) AS n FROM files WHERE type != '' "
+            "GROUP BY type ORDER BY n DESC, type"
+        ).fetchall()
+        return [(r["type"], r["n"]) for r in rows]
+
+    # -- clusters (people) --------------------------------------------------
+
+    def set_clusters(
+        self,
+        kind: str,
+        members: dict[int, list[int]],
+        labels: dict[int, str] | None = None,
+    ) -> None:
+        """Replace the cluster assignment for one media kind.
+
+        ``members`` maps cluster id -> media ids; ``labels`` optionally names
+        a cluster (a person's name). Only one kind is used at a time, so the
+        cluster ids are reused as the primary key.
+        """
+        table = "files" if kind == "image" else "videos"
+        labels = labels or {}
+        self.conn.execute(f"UPDATE {table} SET cluster_id = NULL")
+        self.conn.execute("DELETE FROM clusters WHERE kind = ?", (kind,))
+        for cid, ids in members.items():
+            self.conn.execute(
+                "INSERT INTO clusters(id, kind, label) VALUES(?, ?, ?)",
+                (cid, kind, labels.get(cid, "")),
+            )
+            self.conn.executemany(
+                f"UPDATE {table} SET cluster_id = ? WHERE id = ?",
+                [(cid, mid) for mid in ids],
+            )
+        self.conn.commit()
+
+    def all_clusters(self, kind: str = "image") -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, label FROM clusters WHERE kind = ? ORDER BY id", (kind,)
+        ).fetchall()
+
+    def set_cluster_label(self, cluster_id: int, label: str, kind: str = "image") -> None:
+        self.conn.execute(
+            "UPDATE clusters SET label = ? WHERE id = ? AND kind = ?",
+            (label, cluster_id, kind),
+        )
+        self.conn.commit()
+
+    def files_in_cluster(self, cluster_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM files WHERE cluster_id = ? ORDER BY path", (cluster_id,)
+        ).fetchall()
+
+    def clusters_for_label(self, label: str) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT id FROM clusters WHERE label = ? COLLATE NOCASE ORDER BY id", (label,)
+        ).fetchall()
+        return [r["id"] for r in rows]
 
     def close(self) -> None:
         self.conn.close()

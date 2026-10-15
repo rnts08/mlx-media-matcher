@@ -104,6 +104,37 @@ class SimilarGroup:
         return len(self.others) + 1
 
 
+def cluster_by_similarity(embeddings: np.ndarray, threshold: float = 0.85) -> list[int]:
+    """Connected components of the cosine-similarity graph.
+
+    Returns a cluster label per row in ``embeddings`` (0-based, ordered by
+    first appearance). Unlike ``find_similarity_groups`` this keeps singletons,
+    which is what people/photo clustering wants: every face crop belongs to
+    exactly one cluster even if it resembles nobody else.
+    """
+    n = len(embeddings)
+    if n == 0:
+        return []
+    uf = _UnionFind(n)
+    chunk = max(1, min(n, 4096 * 1024 // max(n, 1) or 1))
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        sims = embeddings[start:stop] @ embeddings.T
+        rows, cols = np.nonzero(sims >= threshold)
+        for r, c in zip(rows, cols):
+            i, j = start + int(r), int(c)
+            if i < j:
+                uf.union(i, j)
+    labels: list[int] = []
+    roots: dict[int, int] = {}
+    for i in range(n):
+        root = uf.find(i)
+        if root not in roots:
+            roots[root] = len(roots)
+        labels.append(roots[root])
+    return labels
+
+
 def find_similarity_groups(
     records: list[FileRecord], embeddings: np.ndarray, threshold: float = 0.85
 ) -> list[SimilarGroup]:

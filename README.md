@@ -10,6 +10,14 @@ builds an index that lets you:
   full-resolution primary file
 - **group semantic near-duplicates** — e.g. several different shots of the
   same subject
+- **refine tags into a clean vocabulary** — keywords are lowercased,
+  singularized and synonym-merged into canonical tags, then bucketed into
+  facets (person/scene/object/food/…); each photo is also *typed*
+  (selfie/portrait/group/scene/city/animal/object/food/document/art) with
+  zero-shot CLIP
+- **group photos of the same person** — photos tagged with the person facet are
+  clustered by CLIP similarity; name a cluster ("Alice") and list it with one
+  command
 - **mark the best version** — the largest image in every group is the primary
 
 Everything runs locally: no cloud services, no PyTorch. Requires Apple Silicon.
@@ -20,6 +28,9 @@ Everything runs locally: no cloud services, no PyTorch. Requires Apple Silicon.
 - **Phase 2 (video): implemented** — the same capabilities for video files:
   keyframes sampled at ~1 fps, embedded with CLIP for search, and matched by
   keyframe pHash for duplicate/re-encode grouping (see `docs/video-spike.md`).
+- **Tag refinement, image types & people clustering: implemented** —
+  `refine` cleans captions into canonical tags/facets and (with `--classify`)
+  types each photo; `people` clusters person photos and supports naming them.
 
 ## Install
 
@@ -54,6 +65,22 @@ frame-for-frame and are matched by *aligned* comparison (O(n)) rather than
 all-pairs. The scan prepares frames on a thread pool that feeds the CLIP
 batcher, so image and video work share one pipeline and the GPU stays busy
 (measured GPU-busy time ~73% → ~99%; see `docs/video-spike.md`).
+
+**Tag refinement** turns the loose VLM keywords into a tidy vocabulary.
+`refine` lowercases, singularizes (with irregular plurals), merges obvious
+synonyms (`guy`→`man`, `bike`→`bicycle`) and drops filler, writing canonical
+tags into `keywords` while keeping the originals in `raw_keywords`. Every tag is
+also bucketed into a **facet** (person/animal/object/scene/food/plant/text/
+activity/color). With `--classify`, each image is additionally given a **type**
+via zero-shot CLIP: the category prompt sentences are embedded once, and the
+image is labeled with the closest category — no extra model or training.
+
+**People clustering** takes every photo whose facet is `person`, embeds its CLIP
+vector, and links photos whose cosine similarity clears a threshold, so
+same-looking people group together. It is honest about its limits: CLIP groups
+*similar photos of a person in a similar shot*, not verified identities (that
+needs a face-embedding model). `people --label N=Name` names a cluster and
+`search --cluster Name` lists it.
 
 ## Usage
 
@@ -99,6 +126,18 @@ batcher, so image and video work share one pipeline and the GPU stays busy
 .venv/bin/media-match stats ~/Pictures   # index, models, coverage
 .venv/bin/media-match embed ~/Pictures   # backfill CLIP embeddings only
 
+# 6. refine the captions into clean tags/facets, and type each photo
+.venv/bin/media-match refine ~/Pictures              # canonical tags + facets
+.venv/bin/media-match refine ~/Pictures --classify   # + selfie/scene/object types
+.venv/bin/media-match tags ~/Pictures --facets       # tags grouped by facet
+.venv/bin/media-match tags ~/Pictures --types        # type counts
+.venv/bin/media-match search ~/Pictures --type selfie
+
+# 7. group photos of the same person and name the groups
+.venv/bin/media-match people ~/Pictures              # cluster person photos
+.venv/bin/media-match people ~/Pictures --label 3=Alice
+.venv/bin/media-match search ~/Pictures --cluster Alice
+
 # videos — pass --video to index/search/group/review video files
 .venv/bin/media-match scan ~/Movies --video        # keyframes + CLIP (~1 fps)
 .venv/bin/media-match search ~/Movies "dog on a beach" --video
@@ -120,13 +159,15 @@ Group 1 (2 files)
 | Command | What it does | Key options |
 |---|---|---|
 | `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
-| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--limit` |
+| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--limit` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video` |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio` |
-| `tags [root]` | keyword counts from captions | `--limit`, `--video` |
-| `stats [root]` | index info: models, described/embedded coverage | |
+| `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--limit`, `--video` |
+| `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute` |
+| `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
+| `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
 
 All commands take `--db` to override the index location. `root` defaults to

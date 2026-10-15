@@ -10,6 +10,7 @@ import sys
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
 from .pipeline import build_jobs, run_scan, store_result
+from .tags import facet_of, refine
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
 from .video_groups import find_video_duplicate_groups, find_video_similarity_groups
@@ -184,6 +185,42 @@ def _describe_videos(db: Database, root: str, args, on_error) -> None:
     describer.unload()
 
 
+def _list_by_type(db: Database, args) -> int:
+    rows = db.files_with_type(args.type)
+    if not rows:
+        known = ", ".join(name for name, _ in db.type_counts()) or "(none)"
+        print(f"No images of type '{args.type}'. Known types: {known}")
+        db.close()
+        return 1
+    for r in rows[: args.limit]:
+        print(f"{r['path']}  ({r['width']}x{r['height']}, "
+              f"{_mp(r['width'], r['height'])})  type={r['type']} "
+              f"({r['type_score']:.3f})")
+    print(f"\n{len(rows)} image(s) of type '{args.type}'"
+          + (f", showing {args.limit}" if len(rows) > args.limit else ""))
+    db.close()
+    return 0
+
+
+def _list_by_cluster(db: Database, args) -> int:
+    cluster_ids = db.clusters_for_label(args.cluster)
+    if not cluster_ids:
+        print(f"No person cluster named '{args.cluster}'. "
+              f"Name one with 'people --label N=Name'.")
+        db.close()
+        return 1
+    rows: list = []
+    for cid in cluster_ids:
+        rows.extend(db.files_in_cluster(cid))
+    for r in rows[: args.limit]:
+        print(f"{r['path']}  ({r['width']}x{r['height']}, "
+              f"{_mp(r['width'], r['height'])})")
+    print(f"\n{len(rows)} photo(s) of '{args.cluster}'"
+          + (f", showing {args.limit}" if len(rows) > args.limit else ""))
+    db.close()
+    return 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -191,6 +228,10 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"No index at {db_path_for(root, args.db)} — "
               f"run 'media-match scan {root}' first.")
         return 1
+    if args.type:
+        return _list_by_type(db, args)
+    if args.cluster:
+        return _list_by_cluster(db, args)
     terms: list[str] = []
     if args.person:
         terms.extend(args.person.split())
@@ -652,6 +693,174 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def cmd_refine(args: argparse.Namespace) -> int:
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    total = 0
+    for kind, label in (("image", "image"), ("video", "video")):
+        rows = db.rows_for_refinement(kind)
+        items = []
+        for r in rows:
+            raw = (r["raw_keywords"] or r["keywords"] or "").strip()
+            if not raw:
+                continue
+            keywords = [k for k in raw.split(",") if k.strip()]
+            tags, _facets = refine(keywords, r["description"] or "")
+            pairs = [(t, facet_of(t)) for t in tags]
+            items.append((r["id"], ", ".join(tags), raw, r["description"] or "", pairs))
+        if rows:
+            db.apply_refinement(kind, items)
+        total += len(items)
+        print(f"  refined {len(items)} {label}(s)")
+
+    if not total:
+        print("Nothing to refine. Run 'scan' (and optionally '--describe') first.")
+
+    if args.classify:
+        _classify_images(db, args)
+
+    facets = db.facet_counts("image")
+    if facets:
+        print("facets: " + ", ".join(f"{name} {n}" for name, n in facets))
+    db.close()
+    return 0
+
+
+def _classify_images(db: Database, args) -> None:
+    import numpy as np
+
+    if args.recompute:
+        rows = db.conn.execute(
+            "SELECT id, path FROM files WHERE embedding IS NOT NULL ORDER BY path"
+        ).fetchall()
+    else:
+        rows = db.files_needing_type()
+    if not rows:
+        print("No images need a type (run 'scan'/'embed' first, "
+              "or they are all classified).")
+        return
+
+    ids, blobs = db.all_embeddings()
+    vec_by_id = {i: np.frombuffer(b, dtype=np.float32) for i, b in zip(ids, blobs)}
+    targets = [(r["id"], vec_by_id[r["id"]]) for r in rows if r["id"] in vec_by_id]
+    if not targets:
+        print("Indexed images have no CLIP embeddings yet; run 'scan' or 'embed'.")
+        return
+
+    from .clip import ClipEncoder
+    from .imagetype import TypeClassifier
+
+    classifier = TypeClassifier(ClipEncoder(model_id=args.clip_model))
+    matrix = np.stack([v for _i, v in targets])
+    results = classifier.classify(matrix)
+    db.set_types([
+        (targets[k][0], name, score) for k, (name, score) in enumerate(results)
+    ])
+    classifier.encoder.unload()
+    print(f"classified {len(targets)} image(s)")
+
+
+def cmd_people(args: argparse.Namespace) -> int:
+    import numpy as np
+
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+    kind = "image"
+
+    if args.label:
+        return _label_cluster(db, args)
+
+    person_ids = set(db.media_ids_with_facet("person", kind))
+    if not person_ids:
+        print("No person tags yet. Run 'scan --describe' then 'refine' first.")
+        db.close()
+        return 1
+
+    ids, blobs = db.all_embeddings()
+    vec_by_id = {i: np.frombuffer(b, dtype=np.float32) for i, b in zip(ids, blobs)}
+    selected = [i for i in person_ids if i in vec_by_id]
+    if len(selected) < 2:
+        print(f"{len(selected)} person photo(s) with embeddings — nothing to cluster.")
+        db.close()
+        return 0
+
+    from .groups import cluster_by_similarity
+
+    matrix = np.stack([vec_by_id[i] for i in selected])
+    labels = cluster_by_similarity(matrix, threshold=args.threshold)
+
+    components: dict[int, list[int]] = {}
+    for fid, comp in zip(selected, labels):
+        components.setdefault(comp, []).append(fid)
+    ordered = sorted(components.values(), key=lambda members: (-len(members), min(members)))
+    members = {n: ids_ for n, ids_ in enumerate(ordered, 1)}
+
+    # carry a name over when a cluster's membership is unchanged by re-running
+    previous: dict[frozenset[int], str] = {}
+    for c in db.all_clusters(kind):
+        if c["label"]:
+            member_set = frozenset(r["id"] for r in db.files_in_cluster(c["id"]))
+            previous[member_set] = c["label"]
+    carried = {n: previous.get(frozenset(ids_), "") for n, ids_ in members.items()}
+    db.set_clusters(kind, members, carried)
+
+    records = {r.id: r for r in db.all_files()}
+    if args.json:
+        print(json.dumps([
+            {"cluster": n, "label": carried.get(n, ""),
+             "files": [records[i].path for i in ids_]}
+            for n, ids_ in members.items()
+        ], indent=2))
+        db.close()
+        return 0
+
+    print(f"{len(members)} person cluster(s) from {len(selected)} photo(s) "
+          f"(cosine >= {args.threshold})")
+    shown = 0
+    for n, ids_ in members.items():
+        if len(ids_) < args.min_size:
+            continue
+        label = carried.get(n, "")
+        tag = f"  [{label}]" if label else ""
+        print(f"\nPerson {n}{tag}  ({len(ids_)} photos)")
+        for i in ids_[: args.limit]:
+            print(f"  {os.path.relpath(records[i].path, root)}")
+        shown += 1
+    if not shown:
+        print(f"No clusters with at least {args.min_size} photo(s).")
+    print("\nName a cluster with: media-match people --label N=Name")
+    db.close()
+    return 0
+
+
+def _label_cluster(db: Database, args) -> int:
+    num, _, name = args.label.partition("=")
+    name = name.strip()
+    if not num.isdigit() or not name:
+        print("--label expects N=Name, e.g. --label 3=Alice")
+        db.close()
+        return 2
+    cid = int(num)
+    if cid not in {r["id"] for r in db.all_clusters("image")}:
+        print(f"No cluster {cid} yet. Run 'people' first to build clusters.")
+        db.close()
+        return 1
+    db.set_cluster_label(cid, name)
+    print(f"cluster {cid} labeled '{name}' "
+          f"({len(db.files_in_cluster(cid))} photo(s))")
+    db.close()
+    return 0
+
+
 def cmd_tags(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -659,11 +868,48 @@ def cmd_tags(args: argparse.Namespace) -> int:
         print(f"No index at {db_path_for(root, args.db)} — "
               f"run 'media-match scan {root}' first.")
         return 1
-    counts = db.keyword_counts(limit=args.limit, include_videos=args.video)
+
+    kind = "video" if args.video else "image"
+
+    if args.types:
+        counts = db.type_counts()
+        if not counts:
+            print("No image types yet. Run 'refine --classify' first.")
+            db.close()
+            return 1
+        width = max(len(name) for name, _ in counts)
+        for name, count in counts:
+            print(f"{name:<{width}}  {count}")
+        db.close()
+        return 0
+
+    if args.facets:
+        grouped = db.facet_tag_counts(kind)
+        if not grouped:
+            print("No refined tags yet. Run 'refine' first.")
+            db.close()
+            return 1
+        total_by_facet = dict(db.facet_counts(kind))
+        for facet, tags in grouped.items():
+            print(f"{facet} ({total_by_facet.get(facet, 0)} media)")
+            width = max(len(t) for t, _ in tags)
+            for tag, count in tags[: args.limit]:
+                print(f"  {tag:<{width}}  {count}")
+            print()
+        db.close()
+        return 0
+
+    if args.raw:
+        counts = db.keyword_counts(limit=args.limit, include_videos=args.video)
+        heading = "raw keywords"
+    else:
+        counts = db.tag_counts(limit=args.limit, kind=kind)
+        heading = "refined tags"
     if not counts:
-        print("No keywords indexed yet. Run 'scan' first.")
+        print(f"No {heading} yet. Run 'scan' then 'refine'.")
         db.close()
         return 1
+    print(f"top {heading}:")
     width = max(len(k) for k, _ in counts)
     for kw, count in counts:
         print(f"{kw:<{width}}  {count}")
@@ -700,6 +946,12 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"vlm:    {db.get_meta('vlm_model', '(not used)')}")
     print(f"files:  {total} ({described} described, {embedded} embedded)")
     print(f"videos: {videos} ({vframes_note(frames, vembedded, vdescribed)})")
+    tagged = db.has_tags("image")
+    typed = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE type != ''"
+    ).fetchone()["n"]
+    people = len(db.all_clusters("image"))
+    print(f"tags:   {tagged} refined tags, {typed} typed, {people} person clusters")
     db.close()
     return 0
 
@@ -761,6 +1013,12 @@ def main(argv: list[str] | None = None) -> int:
                           help="search videos only")
     p_search.add_argument("--image-only", action="store_true",
                           help="search images only (skip videos)")
+    p_search.add_argument("--type",
+                          help="list images of a type, e.g. selfie/scene/object "
+                               "(needs 'refine --classify')")
+    p_search.add_argument("--cluster",
+                          help="list photos of a named person cluster "
+                               "(needs 'people --label N=Name')")
     p_search.add_argument("--limit", type=int, default=50)
     p_search.set_defaults(func=cmd_search)
 
@@ -835,10 +1093,61 @@ def main(argv: list[str] | None = None) -> int:
                          help="show what would be trashed, then exit")
     p_clean.set_defaults(func=cmd_clean)
 
-    p_tags = sub.add_parser("tags", help="list indexed keywords with counts")
+    p_refine = sub.add_parser(
+        "refine",
+        help="clean keywords into canonical tags + facets; optionally type them",
+        description=(
+            "Rewrite each item's free-text keywords into canonical tags "
+            "(lowercased, singularized, synonyms merged, filler dropped) and "
+            "bucket them into facets (person/animal/object/scene/food/plant/"
+            "text/activity/color). The original keywords are kept in "
+            "raw_keywords. With --classify, also label every image's type "
+            "(selfie/portrait/group/scene/city/animal/object/food/document/"
+            "art) with zero-shot CLIP."
+        ),
+    )
+    _add_common(p_refine)
+    p_refine.add_argument("--classify", action="store_true",
+                          help="also label each image's type with zero-shot CLIP")
+    p_refine.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
+                          help=f"CLIP model for --classify (default: {DEFAULT_CLIP_MODEL})")
+    p_refine.add_argument("--recompute", action="store_true",
+                          help="reclassify types even if already set")
+    p_refine.set_defaults(func=cmd_refine)
+
+    p_people = sub.add_parser(
+        "people",
+        help="cluster person photos by CLIP similarity and name the clusters",
+        description=(
+            "Cluster every photo tagged with the 'person' facet by CLIP "
+            "embedding similarity, so photos of the same person group "
+            "together. This groups similar-looking people in similar shots, "
+            "not verified identities (CLIP is not a face-recognition model). "
+            "Name a cluster with --label N=Name; a named cluster can be listed "
+            "with 'search --cluster Name'."
+        ),
+    )
+    _add_common(p_people)
+    p_people.add_argument("--threshold", type=float, default=0.80,
+                          help="min cosine similarity to link two photos (default: 0.80)")
+    p_people.add_argument("--label", help="name a cluster, e.g. --label 3=Alice")
+    p_people.add_argument("--min-size", type=int, default=1,
+                          help="hide clusters smaller than this (default: 1)")
+    p_people.add_argument("--limit", type=int, default=20,
+                          help="max photos to list per cluster (default: 20)")
+    p_people.add_argument("--json", action="store_true", help="machine-readable output")
+    p_people.set_defaults(func=cmd_people)
+
+    p_tags = sub.add_parser("tags", help="list refined tags, facets or image types")
     _add_common(p_tags)
     p_tags.add_argument("--video", action="store_true",
-                        help="include video keywords")
+                        help="use video tags instead of image tags")
+    p_tags.add_argument("--facets", action="store_true",
+                        help="group tags into facets (person/scene/object/...)")
+    p_tags.add_argument("--types", action="store_true",
+                        help="show image type counts (selfie/scene/object/...)")
+    p_tags.add_argument("--raw", action="store_true",
+                        help="show the original keywords instead of refined tags")
     p_tags.add_argument("--limit", type=int, default=40)
     p_tags.set_defaults(func=cmd_tags)
 
