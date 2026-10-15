@@ -3,23 +3,23 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
 
-from .db import Database, FileRecord, db_path_for, open_db
+from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
-from .hashing import hash_to_hex, phash
+from .pipeline import build_jobs, run_scan, store_result
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
-
-IMAGE_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
-    ".tif", ".tiff", ".heic", ".heif",
-}
+from .video_groups import find_video_duplicate_groups, find_video_similarity_groups
+from .video_search import best_moment, format_timestamp
 
 _mp = lambda w, h: f"{w * h / 1_000_000:.1f}MP"
+
+
+def _dur(seconds: float) -> str:
+    return format_timestamp(seconds)
 
 
 def _register_heif() -> None:
@@ -31,30 +31,11 @@ def _register_heif() -> None:
         pass
 
 
-def _iter_images(root: str) -> list[str]:
-    paths: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-        for name in sorted(filenames):
-            if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
-                paths.append(os.path.join(dirpath, name))
-    return paths
-
-
-def _sha1_of(path: str) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 # -- commands ----------------------------------------------------------------
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
     _register_heif()
-    from PIL import Image
 
     root = os.path.abspath(args.root)
     db = Database(db_path_for(root, args.db))
@@ -63,115 +44,121 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if args.describe:
         db.set_meta("vlm_model", args.model)
 
-    paths = _iter_images(root)
-    if args.limit:
-        paths = paths[: args.limit]
+    jobs, total, up_to_date = build_jobs(
+        root, db, include_video=args.video, reanalyze=args.reanalyze,
+        limit=args.limit,
+    )
+    print(f"{total} media found, {up_to_date} up to date, {len(jobs)} to analyze")
 
-    to_process: list[str] = []
-    for path in paths:
-        existing = db.get_file(path)
-        try:
-            stat = os.stat(path)
-        except OSError:
-            continue
-        if (
-            existing
-            and not args.reanalyze
-            and existing["size"] == stat.st_size
-            and abs(existing["mtime"] - stat.st_mtime) < 1e-6
-        ):
-            continue
-        to_process.append(path)
-
-    skipped = len(paths) - len(to_process)
-    print(f"{len(paths)} images found, {skipped} up to date, {len(to_process)} to analyze")
-
-    # Phase A: content hash + perceptual hash + CLIP embedding
     from .clip import ClipEncoder
-    from .clip_processor import process_image
 
     encoder = ClipEncoder(model_id=args.clip_model, batch_size=args.batch)
     errors = 0
-    analyzed = 0
-    prepared: list[tuple] = []
-    for path in to_process:
+
+    def on_error(path: str, exc: Exception) -> None:
+        nonlocal errors
+        errors += 1
+        print(f"  ERROR {path}: {exc}", file=sys.stderr)
+
+    results = run_scan(
+        jobs, encoder, interval=args.interval, max_frames=args.max_frames,
+        batch_size=args.batch, workers=args.workers, on_error=on_error,
+    )
+    for result in results:
         try:
-            stat = os.stat(path)
-            existing = db.get_file(path)
-            # keep captions of unchanged files (e.g. --reanalyze); drop stale ones
-            unchanged = (
-                existing is not None
-                and existing["size"] == stat.st_size
-                and abs(existing["mtime"] - stat.st_mtime) < 1e-6
-            )
-            with Image.open(path) as img:
-                width, height = img.size
-                digest_phash = hash_to_hex(phash(img))
-                processed = process_image(img.convert("RGB"))
-            prepared.append((
-                path, stat.st_size, stat.st_mtime, _sha1_of(path), width, height,
-                digest_phash, processed,
-                existing["description"] if unchanged else "",
-                existing["keywords"] if unchanged else "",
-            ))
+            store_result(db, result)
         except Exception as exc:  # noqa: BLE001 - keep scanning past bad files
             errors += 1
-            print(f"  ERROR {path}: {exc}", file=sys.stderr)
-
-    for start in range(0, len(prepared), args.batch):
-        chunk = prepared[start : start + args.batch]
-        try:
-            vectors = encoder.embed_images([item[7] for item in chunk])
-        except Exception as exc:  # noqa: BLE001
-            errors += len(chunk)
-            print(f"  ERROR embedding batch: {exc}", file=sys.stderr)
-            continue
-        for item, vector in zip(chunk, vectors):
-            db.upsert_file(
-                path=item[0], size=item[1], mtime=item[2], sha1=item[3],
-                width=item[4], height=item[5], phash=item[6],
-                description=item[8], keywords=item[9],
-                embedding=vector.tobytes(),
-            )
-            analyzed += 1
+            print(f"  ERROR storing {result.job.path}: {exc}", file=sys.stderr)
+    analyzed = len(results)
     encoder.unload()
 
-    # Phase B: optional VLM captions, best version of each duplicate group only
+    # Optional VLM captions, best version of each duplicate group only.
     if args.describe:
-        records = db.all_files()
-        group_best: dict[int, int] = {}
-        for group in find_duplicate_groups(records):
-            for member in [group.best] + [rec for rec, _ in group.others]:
-                group_best[member.id] = group.best.id
-        pending = [r for r in records if not r.description]
-        to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
-        shadowed = len(pending) - len(to_describe)
-        if shadowed:
-            print(f"{shadowed} undescribed duplicate(s) skipped; "
-                  f"their best-resolution version is described instead")
-
-        if to_describe:
-            from .vision import Describer
-
-            describer = Describer(model_id=args.model)
-            for n, record in enumerate(to_describe, 1):
-                print(f"[{n}/{len(to_describe)}] describing "
-                      f"{os.path.relpath(record.path, root)}", file=sys.stderr)
-                try:
-                    description, keywords = describer.describe(record.path)
-                    db.set_description(record.id, description, ", ".join(keywords))
-                except Exception as exc:  # noqa: BLE001
-                    errors += 1
-                    print(f"  ERROR {record.path}: {exc}", file=sys.stderr)
-            describer.unload()
+        _describe_images(db, root, args, on_error)
+        if args.video:
+            _describe_videos(db, root, args, on_error)
 
     described = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
     ).fetchone()["n"]
+    vdescribed = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM videos WHERE description != ''"
+    ).fetchone()["n"]
     print(f"Done: analyzed {analyzed}, errors {errors}. Index: "
-          f"{db.count_files()} files, {described} described ({db.path})")
+          f"{db.count_files()} images ({described} described), "
+          f"{db.count_videos()} videos ({vdescribed} described) ({db.path})")
     db.close()
     return 0
+
+
+def _describe_images(db: Database, root: str, args, on_error) -> None:
+    records = db.all_files()
+    group_best: dict[int, int] = {}
+    for group in find_duplicate_groups(records):
+        for member in [group.best] + [rec for rec, _ in group.others]:
+            group_best[member.id] = group.best.id
+    pending = [r for r in records if not r.description]
+    to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
+    shadowed = len(pending) - len(to_describe)
+    if shadowed:
+        print(f"{shadowed} undescribed image duplicate(s) skipped; "
+              f"their best-resolution version is described instead")
+    if not to_describe:
+        return
+
+    from .vision import Describer
+
+    describer = Describer(model_id=args.model)
+    for n, record in enumerate(to_describe, 1):
+        print(f"[{n}/{len(to_describe)}] describing "
+              f"{os.path.relpath(record.path, root)}", file=sys.stderr)
+        try:
+            description, keywords = describer.describe(record.path)
+            db.set_description(record.id, description, ", ".join(keywords))
+        except Exception as exc:  # noqa: BLE001
+            on_error(record.path, exc)
+    describer.unload()
+
+
+def _describe_videos(db: Database, root: str, args, on_error) -> None:
+    import tempfile
+
+    from .video import extract_still_png
+
+    records = db.all_videos_with_frames()
+    group_best: dict[int, int] = {}
+    for group in find_video_duplicate_groups(records):
+        for member in [group.best] + [rec for rec, _ in group.others]:
+            group_best[member.id] = group.best.id
+    pending = [r for r in records if not r.description]
+    to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
+    shadowed = len(pending) - len(to_describe)
+    if shadowed:
+        print(f"{shadowed} undescribed video duplicate(s) skipped; "
+              f"their best-resolution version is described instead")
+    if not to_describe:
+        return
+
+    from .vision import Describer
+
+    describer = Describer(model_id=args.model)
+    for n, record in enumerate(to_describe, 1):
+        print(f"[{n}/{len(to_describe)}] describing "
+              f"{os.path.relpath(record.path, root)}", file=sys.stderr)
+        try:
+            png = extract_still_png(record.path, at=record.duration / 2)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp.write(png)
+                tmp_path = tmp.name
+            try:
+                description, keywords = describer.describe(tmp_path)
+            finally:
+                os.unlink(tmp_path)
+            db.set_video_description(record.id, description, ", ".join(keywords))
+        except Exception as exc:  # noqa: BLE001
+            on_error(record.path, exc)
+    describer.unload()
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -193,27 +180,42 @@ def cmd_search(args: argparse.Namespace) -> int:
         db.close()
         return 2
 
+    include_images = not args.video
+    include_videos = not args.image_only
+
     use_clip = args.clip
     if not use_clip and not args.fts:
-        # default to CLIP when embeddings are available, keywords otherwise
         _, blobs = db.all_embeddings()
-        use_clip = bool(blobs)
+        use_clip = bool(blobs) or bool(db.video_embeddings())
 
     if use_clip:
-        return _clip_search(db, " ".join(terms), args.limit)
+        return _clip_search(db, " ".join(terms), args.limit,
+                            include_images=include_images,
+                            include_videos=include_videos)
 
-    records = db.search(terms, limit=args.limit)
-    if not records:
+    count = 0
+    if include_images:
+        for r in db.search(terms, limit=args.limit):
+            print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
+                  f"{_mp(r['width'], r['height'])})")
+            if r["keywords"]:
+                print(f"  keywords: {r['keywords']}")
+            if r["description"]:
+                print(f"  {r['description']}")
+            count += 1
+    if include_videos:
+        for r in db.search_videos(terms, limit=args.limit):
+            print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
+                  f"{_dur(r['duration'])})")
+            if r["keywords"]:
+                print(f"  keywords: {r['keywords']}")
+            if r["description"]:
+                print(f"  {r['description']}")
+            count += 1
+    if not count:
         print("No matches.")
         db.close()
         return 1
-    print(f"{len(records)} match(es):")
-    for r in records:
-        print(f"\n{r['path']}  ({r['width']}x{r['height']}, {_mp(r['width'], r['height'])})")
-        if r["keywords"]:
-            print(f"  keywords: {r['keywords']}")
-        if r["description"]:
-            print(f"  {r['description']}")
     db.close()
     return 0
 
@@ -227,24 +229,49 @@ def _load_embedding_matrix(db: Database):
     return ids, np.stack([np.frombuffer(b, dtype=np.float32) for b in blobs])
 
 
-def _clip_search(db: Database, query_text: str, limit: int) -> int:
+def _clip_search(db: Database, query_text: str, limit: int, *,
+                 include_images: bool = True, include_videos: bool = True) -> int:
     import numpy as np
 
     from .clip import ClipEncoder
 
     ids, matrix = _load_embedding_matrix(db)
-    if matrix is None:
-        print("No CLIP embeddings yet. Run 'media-match embed' first.")
+    video_embeddings = db.video_embeddings() if include_videos else {}
+    if (matrix is None or not include_images) and not video_embeddings:
+        print("No CLIP embeddings yet. Run 'media-match scan' first.")
         db.close()
         return 1
+
     query = ClipEncoder().embed_texts([query_text])[0]
-    sims = matrix @ query
-    order = np.argsort(-sims)[:limit]
-    print(f"CLIP text->image search for {query_text!r}:")
-    for idx in order:
-        r = db.conn.execute("SELECT * FROM files WHERE id = ?", (ids[idx],)).fetchone()
-        print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
-              f"{_mp(r['width'], r['height'])})  similarity={sims[idx]:.3f}")
+
+    hits: list[tuple[float, str, object, float | None]] = []
+    if include_images and matrix is not None:
+        sims = matrix @ query
+        for idx in np.argsort(-sims)[:limit]:
+            row = db.conn.execute(
+                "SELECT * FROM files WHERE id = ?", (ids[int(idx)],)
+            ).fetchone()
+            hits.append((float(sims[int(idx)]), "image", row, None))
+    if video_embeddings:
+        by_id = {r.id: r for r in db.all_videos()}
+        for vid, frames in video_embeddings.items():
+            record = by_id.get(vid)
+            if record is None:
+                continue
+            frame_map = {t: np.frombuffer(b, dtype=np.float32) for t, b in frames}
+            score, ts = best_moment(query, frame_map)
+            hits.append((score, "video", record, ts))
+
+    hits.sort(key=lambda h: -h[0])
+    print(f"CLIP text->media search for {query_text!r}:")
+    for score, kind, record, ts in hits[:limit]:
+        if kind == "image":
+            print(f"\n{record['path']}  ({record['width']}x{record['height']}, "
+                  f"{_mp(record['width'], record['height'])})  similarity={score:.3f}")
+        else:
+            print(f"\n{record.path}  ({record.width}x{record.height}, "
+                  f"{_dur(record.duration)})  similarity={score:.3f}  "
+                  f"@ {format_timestamp(ts)}")
     db.close()
     return 0
 
@@ -321,6 +348,10 @@ def cmd_similar(args: argparse.Namespace) -> int:
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — run 'media-match scan {root}' first.")
         return 1
+
+    if args.video:
+        return _similar_videos(db, args)
+
     ids, matrix = _load_embedding_matrix(db)
     if matrix is None:
         print("No CLIP embeddings in the index. Run 'media-match embed' first.")
@@ -385,6 +416,63 @@ def cmd_similar(args: argparse.Namespace) -> int:
     return 0
 
 
+def _similar_videos(db: Database, args) -> int:
+    import numpy as np
+
+    from .clip import ClipEncoder
+
+    embeddings = db.video_embeddings()
+    if not embeddings:
+        print("No CLIP embeddings for videos. Run 'media-match scan --video' first.")
+        db.close()
+        return 1
+    records = db.all_videos()
+    id_to_record = {r.id: r for r in records}
+
+    if args.image:
+        target = os.path.abspath(args.image)
+        query = ClipEncoder().embed_image_paths([target])[0]
+        hits = []
+        for vid, frames in embeddings.items():
+            frame_map = {t: np.frombuffer(b, dtype=np.float32) for t, b in frames}
+            score, ts = best_moment(query, frame_map)
+            hits.append((score, vid, ts))
+        hits.sort(reverse=True)
+        print(f"Videos similar to {target}:")
+        for score, vid, ts in hits[: args.limit]:
+            record = id_to_record[vid]
+            print(f"  {score:.3f}  {record.path}  "
+                  f"({record.width}x{record.height}, {_dur(record.duration)})  "
+                  f"@ {format_timestamp(ts)}")
+        db.close()
+        return 0
+
+    stacked = {
+        vid: np.stack([np.frombuffer(b, np.float32) for _t, b in frames])
+        for vid, frames in embeddings.items() if frames
+    }
+    groups = find_video_similarity_groups(
+        records, stacked, threshold=args.threshold
+    )
+    if not groups:
+        print(f"No semantic video groups at cosine threshold {args.threshold}.")
+        db.close()
+        return 0
+    total = sum(g.size for g in groups)
+    print(f"{len(groups)} semantic video group(s), {total} videos "
+          f"(cosine >= {args.threshold}; best version marked with *)\n")
+    for n, group in enumerate(groups, 1):
+        b = group.best
+        print(f"Group {n} ({group.size} videos)")
+        print(f"  * {b.path}  ({b.width}x{b.height}, {_dur(b.duration)}) [best]")
+        for record, sim in group.others:
+            print(f"    {record.path}  ({record.width}x{record.height}, "
+                  f"{_dur(record.duration)}) similarity={sim:.3f}")
+        print()
+    db.close()
+    return 0
+
+
 def cmd_duplicates(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -392,29 +480,46 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
         print(f"No index at {db_path_for(root, args.db)} — "
               f"run 'media-match scan {root}' first.")
         return 1
-    groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
+
+    if args.video:
+        groups = find_video_duplicate_groups(
+            db.all_videos_with_frames(),
+            frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
+        )
+    else:
+        groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
     if not groups:
         print("No duplicate groups found.")
         db.close()
         return 0
 
     total = sum(g.size for g in groups)
-    reclaimable = sum(
-        r.size for g in groups for r, _ in g.others
-    )
 
     if args.json:
-        payload = [
-            {
-                "best": g.best.path,
-                "best_size": [g.best.width, g.best.height],
-                "duplicates": [
-                    {"path": r.path, "size": [r.width, r.height], "hash_distance": d}
-                    for r, d in g.others
-                ],
-            }
-            for g in groups
-        ]
+        payload = []
+        for g in groups:
+            if args.video:
+                best = {
+                    "best": g.best.path,
+                    "duration": g.best.duration,
+                    "resolution": [g.best.width, g.best.height],
+                    "duplicates": [
+                        {"path": r.path, "duration": r.duration,
+                         "resolution": [r.width, r.height], "min_hamming": d}
+                        for r, d in g.others
+                    ],
+                }
+            else:
+                best = {
+                    "best": g.best.path,
+                    "best_size": [g.best.width, g.best.height],
+                    "duplicates": [
+                        {"path": r.path, "size": [r.width, r.height],
+                         "hash_distance": d}
+                        for r, d in g.others
+                    ],
+                }
+            payload.append(best)
         print(json.dumps(payload, indent=2))
         db.close()
         return 0
@@ -422,11 +527,18 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
     for n, g in enumerate(groups, 1):
         print(f"Group {n} ({g.size} files)")
         b = g.best
-        print(f"  * {b.path}  ({b.width}x{b.height}, {_mp(b.width, b.height)}) [best]")
-        for r, dist in g.others:
-            print(f"    {r.path}  ({r.width}x{r.height}, {_mp(r.width, r.height)}) "
-                  f"hamming={dist}")
+        if args.video:
+            print(f"  * {b.path}  ({b.width}x{b.height}, {_dur(b.duration)}) [best]")
+            for r, dist in g.others:
+                print(f"    {r.path}  ({r.width}x{r.height}, {_dur(r.duration)}) "
+                      f"hamming_min={dist}")
+        else:
+            print(f"  * {b.path}  ({b.width}x{b.height}, {_mp(b.width, b.height)}) [best]")
+            for r, dist in g.others:
+                print(f"    {r.path}  ({r.width}x{r.height}, {_mp(r.width, r.height)}) "
+                      f"hamming={dist}")
         print()
+    print(f"{len(groups)} group(s), {total} files")
     db.close()
     return 0
 
@@ -448,7 +560,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
         trash_files,
     )
 
-    groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
+    if args.video:
+        groups = find_video_duplicate_groups(
+            db.all_videos_with_frames(),
+            frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
+        )
+    else:
+        groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
     if not groups:
         print("No duplicate groups found.")
         db.close()
@@ -476,7 +594,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
             for error in session.errors:
                 print(f"  {error}")
             if moved:
-                # files are already gone from disk; use indexed byte sizes
                 size = sum(r.size for r in moved)
                 print(f"Moved {len(moved)} file(s) to the Trash "
                       f"({human_size(size)}; recoverable until emptied); "
@@ -504,7 +621,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return 1
 
     trashed, failed = trash_files(trash)
-    db.delete_files([r.id for r in trashed])
+    db.delete_media(trashed)
     print(f"\nMoved {len(trashed)} file(s) to the Trash (recoverable until "
           f"emptied); removed {len(trashed)} entries from the index. "
           f"{len(failed)} failed.")
@@ -519,7 +636,7 @@ def cmd_tags(args: argparse.Namespace) -> int:
         print(f"No index at {db_path_for(root, args.db)} — "
               f"run 'media-match scan {root}' first.")
         return 1
-    counts = db.keyword_counts(limit=args.limit)
+    counts = db.keyword_counts(limit=args.limit, include_videos=args.video)
     if not counts:
         print("No keywords indexed yet. Run 'scan' first.")
         db.close()
@@ -542,16 +659,30 @@ def cmd_stats(args: argparse.Namespace) -> int:
     described = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
     ).fetchone()["n"]
+    embedded = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE embedding IS NOT NULL"
+    ).fetchone()["n"]
+    videos = db.count_videos()
+    frames = db.conn.execute("SELECT COUNT(*) AS n FROM video_frames").fetchone()["n"]
+    vembedded = db.conn.execute(
+        "SELECT COUNT(DISTINCT video_id) AS n FROM video_frames "
+        "WHERE embedding IS NOT NULL"
+    ).fetchone()["n"]
+    vdescribed = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM videos WHERE description != ''"
+    ).fetchone()["n"]
     print(f"index:  {db.path}")
     print(f"root:   {db.get_meta('root', root)}")
     print(f"clip:   {db.get_meta('clip_model', '(not set)')}")
     print(f"vlm:    {db.get_meta('vlm_model', '(not used)')}")
-    embedded = db.conn.execute(
-        "SELECT COUNT(*) AS n FROM files WHERE embedding IS NOT NULL"
-    ).fetchone()["n"]
     print(f"files:  {total} ({described} described, {embedded} embedded)")
+    print(f"videos: {videos} ({vframes_note(frames, vembedded, vdescribed)})")
     db.close()
     return 0
+
+
+def vframes_note(frames: int, embedded: int, described: int) -> str:
+    return (f"{frames} keyframes, {embedded} embedded, {described} described")
 
 
 # -- parser ------------------------------------------------------------------
@@ -566,27 +697,35 @@ def _add_common(p: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="media-match",
-        description="Index photos with a local MLX vision model; search people/"
-                    "objects and group duplicates across resolutions.",
+        description="Index photos and videos with local MLX models; search "
+                    "people/objects and group duplicates across resolutions.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_scan = sub.add_parser("scan", help="analyze new/changed images in a folder")
+    p_scan = sub.add_parser("scan", help="analyze new/changed media in a folder")
     _add_common(p_scan)
     p_scan.add_argument("--describe", action="store_true",
-                        help="also caption images with the vision model "
+                        help="also caption media with the vision model "
                              "(best version of each duplicate group only)")
+    p_scan.add_argument("--video", action="store_true",
+                        help="also index video files (keyframes each)")
     p_scan.add_argument("--model", default=DEFAULT_MODEL,
                         help=f"MLX vision model for --describe (default: {DEFAULT_MODEL})")
     p_scan.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
                         help=f"CLIP model for embeddings (default: {DEFAULT_CLIP_MODEL})")
     p_scan.add_argument("--batch", type=int, default=16, help="CLIP batch size")
-    p_scan.add_argument("--limit", type=int, help="only scan first N images")
+    p_scan.add_argument("--workers", type=int, default=4,
+                        help="parallel CPU prep threads feeding the GPU (default: 4)")
+    p_scan.add_argument("--interval", type=float, default=1.0,
+                        help="target seconds between video keyframes (default: 1.0)")
+    p_scan.add_argument("--max-frames", type=int, default=120,
+                        help="cap on keyframes per video (default: 120)")
+    p_scan.add_argument("--limit", type=int, help="only scan first N media items")
     p_scan.add_argument("--reanalyze", action="store_true",
                         help="re-analyze files even if unchanged")
     p_scan.set_defaults(func=cmd_scan)
 
-    p_search = sub.add_parser("search", help="find images by person/object/text")
+    p_search = sub.add_parser("search", help="find media by person/object/text")
     _add_common(p_search)
     p_search.add_argument("query", nargs="*", help="free-text search terms")
     p_search.add_argument("--person", help="terms describing a person, e.g. 'woman red jacket'")
@@ -595,6 +734,10 @@ def main(argv: list[str] | None = None) -> int:
                           help="force CLIP embedding search (default when embeddings exist)")
     p_search.add_argument("--fts", action="store_true",
                           help="force keyword/full-text search over captions")
+    p_search.add_argument("--video", action="store_true",
+                          help="search videos only")
+    p_search.add_argument("--image-only", action="store_true",
+                          help="search images only (skip videos)")
     p_search.add_argument("--limit", type=int, default=50)
     p_search.set_defaults(func=cmd_search)
 
@@ -609,12 +752,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_sim = sub.add_parser(
         "similar",
-        help="group the tree by CLIP similarity, or find neighbors of one image",
+        help="group the tree by CLIP similarity, or find neighbors of one file",
     )
     _add_common(p_sim)
+    p_sim.add_argument("--video", action="store_true",
+                       help="group videos instead of images")
     p_sim.add_argument("--image",
                        help="compare a single image against the index instead "
-                            "of grouping the whole tree")
+                            "of grouping the whole tree (also valid with --video)")
     p_sim.add_argument("--threshold", type=float, default=0.85,
                        help="min cosine similarity for tree grouping (default: 0.85)")
     p_sim.add_argument("--limit", type=int, default=10,
@@ -623,8 +768,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_dup = sub.add_parser("duplicates", help="group duplicates; best resolution wins")
     _add_common(p_dup)
+    p_dup.add_argument("--video", action="store_true",
+                       help="group duplicate/re-encode videos by keyframe pHash")
     p_dup.add_argument("--threshold", type=int, default=8,
-                       help="max pHash hamming distance 0-64 (default: 8)")
+                       help="max pHash hamming distance 0-64 for images (default: 8)")
+    p_dup.add_argument("--frame-threshold", type=int, default=12,
+                       help="max keyframe pHash hamming distance for videos (default: 12)")
+    p_dup.add_argument("--ratio", type=float, default=0.6,
+                       help="min fraction of matching keyframes for videos (default: 0.6)")
     p_dup.add_argument("--json", action="store_true", help="machine-readable output")
     p_dup.set_defaults(func=cmd_duplicates)
 
@@ -642,12 +793,19 @@ def main(argv: list[str] | None = None) -> int:
             "and e ask y/n first), e executes only the decisions made so far "
             "up to the bar's group and keeps the review open, q or esc quits "
             "but asks y/n first whenever files are still marked for the "
-            "Trash. Without a TTY it falls back to line-based prompts."
+            "Trash. Without a TTY it falls back to line-based prompts. With "
+            "--video the same UI reviews duplicate videos."
         ),
     )
     _add_common(p_clean)
+    p_clean.add_argument("--video", action="store_true",
+                         help="review duplicate videos instead of images")
     p_clean.add_argument("--threshold", type=int, default=8,
-                         help="max pHash hamming distance 0-64 (default: 8)")
+                         help="max pHash hamming distance 0-64 for images (default: 8)")
+    p_clean.add_argument("--frame-threshold", type=int, default=12,
+                         help="max keyframe pHash hamming distance for videos (default: 12)")
+    p_clean.add_argument("--ratio", type=float, default=0.6,
+                         help="min fraction of matching keyframes for videos (default: 0.6)")
     p_clean.add_argument("--yes", action="store_true",
                          help="trash the algorithm's worse copies without prompting")
     p_clean.add_argument("--dry-run", action="store_true",
@@ -656,6 +814,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_tags = sub.add_parser("tags", help="list indexed keywords with counts")
     _add_common(p_tags)
+    p_tags.add_argument("--video", action="store_true",
+                        help="include video keywords")
     p_tags.add_argument("--limit", type=int, default=40)
     p_tags.set_defaults(func=cmd_tags)
 

@@ -223,7 +223,7 @@ class CleanSession:
             return
         self.x_trashed.append(record)
         if self.db is not None:
-            self.db.delete_files([record.id])
+            self.db.delete_media([record])
         self._forget(record)
         self.status = (
             f"Moved {os.path.basename(record.path)} to the Trash "
@@ -238,7 +238,7 @@ class CleanSession:
             except Exception as exc:  # noqa: BLE001
                 self.errors.append(f"{record.path}: {exc}")
         if self.db is not None and self.batch_trashed:
-            self.db.delete_files([r.id for r in self.batch_trashed])
+            self.db.delete_media(list(self.batch_trashed))
         self.done = True
 
     def _execute_to_cursor(self, gi: int, pending: list[FileRecord]) -> None:
@@ -262,7 +262,7 @@ class CleanSession:
             trashed += 1
             size += record.size  # file is already in the Trash; use index size
         if self.db is not None and trashed:
-            self.db.delete_files([r.id for r in self.batch_trashed[-trashed:]])
+            self.db.delete_media(list(self.batch_trashed[-trashed:]))
         for group in self.groups[: gi + 1]:
             # only groups with nothing pending left are actually completed
             group.done = not self.pending_trash([group])
