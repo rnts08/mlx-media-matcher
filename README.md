@@ -153,6 +153,16 @@ needs a face-embedding model). `people --label N=Name` names a cluster and
 .venv/bin/media-match clean ~/Movies --video       # same review UI as images
 ```
 
+> **Quote paths that contain spaces or shell metacharacters** (`&`, `$`, `;`,
+> quotes, `…`). The program handles them fine, but an *unquoted* `&` makes the
+> shell split the command in two, so it fails with "no such file or directory"
+> before it ever reaches us:
+>
+> ```bash
+> media-match scan "/Users/me/_Private/Pictures/Timh & Dung"   # ✓ quoted
+> media-match scan /Users/me/_Private/Pictures/Timh & Dung      # ✗ shell splits on &
+> ```
+
 Example `duplicates` output:
 
 ```
