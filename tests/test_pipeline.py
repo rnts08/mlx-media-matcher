@@ -66,6 +66,23 @@ def test_run_scan_embeds_images_in_batches(tmp_path):
     assert db.count_files() == 5
 
 
+def test_run_scan_bounded_window_processes_all(tmp_path):
+    # workers=1 -> in-flight window of 4, so 10 jobs must be refilled in waves
+    root = tmp_path / "tree"
+    root.mkdir()
+    for i in range(10):
+        _write_image(root / f"{i}.png", color=(i * 10, 5, 5))
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+
+    encoder = FakeEncoder()
+    collected = []
+    n = run_scan(jobs, encoder, interval=1.0, max_frames=120, batch_size=3,
+                 workers=1, on_result=collected.append)
+    assert n == 10 and len(collected) == 10
+    assert encoder.calls == 4  # ceil(10/3)
+
+
 def test_run_scan_failed_batch_keeps_frame_alignment(tmp_path):
     root = tmp_path / "tree"
     root.mkdir()

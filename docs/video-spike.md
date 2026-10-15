@@ -57,7 +57,10 @@ prep and burst during embedding — the "spikes and valleys".
 The new pipeline runs the CPU work on a thread pool that feeds a queue the main
 thread drains in GPU batches. Images and video keyframes share the same queue,
 so both kinds of media fill the same pipeline. Processed arrays are released as
-soon as they are queued, so memory stays bounded on large trees.
+soon as they are queued, and results are streamed to the database as soon as
+their frames are embedded, so memory stays bounded on large trees. The pool
+keeps a bounded number of prep jobs in flight (at least two batches' worth), so
+a huge tree does not spawn one Future per file and the GPU never starves.
 
 ### Measured (Apple M5, CLIP ViT-B/32, 300× 224px JPEGs, best of 3)
 

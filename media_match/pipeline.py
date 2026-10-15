@@ -11,7 +11,7 @@ queue, so both kinds of media fill the same pipeline.
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -216,35 +216,60 @@ def run_scan(
             emit(owner)
 
     prepare_one = partial(prepare, interval=interval, max_frames=max_frames)
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(prepare_one, job): job for job in jobs}
-        done = 0
-        for future in as_completed(futures):
-            job = futures[future]
-            done += 1
-            if progress:
-                progress(done, len(jobs), job.path)
+    job_of: dict[object, ScanJob] = {}
+    pending: set = set()
+    # keep only a bounded number of prep jobs in flight so a huge tree does not
+    # spawn one Future per file up front. It must hold at least a couple of
+    # batches or the GPU stalls waiting for the queue to refill.
+    window = max(max(1, workers) * 4, batch_size * 2)
+
+    def fill(iterator) -> None:
+        while len(pending) < window:
             try:
-                result = future.result()
-            except Exception as exc:  # noqa: BLE001 - keep scanning past bad files
-                if on_error:
-                    on_error(job.path, exc)
-                continue
-            owner = next_owner
-            next_owner += 1
-            results[owner] = result
-            owners[owner] = [None] * len(result.arrays)
-            remaining[owner] = len(result.arrays)
-            if not result.arrays:
-                emit(owner)
-                continue
-            for frame, array in enumerate(result.arrays):
-                batch.append((owner, frame, array))
-                if len(batch) >= batch_size:
-                    flush()
-            # the processed arrays are only needed once they are in the batch
-            # queue; drop them so memory stays bounded on large trees
-            result.arrays = []
+                job = next(iterator)
+            except StopIteration:
+                return
+            future = pool.submit(prepare_one, job)
+            job_of[future] = job
+            pending.add(future)
+
+    def handle(result: ScanResult) -> None:
+        nonlocal next_owner
+        owner = next_owner
+        next_owner += 1
+        results[owner] = result
+        owners[owner] = [None] * len(result.arrays)
+        remaining[owner] = len(result.arrays)
+        if not result.arrays:
+            emit(owner)
+            return
+        for frame, array in enumerate(result.arrays):
+            batch.append((owner, frame, array))
+            if len(batch) >= batch_size:
+                flush()
+        # the processed arrays are only needed once they are in the batch
+        # queue; drop them so memory stays bounded on large trees
+        result.arrays = []
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        iterator = iter(jobs)
+        fill(iterator)
+        done = 0
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                job = job_of.pop(future)
+                done += 1
+                if progress:
+                    progress(done, len(jobs), job.path)
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 - keep scanning past bad files
+                    if on_error:
+                        on_error(job.path, exc)
+                    continue
+                handle(result)
+            fill(iterator)
         flush()
 
     return emitted
