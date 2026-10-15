@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
@@ -989,6 +990,145 @@ def vframes_note(frames: int, embedded: int, described: int) -> str:
     return (f"{frames} keyframes, {embedded} embedded, {described} described")
 
 
+# -- help --------------------------------------------------------------------
+
+# Filled in main(); maps a command name to its argparse parser.
+_SUBPARSERS: dict[str, argparse.ArgumentParser] = {}
+
+# One-line summary for the top-level command listing and the `help` command.
+_COMMAND_SUMMARIES = {
+    "scan": "index new/changed media (hash + pHash + CLIP)",
+    "search": "find media by person/object/text (CLIP by default)",
+    "embed": "compute CLIP embeddings for indexed images",
+    "similar": "group the tree by CLIP similarity, or find neighbors of one file",
+    "duplicates": "group duplicates; best resolution wins",
+    "clean": "review duplicate groups and move rejected copies to the Trash",
+    "refine": "rewrite keywords into canonical tags/facets; type photos",
+    "people": "cluster person photos by similarity and name the clusters",
+    "tags": "list refined tags, facets or image types",
+    "stats": "show index statistics",
+    "help": "show this guide; 'help <cmd>' describes one command",
+}
+
+# A runnable example per command, shown in `media-match help <cmd>`.
+_EXAMPLES = {
+    "scan": "media-match scan ~/Pictures --describe --refine --classify",
+    "search": "media-match search ~/Pictures --object bicycle",
+    "embed": "media-match embed ~/Pictures",
+    "similar": "media-match similar ~/Pictures --threshold 0.9",
+    "duplicates": "media-match duplicates ~/Pictures",
+    "clean": "media-match clean ~/Pictures --dry-run",
+    "refine": "media-match refine ~/Pictures --classify",
+    "people": "media-match people ~/Pictures --label 1=Alice",
+    "tags": "media-match tags ~/Pictures --facets",
+    "stats": "media-match stats ~/Pictures",
+}
+
+
+def _flag_lines(parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
+    """[(flags, help), ...] for every option, noting defaults when missing."""
+    out: list[tuple[str, str]] = []
+    for action in parser._actions:
+        if not action.option_strings or action.dest == "help":
+            continue
+        if action.default is argparse.SUPPRESS:
+            continue
+        flags = ", ".join(action.option_strings)
+        if action.nargs != 0:
+            metavar = action.metavar or action.dest.upper()
+            flags = f"{flags} {metavar}"
+        text = action.help or ""
+        default = action.default
+        if default not in (None, False, argparse.SUPPRESS) and "default" not in text.lower():
+            text += f"  (default: {default})"
+        out.append((flags, text))
+    return out
+
+
+def _positional_lines(parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for action in parser._actions:
+        if action.option_strings or action.dest == "help":
+            continue
+        if isinstance(action, argparse._SubParsersAction):
+            continue
+        name = action.metavar or action.dest.upper()
+        if action.nargs == "*":
+            name += "..."
+        out.append((name, action.help or ""))
+    return out
+
+
+def _command_section(name: str) -> str:
+    parser = _SUBPARSERS[name]
+    lines = [f"{name} — {_COMMAND_SUMMARIES.get(name, '')}", ""]
+    if parser.description:
+        lines.append(textwrap.dedent(parser.description).strip())
+        lines.append("")
+    lines.append(parser.format_usage().strip())
+
+    positional = _positional_lines(parser)
+    if positional:
+        lines += ["", "positional arguments:"]
+        width = max(len(n) for n, _ in positional)
+        for n, t in positional:
+            lines.append(f"  {n:<{width}}  {t}")
+
+    flags = _flag_lines(parser)
+    if flags:
+        lines += ["", "options:"]
+        width = max(len(f) for f, _ in flags)
+        for f, t in flags:
+            lines.append(f"  {f:<{width}}  {t}")
+
+    if name in _EXAMPLES:
+        lines += ["", f"example: {_EXAMPLES[name]}"]
+    return "\n".join(lines)
+
+
+def _print_full_help() -> None:
+    lines = [
+        "Local photo-library analyzer built on Apple's MLX. Point it at a folder",
+        "and it builds an index that lets you:",
+        "",
+        "  - find photos by person, object or free text (CLIP vector search)",
+        "  - group duplicates across resolutions, and mark the best version",
+        "  - group semantic near-duplicates",
+        "  - refine tags into facets (person/scene/object/...) and type each photo",
+        "  - cluster photos of the same person and name the clusters",
+        "  - index video files (keyframes at ~1 fps) with the same machinery",
+        "",
+        "usage: media-match [--help] <command> [command options] [args...]",
+        "",
+        "commands:",
+    ]
+    width = max(len(c) for c in _COMMAND_SUMMARIES)
+    for name in sorted(_COMMAND_SUMMARIES):
+        lines.append(f"  {name:<{width}}  {_COMMAND_SUMMARIES[name]}")
+    lines += [
+        "",
+        "Every command accepts --db to override the index location and takes a",
+        "root argument (default: the current directory).",
+        "",
+        "Run 'media-match <command> --help' or 'media-match help <command>' for",
+        "the full flag list of one command, with defaults and an example.",
+        "Run 'media-match help' again to re-read this guide.",
+    ]
+    print("\n".join(lines))
+
+
+def _cmd_help(args: argparse.Namespace) -> int:
+    if args.command:
+        if args.command not in _SUBPARSERS:
+            print(f"Unknown command: {args.command}")
+            print("Commands: " + ", ".join(sorted(_COMMAND_SUMMARIES)))
+            return 1
+        print(_command_section(args.command))
+        return 0
+    _print_full_help()
+    return 0
+
+
 # -- parser ------------------------------------------------------------------
 
 
@@ -1001,8 +1141,17 @@ def _add_common(p: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="media-match",
-        description="Index photos and videos with local MLX models; search "
-                    "people/objects and group duplicates across resolutions.",
+        description=(
+            "Local photo-library analyzer built on Apple's MLX. Index photos "
+            "and videos locally (no cloud, no PyTorch), then find, group, tag "
+            "and clean them with CLIP embeddings, perceptual hashes and "
+            "optional vision-model captions."
+        ),
+        epilog=(
+            "Run 'media-match help' for the full guide (every command and "
+            "flag), or 'media-match <command> --help' for one command."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1037,7 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_search = sub.add_parser("search", help="find media by person/object/text")
     _add_common(p_search)
-    p_search.add_argument("query", nargs="*", help="free-text search terms")
+    p_search.add_argument("query", nargs="*", metavar="QUERY",
+                          help="free-text search terms (ANDed together)")
     p_search.add_argument("--person", help="terms describing a person, e.g. 'woman red jacket'")
     p_search.add_argument("--object", help="terms describing an object, e.g. 'bicycle'")
     p_search.add_argument("--clip", action="store_true",
@@ -1189,6 +1339,27 @@ def main(argv: list[str] | None = None) -> int:
     p_stats = sub.add_parser("stats", help="show index statistics")
     _add_common(p_stats)
     p_stats.set_defaults(func=cmd_stats)
+
+    p_help = sub.add_parser(
+        "help",
+        help="show the full guide (commands, flags, examples)",
+        description=(
+            "Print this guide. With a command name, print that command's full "
+            "help: every positional argument, every flag with its default, "
+            "and a runnable example."
+        ),
+    )
+    p_help.add_argument("command", nargs="?", metavar="COMMAND",
+                        help="command to describe in detail (default: the whole guide)")
+    p_help.set_defaults(func=_cmd_help)
+
+    for name, parser_obj in (
+        ("scan", p_scan), ("search", p_search), ("embed", p_embed),
+        ("similar", p_sim), ("duplicates", p_dup), ("clean", p_clean),
+        ("refine", p_refine), ("people", p_people), ("tags", p_tags),
+        ("stats", p_stats), ("help", p_help),
+    ):
+        _SUBPARSERS[name] = parser_obj
 
     args = parser.parse_args(argv)
     return args.func(args)

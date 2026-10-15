@@ -90,6 +90,10 @@ needs a face-embedding model). `people --label N=Name` names a cluster and
 # 1. index a photo tree: content hash + pHash + CLIP embeddings (~500 img/s)
 .venv/bin/media-match scan ~/Pictures
 
+#    the built-in guide (every command, every flag, examples)
+.venv/bin/media-match help              # all commands + flags + an example each
+.venv/bin/media-match help scan         # one command in full
+
 # 1b. optional: add captions with the vision model (~1 s/image, only for the
 #     best-resolution version of each duplicate group) and, in the same pass,
 #     refine the tags and type every photo
@@ -172,6 +176,7 @@ Group 1 (2 files)
 | `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
 | `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
+| `help [command]` | the full guide: every command, every flag with its default, and a runnable example | optional command name |
 
 All commands take `--db` to override the index location. `root` defaults to
 the current directory. Supported image formats: JPEG, PNG, WebP, GIF, BMP,
