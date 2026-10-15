@@ -2,6 +2,7 @@ import numpy as np
 
 from media_match.db import VideoRecord
 from media_match.video_groups import (
+    _candidate_pairs,
     find_video_duplicate_groups,
     find_video_similarity_groups,
     pair_ratio,
@@ -55,6 +56,32 @@ def test_find_video_duplicate_groups_prefers_resolution():
                 "fffffffffffffff4", "fffffffffffffff8"])
     groups = find_video_duplicate_groups([hd, sd, other], frame_threshold=12,
                                          merge_ratio=0.6)
+    assert len(groups) == 1
+    assert groups[0].best.path == "/movies/a_1080.mp4"
+    assert [r.path for r, _ in groups[0].others] == ["/movies/a_480.mp4"]
+
+
+def test_candidate_pairs_shared_band():
+    a = ["0000000000000001"]
+    b = ["0000000000000003"]   # differs in 1 bit -> shares every band
+    c = ["ffffffffffffffff"]
+    pairs = _candidate_pairs([a, b, c])
+    assert (0, 1) in pairs
+    assert (0, 2) not in pairs and (1, 2) not in pairs
+
+
+def test_duplicate_group_forced_lsh_path():
+    # full_compare_limit=0 forces the band-bucket candidate path; an exact
+    # re-encode must still be found, and an unrelated video never grouped.
+    hashes = ["0000000000000001", "0000000000000002",
+              "0000000000000004", "0000000000000008"]
+    hd = _v(1, "/movies/a_1080.mp4", 1920, 1080, 5_000_000, hashes)
+    sd = _v(2, "/movies/a_480.mp4", 854, 480, 800_000, hashes)
+    other = _v(3, "/movies/other.mp4", 1920, 1080, 5_000_000,
+               ["fffffffffffffff1", "fffffffffffffff2",
+                "fffffffffffffff4", "fffffffffffffff8"])
+    groups = find_video_duplicate_groups([hd, sd, other], frame_threshold=12,
+                                         merge_ratio=0.6, full_compare_limit=0)
     assert len(groups) == 1
     assert groups[0].best.path == "/movies/a_1080.mp4"
     assert [r.path for r, _ in groups[0].others] == ["/movies/a_480.mp4"]

@@ -162,31 +162,58 @@ def run_scan(
     max_frames: int,
     batch_size: int = 16,
     workers: int = 4,
+    on_result=None,
     progress=None,
     on_error=None,
-) -> list[ScanResult]:
+) -> int:
     """Prepare jobs concurrently and embed their frames in GPU batches.
 
-    Returns results with ``.vectors`` filled in (one vector per prepared array).
+    Results are streamed to ``on_result`` as soon as all of a file's frames are
+    embedded, so memory stays bounded on large trees (a video's 120 keyframe
+    vectors are dropped right after it is stored). Returns the number of results
+    emitted.
+
+    A failed embedding batch leaves the affected frames' vectors as ``None`` but
+    keeps *positional* alignment: ``result.vectors[i]`` always belongs to
+    ``result.phashes[i]`` / ``result.timestamps[i]``.
     """
-    prepared: list[ScanResult] = []
+    results: dict[int, ScanResult] = {}
     owners: dict[int, list[np.ndarray | None]] = {}
+    remaining: dict[int, int] = {}
     batch: list[tuple[int, int, np.ndarray]] = []
+    next_owner = 0
+    emitted = 0
+
+    def emit(owner: int) -> None:
+        nonlocal emitted
+        result = results.pop(owner)
+        result.vectors = owners.pop(owner)
+        remaining.pop(owner, None)
+        emitted += 1
+        if on_result is not None:
+            on_result(result)
 
     def flush() -> None:
+        nonlocal batch
         if not batch:
             return
         arrays = [arr for _, _, arr in batch]
+        vectors = None
         try:
             vectors = encoder.embed_images(arrays)
         except Exception as exc:  # noqa: BLE001 - report, drop this batch
             if on_error:
                 on_error("<batch>", exc)
-            batch.clear()
-            return
-        for (owner, frame, _), vec in zip(batch, vectors):
-            owners[owner][frame] = vec
-        batch.clear()
+        completed: list[int] = []
+        for k, (owner, frame, _) in enumerate(batch):
+            if vectors is not None:
+                owners[owner][frame] = vectors[k]
+            remaining[owner] -= 1
+            if remaining[owner] == 0:
+                completed.append(owner)
+        batch = []
+        for owner in completed:
+            emit(owner)
 
     prepare_one = partial(prepare, interval=interval, max_frames=max_frames)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
@@ -203,9 +230,14 @@ def run_scan(
                 if on_error:
                     on_error(job.path, exc)
                 continue
-            owner = len(prepared)
-            prepared.append(result)
+            owner = next_owner
+            next_owner += 1
+            results[owner] = result
             owners[owner] = [None] * len(result.arrays)
+            remaining[owner] = len(result.arrays)
+            if not result.arrays:
+                emit(owner)
+                continue
             for frame, array in enumerate(result.arrays):
                 batch.append((owner, frame, array))
                 if len(batch) >= batch_size:
@@ -215,16 +247,21 @@ def run_scan(
             result.arrays = []
         flush()
 
-    for owner, result in enumerate(prepared):
-        result.vectors = [v for v in owners[owner] if v is not None]
-    return prepared
+    return emitted
 
 
 def store_result(db: Database, result: ScanResult) -> None:
-    """Write one prepared+embedded result to the index."""
+    """Write one prepared+embedded result to the index.
+
+    ``result.vectors`` is positionally aligned with the frames; entries may be
+    ``None`` when a batch failed, in which case the frame is stored without an
+    embedding rather than shifting the rest.
+    """
     job = result.job
     if job.kind == "image":
-        embedding = result.vectors[0].tobytes() if result.vectors else None
+        embedding = None
+        if result.vectors and result.vectors[0] is not None:
+            embedding = result.vectors[0].tobytes()
         db.upsert_file(
             path=job.path, size=job.size, mtime=job.mtime, sha1=result.sha1,
             width=result.width, height=result.height, phash=result.phashes[0],

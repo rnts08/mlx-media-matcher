@@ -10,12 +10,15 @@ from tests.conftest import requires_ffmpeg
 class FakeEncoder:
     """Stands in for ClipEncoder so pipeline tests need no MLX/GPU."""
 
-    def __init__(self, dim: int = 4):
+    def __init__(self, dim: int = 4, fail_on_calls: set[int] | None = None):
         self.dim = dim
         self.calls = 0
+        self.fail_on_calls = fail_on_calls or set()
 
     def embed_images(self, arrays):
         self.calls += 1
+        if self.calls in self.fail_on_calls:
+            raise RuntimeError("boom")
         return np.stack([np.ones(self.dim, dtype=np.float32) for _ in arrays])
 
 
@@ -52,14 +55,38 @@ def test_run_scan_embeds_images_in_batches(tmp_path):
     jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
 
     encoder = FakeEncoder()
-    results = run_scan(jobs, encoder, interval=1.0, max_frames=120,
-                       batch_size=2, workers=3)
-    assert len(results) == 5
-    assert all(len(r.vectors) == 1 for r in results)
+    collected = []
+    n = run_scan(jobs, encoder, interval=1.0, max_frames=120,
+                 batch_size=2, workers=3, on_result=collected.append)
+    assert n == 5 and len(collected) == 5
+    assert all(len(r.vectors) == 1 for r in collected)
     assert encoder.calls == 3  # ceil(5/2)
-    for r in results:
+    for r in collected:
         store_result(db, r)
     assert db.count_files() == 5
+
+
+def test_run_scan_failed_batch_keeps_frame_alignment(tmp_path):
+    root = tmp_path / "tree"
+    root.mkdir()
+    for i in range(4):
+        _write_image(root / f"{i}.png", color=(i * 30, 0, 0))
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+
+    # batch 2: first call succeeds, second raises -> 2 embedded, 2 not
+    encoder = FakeEncoder(fail_on_calls={2})
+    collected = []
+    errors = []
+    run_scan(jobs, encoder, interval=1.0, max_frames=120, batch_size=2,
+             workers=1, on_result=collected.append,
+             on_error=lambda p, e: errors.append((p, e)))
+    assert len(collected) == 4
+    assert errors  # the failed batch was reported
+    embedded = sum(1 for r in collected if r.vectors and r.vectors[0] is not None)
+    assert embedded == 2
+    # positional alignment is preserved for every result
+    assert all(len(r.vectors) == 1 for r in collected)
 
 
 @requires_ffmpeg
@@ -77,10 +104,11 @@ def test_run_scan_mixes_images_and_videos(tmp_path, make_video):
     assert kinds == {"image", "video"}
 
     encoder = FakeEncoder()
-    results = run_scan(jobs, encoder, interval=1.0, max_frames=120,
-                       batch_size=4, workers=4)
-    assert len(results) == 2
-    for r in results:
+    collected = []
+    n = run_scan(jobs, encoder, interval=1.0, max_frames=120,
+                 batch_size=4, workers=4, on_result=collected.append)
+    assert n == 2
+    for r in collected:
         store_result(db, r)
 
     assert db.count_files() == 1

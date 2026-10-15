@@ -95,3 +95,20 @@ media-match search TREE "color bars" --video
 
 The re-encode groups with its source at hamming 0 across a 4× resolution
 change; the higher-resolution copy wins; search returns the matching moment.
+
+## 5. Scaling to a large library
+
+Two things would otherwise blow up on a real library:
+
+- **Grouping cost.** Verifying every pair of videos is O(videos²). Above a few
+  hundred videos the matcher switches to an LSH prefilter: each 64-bit keyframe
+  pHash is split into 4 × 16-bit bands, and only videos that share a band on
+  some keyframe become candidate pairs (a 1-bit difference always shares all
+  bands). The aligned matcher then verifies the candidates. Below the limit
+  (`FULL_COMPARE_LIMIT = 500`) every pair is compared exactly.
+- **Memory.** Video keyframe vectors are ~2 KB each (a 120-frame clip ≈ 240 KB).
+  `run_scan` streams each result to the database as soon as its frames are
+  embedded and drops the vectors, instead of accumulating the whole tree in RAM.
+  A failed embedding batch leaves those frames without embeddings but keeps
+  positional alignment, so it never shifts a frame's hash onto another's vector.
+

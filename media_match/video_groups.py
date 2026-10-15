@@ -24,6 +24,40 @@ from .groups import DuplicateGroup, SimilarGroup, _UnionFind
 
 MIN_MATCHES = 2  # a couple of matching frames is coincidence; more is a copy
 
+FULL_COMPARE_LIMIT = 500  # below this, compare every pair (exact, simple)
+_BANDS = 4                # 64-bit pHash -> 4 x 16-bit bands for LSH bucketing
+_BAND_BITS = 16
+
+
+def _candidate_pairs(
+    hashes_per_record: list[list[str]], bands: int = _BANDS, band_bits: int = _BAND_BITS
+) -> set[tuple[int, int]]:
+    """Video pairs that share a pHash band on some keyframe (LSH prefilter).
+
+    A 64-bit pHash split into bands: if two hashes differ in <= 3 bits, at least
+    one 16-bit band is identical, so near-duplicate keyframes land their videos
+    in the same bucket. Sharing a band on *any* frame over-generates candidates;
+    the aligned matcher then verifies each one. This turns the O(videos^2) sweep
+    into roughly-linear work for large libraries.
+    """
+    mask = (1 << band_bits) - 1
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for idx, hashes in enumerate(hashes_per_record):
+        for h in hashes:
+            value = int(h, 16)
+            for b in range(bands):
+                key = (b, (value >> (b * band_bits)) & mask)
+                buckets.setdefault(key, []).append(idx)
+    pairs: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        unique = sorted(set(members))
+        for a in range(len(unique)):
+            for b in range(a + 1, len(unique)):
+                pairs.add((unique[a], unique[b]))
+    return pairs
+
 
 def pair_ratio(
     a_hex: list[str],
@@ -65,6 +99,7 @@ def find_video_duplicate_groups(
     frame_threshold: int = 12,
     merge_ratio: float = 0.6,
     band: int = 2,
+    full_compare_limit: int = FULL_COMPARE_LIMIT,
 ) -> list[DuplicateGroup]:
     """Cluster duplicate/re-encode videos by aligned keyframe pHash matching."""
     n = len(records)
@@ -79,14 +114,20 @@ def find_video_duplicate_groups(
         else:
             by_sha1[r.sha1] = i
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            ratio, _ = pair_ratio(
-                records[i].phashes, records[j].phashes,
-                threshold=frame_threshold, band=band,
-            )
-            if ratio >= merge_ratio:
-                uf.union(i, j)
+    # small libraries: exact all-pairs. large ones: LSH candidate pairs so the
+    # sweep stays far below O(n^2).
+    if n <= full_compare_limit:
+        pairs = ((i, j) for i in range(n) for j in range(i + 1, n))
+    else:
+        pairs = _candidate_pairs([r.phashes for r in records])
+
+    for i, j in pairs:
+        ratio, _ = pair_ratio(
+            records[i].phashes, records[j].phashes,
+            threshold=frame_threshold, band=band,
+        )
+        if ratio >= merge_ratio:
+            uf.union(i, j)
 
     clusters: dict[int, list[int]] = {}
     for i in range(n):

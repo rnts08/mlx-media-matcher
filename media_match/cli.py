@@ -31,6 +31,16 @@ def _register_heif() -> None:
         pass
 
 
+def _require_ffmpeg() -> bool:
+    from shutil import which
+
+    if which("ffmpeg") and which("ffprobe"):
+        return True
+    print("video support needs 'ffmpeg' and 'ffprobe' on PATH "
+          "(e.g. 'brew install ffmpeg')", file=sys.stderr)
+    return False
+
+
 # -- commands ----------------------------------------------------------------
 
 
@@ -43,6 +53,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
     db.set_meta("clip_model", args.clip_model)
     if args.describe:
         db.set_meta("vlm_model", args.model)
+
+    if args.video and not _require_ffmpeg():
+        db.close()
+        return 2
 
     jobs, total, up_to_date = build_jobs(
         root, db, include_video=args.video, reanalyze=args.reanalyze,
@@ -60,17 +74,26 @@ def cmd_scan(args: argparse.Namespace) -> int:
         errors += 1
         print(f"  ERROR {path}: {exc}", file=sys.stderr)
 
-    results = run_scan(
-        jobs, encoder, interval=args.interval, max_frames=args.max_frames,
-        batch_size=args.batch, workers=args.workers, on_error=on_error,
-    )
-    for result in results:
+    def on_result(result) -> None:
+        nonlocal errors
         try:
             store_result(db, result)
         except Exception as exc:  # noqa: BLE001 - keep scanning past bad files
             errors += 1
             print(f"  ERROR storing {result.job.path}: {exc}", file=sys.stderr)
-    analyzed = len(results)
+
+    total_jobs = len(jobs)
+    step = max(1, total_jobs // 20)
+
+    def progress(done: int, total: int, _path: str) -> None:
+        if total > 20 and (done % step == 0 or done == total):
+            print(f"  preparing [{done}/{total}]", file=sys.stderr)
+
+    analyzed = run_scan(
+        jobs, encoder, interval=args.interval, max_frames=args.max_frames,
+        batch_size=args.batch, workers=args.workers,
+        on_result=on_result, progress=progress, on_error=on_error,
+    )
     encoder.unload()
 
     # Optional VLM captions, best version of each duplicate group only.
