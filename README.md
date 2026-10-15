@@ -17,7 +17,9 @@ Everything runs locally: no cloud services, no PyTorch. Requires Apple Silicon.
 ## Status
 
 - **Phase 1 (images): implemented** — described below.
-- **Phase 2 (video): planned** — the same capabilities for video files.
+- **Phase 2 (video): implemented** — the same capabilities for video files:
+  keyframes sampled at ~1 fps, embedded with CLIP for search, and matched by
+  keyframe pHash for duplicate/re-encode grouping (see `docs/video-spike.md`).
 
 ## Install
 
@@ -25,6 +27,8 @@ Everything runs locally: no cloud services, no PyTorch. Requires Apple Silicon.
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
+
+Video support also needs `ffmpeg`/`ffprobe` on `PATH` (e.g. `brew install ffmpeg`).
 
 Models are downloaded from Hugging Face on first use: CLIP ViT-B/32
 (~600 MB) for `scan`, SmolVLM-256M (~150 MB) for `scan --describe`.
@@ -42,6 +46,14 @@ for the measurements that justify the design):
 
 The index lives in `<root>/.media-match.db` (SQLite + FTS5). Read-only
 commands never create it — run `scan` first.
+
+**Videos** are indexed by sampling keyframes (~1 fps, capped at 120 for long
+clips) with `ffmpeg`, then running those frames through the same CLIP + pHash
+layers. Keyframes are sampled on a fixed time grid, so duplicate copies line up
+frame-for-frame and are matched by *aligned* comparison (O(n)) rather than
+all-pairs. The scan prepares frames on a thread pool that feeds the CLIP
+batcher, so image and video work share one pipeline and the GPU stays busy
+(measured GPU-busy time ~73% → ~99%; see `docs/video-spike.md`).
 
 ## Usage
 
@@ -86,6 +98,13 @@ commands never create it — run `scan` first.
 .venv/bin/media-match tags ~/Pictures    # keyword counts from captions
 .venv/bin/media-match stats ~/Pictures   # index, models, coverage
 .venv/bin/media-match embed ~/Pictures   # backfill CLIP embeddings only
+
+# videos — pass --video to index/search/group/review video files
+.venv/bin/media-match scan ~/Movies --video        # keyframes + CLIP (~1 fps)
+.venv/bin/media-match search ~/Movies "dog on a beach" --video
+.venv/bin/media-match duplicates ~/Movies --video  # re-encodes, across resolution
+.venv/bin/media-match similar ~/Movies --video     # same-subject video groups
+.venv/bin/media-match clean ~/Movies --video       # same review UI as images
 ```
 
 Example `duplicates` output:
@@ -100,19 +119,20 @@ Group 1 (2 files)
 
 | Command | What it does | Key options |
 |---|---|---|
-| `scan [root]` | index new/changed images (hash + pHash + CLIP). Incremental: unchanged files are skipped | `--describe`, `--model`, `--clip-model`, `--limit`, `--reanalyze`, `--batch` |
-| `search [root] [query...]` | find images. CLIP by default when embeddings exist | `--person`, `--object`, `--fts`, `--clip`, `--limit` |
-| `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85) |
-| `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file) | `--limit` |
-| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json` |
-| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold` |
-| `tags [root]` | keyword counts from captions | `--limit` |
+| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
+| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--limit` |
+| `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video` |
+| `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
+| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio` |
+| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio` |
+| `tags [root]` | keyword counts from captions | `--limit`, `--video` |
 | `stats [root]` | index info: models, described/embedded coverage | |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
 
 All commands take `--db` to override the index location. `root` defaults to
-the current directory. Supported formats: JPEG, PNG, WebP, GIF, BMP, TIFF,
-HEIC/HEIF.
+the current directory. Supported image formats: JPEG, PNG, WebP, GIF, BMP,
+TIFF, HEIC/HEIF. Supported video formats (with `--video`): MP4, MOV, M4V, AVI,
+MKV, WebM, MPG/MPEG, WMV (anything `ffmpeg` can decode).
 
 Default models are the smallest viable ones; for better accuracy use
 `--clip-model` / `--model` with any MLX-converted checkpoint, e.g.
@@ -128,13 +148,14 @@ This should work across resolution, so that accidentally saved thumbnails are
 identified as duplicates and grouped with their primary file that should have
 a better resolution.
 
-## Phase 2 (planned)
+## Phase 2 (video)
 
-The same as above, but on video files: find videos by person/object content,
+The same as Phase 1, but on video files: find videos by person/object content,
 group duplicates and re-encodes across resolution, and identify the best
-version — e.g. by sampling frames, embedding keyframes with CLIP, hashing
-frames for cross-resolution matching, and aggregating frame-level results
-into per-video scores.
+version. Each video is reduced to ~1 keyframe per second (capped for long
+clips), embedded with CLIP for search and matched by keyframe pHash for
+grouping. See `docs/video-spike.md` for the sampling and matching design and
+the scan-pipeline measurements.
 
 ## Goal
 
@@ -146,5 +167,11 @@ tree the program is working on.
 
 - `docs/clip-spike.md` — the CLIP investigation and benchmarks behind the
   hybrid design (branch `spike/clip`, merged).
+- `docs/video-spike.md` — Phase-2 video sampling/matching design and the
+  scan-pipeline measurements.
+- `scripts/bench_pipeline.py` — reproduces the GPU-busy pipeline numbers.
+- `tests/` — pytest suite (`pip install -e '.[dev]'`, then `pytest`).
 - Test tree used during development: JPEG/WebP thumbnails of real photos,
-  validated for grouping at hamming distance 0 across formats and sizes.
+  validated for grouping at hamming distance 0 across formats and sizes;
+  for video, a clip plus a downscaled H.264 re-encode, validated at
+  `hamming_min=0` across a 4× resolution change.
