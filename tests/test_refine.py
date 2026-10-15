@@ -84,6 +84,18 @@ def test_people_rerun_keeps_labels(tmp_path, capsys):
     assert "[Alice]" in out
 
 
+def test_scan_can_refine_tags(tmp_path, capsys):
+    # nothing on disk to analyze, but --refine still rebuilds tags from the
+    # injected keywords without loading CLIP
+    _seed(tmp_path)
+    assert cli.main(["scan", str(tmp_path), "--refine"]) == 0
+    capsys.readouterr()
+    db = Database(str(tmp_path / ".media-match.db"))
+    assert dict(db.tag_counts(kind="image"))["woman"] == 2
+    assert db.media_ids_with_facet("person")
+    db.close()
+
+
 def test_cluster_by_similarity_keeps_singletons():
     matrix = np.stack([
         _vec(1.0, 0.0, 0.0),

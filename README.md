@@ -73,7 +73,9 @@ tags into `keywords` while keeping the originals in `raw_keywords`. Every tag is
 also bucketed into a **facet** (person/animal/object/scene/food/plant/text/
 activity/color). With `--classify`, each image is additionally given a **type**
 via zero-shot CLIP: the category prompt sentences are embedded once, and the
-image is labeled with the closest category — no extra model or training.
+image is labeled with the closest category — no extra model or training. Run it
+on its own with `refine`, or let `scan --refine --classify` keep tags and types
+fresh automatically (it reuses the CLIP model already loaded for the scan).
 
 **People clustering** takes every photo whose facet is `person`, embeds its CLIP
 vector, and links photos whose cosine similarity clears a threshold, so
@@ -89,8 +91,9 @@ needs a face-embedding model). `people --label N=Name` names a cluster and
 .venv/bin/media-match scan ~/Pictures
 
 # 1b. optional: add captions with the vision model (~1 s/image, only for the
-#     best-resolution version of each duplicate group)
-.venv/bin/media-match scan ~/Pictures --describe
+#     best-resolution version of each duplicate group) and, in the same pass,
+#     refine the tags and type every photo
+.venv/bin/media-match scan ~/Pictures --describe --refine --classify
 
 # 2. find photos by person / object / free text (CLIP vector search)
 .venv/bin/media-match search ~/Pictures "woman red jacket"
@@ -158,7 +161,7 @@ Group 1 (2 files)
 
 | Command | What it does | Key options |
 |---|---|---|
-| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
+| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
 | `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--limit` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video` |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |

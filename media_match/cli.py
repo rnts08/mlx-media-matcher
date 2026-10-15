@@ -95,6 +95,18 @@ def cmd_scan(args: argparse.Namespace) -> int:
         batch_size=args.batch, workers=args.workers,
         on_result=on_result, progress=progress, on_error=on_error,
     )
+
+    # Optional keep-tags-fresh step: refine keywords into canonical tags/facets
+    # (and, with --classify, type each image) before releasing the CLIP model.
+    if args.refine or args.classify:
+        refined = _refine_all(db, quiet=True)
+        if refined:
+            print(f"refined {refined} item(s)")
+    if args.classify:
+        classified = _classify_with(db, encoder, recompute=False)
+        if classified:
+            print(f"classified {classified} image(s)")
+
     encoder.unload()
 
     # Optional VLM captions, best version of each duplicate group only.
@@ -701,6 +713,22 @@ def cmd_refine(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.")
         return 1
 
+    total = _refine_all(db)
+    if not total:
+        print("Nothing to refine. Run 'scan' (and optionally '--describe') first.")
+
+    if args.classify:
+        _classify_images(db, args)
+
+    facets = db.facet_counts("image")
+    if facets:
+        print("facets: " + ", ".join(f"{name} {n}" for name, n in facets))
+    db.close()
+    return 0
+
+
+def _refine_all(db: Database, *, quiet: bool = False) -> int:
+    """Rewrite keywords into canonical tags + facets for images and videos."""
     total = 0
     for kind, label in (("image", "image"), ("video", "video")):
         rows = db.rows_for_refinement(kind)
@@ -716,53 +744,54 @@ def cmd_refine(args: argparse.Namespace) -> int:
         if rows:
             db.apply_refinement(kind, items)
         total += len(items)
-        print(f"  refined {len(items)} {label}(s)")
-
-    if not total:
-        print("Nothing to refine. Run 'scan' (and optionally '--describe') first.")
-
-    if args.classify:
-        _classify_images(db, args)
-
-    facets = db.facet_counts("image")
-    if facets:
-        print("facets: " + ", ".join(f"{name} {n}" for name, n in facets))
-    db.close()
-    return 0
+        if not quiet:
+            print(f"  refined {len(items)} {label}(s)")
+    return total
 
 
-def _classify_images(db: Database, args) -> None:
+def _classify_with(db: Database, encoder, *, recompute: bool = False) -> int:
+    """Type every untyped image (or all images) using an already-loaded encoder."""
     import numpy as np
 
-    if args.recompute:
+    if recompute:
         rows = db.conn.execute(
             "SELECT id, path FROM files WHERE embedding IS NOT NULL ORDER BY path"
         ).fetchall()
     else:
         rows = db.files_needing_type()
     if not rows:
-        print("No images need a type (run 'scan'/'embed' first, "
-              "or they are all classified).")
-        return
+        return 0
 
     ids, blobs = db.all_embeddings()
     vec_by_id = {i: np.frombuffer(b, dtype=np.float32) for i, b in zip(ids, blobs)}
     targets = [(r["id"], vec_by_id[r["id"]]) for r in rows if r["id"] in vec_by_id]
     if not targets:
-        print("Indexed images have no CLIP embeddings yet; run 'scan' or 'embed'.")
-        return
+        return 0
 
-    from .clip import ClipEncoder
     from .imagetype import TypeClassifier
 
-    classifier = TypeClassifier(ClipEncoder(model_id=args.clip_model))
+    classifier = TypeClassifier(encoder)
     matrix = np.stack([v for _i, v in targets])
     results = classifier.classify(matrix)
     db.set_types([
         (targets[k][0], name, score) for k, (name, score) in enumerate(results)
     ])
-    classifier.encoder.unload()
-    print(f"classified {len(targets)} image(s)")
+    return len(targets)
+
+
+def _classify_images(db: Database, args) -> None:
+    from .clip import ClipEncoder
+
+    encoder = ClipEncoder(model_id=args.clip_model)
+    try:
+        classified = _classify_with(db, encoder, recompute=args.recompute)
+    finally:
+        encoder.unload()
+    if classified:
+        print(f"classified {classified} image(s)")
+    else:
+        print("No images need a type (run 'scan'/'embed' first, "
+              "or they are all classified).")
 
 
 def cmd_people(args: argparse.Namespace) -> int:
@@ -982,6 +1011,12 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--describe", action="store_true",
                         help="also caption media with the vision model "
                              "(best version of each duplicate group only)")
+    p_scan.add_argument("--refine", action="store_true",
+                        help="after scanning, rewrite keywords into canonical "
+                             "tags + facets (see 'refine')")
+    p_scan.add_argument("--classify", action="store_true",
+                        help="after scanning, also type each image with CLIP "
+                             "(selfie/scene/object/...; implies --refine)")
     p_scan.add_argument("--video", action="store_true",
                         help="also index video files (keyframes each)")
     p_scan.add_argument("--model", default=DEFAULT_MODEL,
