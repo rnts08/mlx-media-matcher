@@ -2,6 +2,8 @@
 name = "mlx-media-match"
 version = "0.1.0"
 description = "Analyze image folders with a local MLX vision model: find people/objects and group duplicates across resolutions."
+authors = [{ name = "Timh Bergström" }]
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "mlx-vlm>=0.7.0",

@@ -1,0 +1,87 @@
+media-match — Non-Commercial Licence Agreement
+Copyright © 2026 Timh Bergström
+Home: https://github.com/rnts08/mlx-media-matcher
+
+0. Support development
+
+Support project development and the creator, reach out for other ways to contribute.
+
+- EVM: 0x6e8e3c2b31424266e7cff59e910df1587c317427 (ERC-20, BEP-20, TRC-20, AVAX-C, SPL, MATIC, POL, ARB, BASE, TON)
+- BTC: bc1qzzvcguvqjc6qhwe2y5vy38w2zke7hksukjhm68
+- LTC: MPfm5QLKH1r9XxgWmH75Gyps4LDfX5c53L
+- SOL: GEaCMpnyM8tB5BU4RMuLm6tgMr3q9FgMHodxDxxAGby
+
+Buy me a coffee: https://buymeacoffee.com/timhbergsta or support me on ko-fi: https://ko-fi.com/rnts08
+
+Donators and supporters gets honored in the application, unless specifically requested to be anonymous.
+
+1. Definitions
+
+"Software" means the media-match source code, binaries and accompanying files in
+this repository.
+
+"Licensor" means Timh Bergström.
+
+"Non-Commercial Use" means use that is not intended for, or directed towards,
+commercial advantage or monetary compensation.
+
+2. Grant
+
+Subject to the terms below, the Licensor grants you a worldwide, royalty-free,
+non-exclusive licence to use, copy, modify and distribute the Software for
+Non-Commercial Use only.
+
+3. Restrictions
+
+  3.1 No commercial use. You may not use the Software, or any derivative of it,
+      for any commercial purpose, including but not limited to:
+        - selling it or any derivative of it;
+        - offering it, or any derivative of it, as a paid or paid-for service;
+        - embedding it in a product that is sold or licensed for a fee;
+        - using it internally at a for-profit organisation in the course of
+          revenue-generating activity.
+
+  3.2 No trademark rights. This licence grants no rights in the name
+      "media-match", any associated logo, or the Licensor's name, beyond what is
+      needed to identify the origin of the Software.
+
+  3.3 Notices. Any copy or distribution must retain this licence, the copyright
+      notice above and the attribution in 3.4.
+
+  3.4 Attribution. Derivative works must state that they are derived from
+      media-match, with a link to
+      https://github.com/rnts08/mlx-media-matcher.
+
+4. Third-party components
+
+The Software invokes third-party models and libraries at runtime, including
+mlx-vlm, MLX, and CLIP and vision-language models published on Hugging Face.
+Those components are governed by their own licences, which are not granted by
+this agreement. It is your responsibility to comply with them — in particular,
+several model licences restrict commercial use. Nothing here grants rights in
+those models.
+
+5. Permissions beyond this licence
+
+Commercial use is available from the Licensor by separate written agreement.
+Contact the Licensor through the repository above.
+
+6. Termination
+
+The licence terminates automatically if you breach it. If you do, you must stop
+using and distributing the Software, but the recipients you have already
+distributed it to keep their rights, provided they remain in compliance.
+
+7. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+8. Governing law
+
+This agreement is governed by the laws of Liberland, without regard to conflict of
+law rules.
