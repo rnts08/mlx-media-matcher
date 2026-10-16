@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import textwrap
 
@@ -1122,7 +1123,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.8"
+_VERSION = "0.2.9"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1246,6 +1247,48 @@ def _cmd_help(args: argparse.Namespace) -> int:
     return 0
 
 
+# What the program does, shown at the top of 'about' (and nowhere else now
+# that 'help' is just the command reference).
+_ABOUT_BLURB = (
+    "Local photo-library analyzer built on Apple's MLX. Point it at a folder\n"
+    "and it builds an index that lets you:\n"
+    "\n"
+    "  - find photos by person, object or free text (CLIP vector search)\n"
+    "  - group duplicates across resolutions, and mark the best version\n"
+    "  - group semantic near-duplicates\n"
+    "  - refine tags into facets (person/scene/object/...) and type each photo\n"
+    "  - cluster photos of the same person and name the clusters\n"
+    "  - index video files (keyframes at ~1 fps) with the same machinery"
+)
+
+
+def _pager() -> list[str] | None:
+    """The pager to pipe long output through, honouring $PAGER."""
+    configured = os.environ.get("PAGER")
+    if configured:
+        return configured.split()
+    for candidate in ("less", "more"):
+        if shutil.which(candidate):
+            return [candidate, "-R"] if candidate == "less" else [candidate]
+    return None
+
+
+def _page(text: str) -> None:
+    """Print text, paging through $PAGER/less/more when stdout is a TTY.
+
+    Outside a terminal (pipes, tests) the text is printed straight through so
+    command output stays scriptable; if the pager is missing we fall back too.
+    """
+    pager = _pager() if sys.stdout.isatty() else None
+    if pager:
+        try:
+            subprocess.run(pager, input=text + "\n", text=True, check=False)
+            return
+        except OSError:
+            pass
+    print(text)
+
+
 def _license_text() -> str:
     """The full license text from the LICENSE file, or a short pointer."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1261,28 +1304,21 @@ def _license_text() -> str:
 
 
 def cmd_about(args: argparse.Namespace) -> int:
-    print(
-        "media-match — local photo-library analyzer built on Apple's MLX.\n"
-        "Point it at a folder and it builds an index that lets you:\n"
-        "\n"
-        "  - find photos by person, object or free text (CLIP vector search)\n"
-        "  - group duplicates across resolutions, and mark the best version\n"
-        "  - group semantic near-duplicates\n"
-        "  - refine tags into facets (person/scene/object/...) and type each photo\n"
-        "  - cluster photos of the same person and name the clusters\n"
-        "  - index video files (keyframes at ~1 fps) with the same machinery\n"
+    text = (
+        f"{_ABOUT_BLURB}\n"
         "\n"
         f"Version:    {_VERSION}\n"
         f"Author:     {_AUTHOR}\n"
         f"License:    {_LICENSE}\n"
         f"Repository: {_REPO}\n"
         f"Report:     {_ISSUES_URL}\n"
-        f"Support:    {_REPO}\n"
+        f"Support:    media-match info\n"
         "\n"
         "License text\n"
-        "------------"
+        "------------\n"
+        f"{_license_text()}"
     )
-    print(_license_text())
+    _page(text)
     return 0
 
 
