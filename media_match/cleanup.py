@@ -11,6 +11,7 @@ never deleted outright.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -186,3 +187,40 @@ def trash_files(
             out(f"  FAILED {record.path}: {exc}")
             failed.append(record)
     return trashed, failed
+
+
+def trash_dirs() -> list[str]:
+    """Candidate OS Trash directories on this platform."""
+    home = os.path.expanduser("~")
+    return [
+        os.path.join(home, ".Trash"),                      # macOS
+        os.path.join(home, ".local", "share", "Trash", "files"),  # freedesktop
+    ]
+
+
+def find_in_trash(path: str) -> str | None:
+    """The trashed copy of ``path`` (matched by basename), if present."""
+    name = os.path.basename(path)
+    for directory in trash_dirs():
+        candidate = os.path.join(directory, name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def restore_file(path: str) -> str:
+    """Move a trashed file back to its original path.
+
+    Returns ``"restored"``, ``"already"`` (it is back on disk), or
+    ``"missing"`` (no copy found in the Trash). Restoring is best-effort: the
+    OS Trash may have renamed a colliding basename, in which case we cannot be
+    sure of the match and say so rather than guessing.
+    """
+    if os.path.exists(path):
+        return "already"
+    source = find_in_trash(path)
+    if source is None:
+        return "missing"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    shutil.move(source, path)
+    return "restored"

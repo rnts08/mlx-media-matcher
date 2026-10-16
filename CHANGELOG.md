@@ -13,6 +13,7 @@ naturally against the work that produced it.
 
 ## 0.2.x — video support
 
+- **0.2.15** feat: `restore` command — undo `clean` by moving files back from the OS Trash
 - **0.2.14** feat: `search --since/--until/--camera`, show capture dates, `duplicates --prefer date`, `stats` date range
 - **0.2.13** feat(exif): index capture time, camera and GPS from image EXIF
 - **0.2.12** feat: report reclaimable space (extra-copy bytes) in `duplicates` and `stats`

@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
@@ -821,6 +821,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
         trash_files,
     )
 
+    kind = "video" if args.video else "image"
+    batch = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
     if args.video:
         groups = find_video_duplicate_groups(
             db.all_videos_with_frames(),
@@ -855,11 +858,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
             for error in session.errors:
                 print(f"  {error}")
             if moved:
+                db.record_trash(moved, kind=kind, batch=batch)
                 size = sum(r.size for r in moved)
                 print(f"Moved {len(moved)} file(s) to the Trash "
                       f"({human_size(size)}; recoverable until emptied); "
                       f"removed {len(moved)} entries from the index. "
-                      f"{len(session.errors)} failed.")
+                      f"{len(session.errors)} failed. "
+                      f"Undo with 'media-match restore {root}'.")
             else:
                 print("Nothing changed.")
             db.close()
@@ -883,11 +888,74 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     trashed, failed = trash_files(trash)
     db.delete_media(trashed)
+    db.record_trash(trashed, kind=kind, batch=batch)
     print(f"\nMoved {len(trashed)} file(s) to the Trash (recoverable until "
           f"emptied); removed {len(trashed)} entries from the index. "
-          f"{len(failed)} failed.")
+          f"{len(failed)} failed. Undo with 'media-match restore {root}'.")
     db.close()
     return 0 if not failed else 1
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    from .cleanup import confirm, human_size, restore_file
+
+    rows = db.trash_log(args.batch)
+    if not rows:
+        print("Nothing to restore — no trashed files are logged for this index.")
+        db.close()
+        return 0
+
+    total = sum(r["size"] for r in rows)
+    if args.batch:
+        print(f"batch {args.batch}: {len(rows)} file(s), {human_size(total)}")
+    else:
+        print(f"{len(rows)} file(s), {human_size(total)} in "
+              f"{len(db.trash_batches())} batch(es) of trashed files:")
+    for r in rows[: args.limit]:
+        print(f"  [{r['batch']}] {r['kind']:<5} {r['path']}")
+    if len(rows) > args.limit:
+        print(f"  ... and {len(rows) - args.limit} more")
+
+    if args.dry_run:
+        print("\nDry run: nothing was moved.")
+        db.close()
+        return 0
+
+    if not args.yes and not confirm(
+        f"\nMove {len(rows)} file(s) back from the system Trash? [y/N] "
+    ):
+        print("Aborted; nothing was changed.")
+        db.close()
+        return 1
+
+    restored = already = missing = 0
+    done_ids: list[int] = []
+    for r in rows:
+        status = restore_file(r["path"])
+        if status == "restored":
+            restored += 1
+            done_ids.append(r["id"])
+        elif status == "already":
+            already += 1
+            done_ids.append(r["id"])
+        else:
+            missing += 1
+            print(f"  not in the Trash: {r['path']}")
+
+    db.clear_trash_log(done_ids)
+    print(f"\nRestored {restored} file(s) from the Trash"
+          + (f", {already} were already back" if already else "")
+          + (f", {missing} not found" if missing else "")
+          + ". Run 'scan' to re-index them.")
+    db.close()
+    return 0 if not missing else 1
 
 
 def cmd_refine(args: argparse.Namespace) -> int:
@@ -1236,6 +1304,7 @@ _COMMAND_SUMMARIES = {
     "similar": "group the tree by CLIP similarity, or find neighbors of one file",
     "duplicates": "group duplicates; best resolution wins",
     "clean": "review duplicate groups and move rejected copies to the Trash",
+    "restore": "move files back from the system Trash (undo 'clean')",
     "refine": "rewrite keywords into canonical tags/facets; type photos",
     "people": "cluster person photos by similarity and name the clusters",
     "tags": "list refined tags, facets or image types",
@@ -1254,6 +1323,7 @@ _EXAMPLES = {
     "similar": "media-match similar ~/Pictures --threshold 0.9",
     "duplicates": "media-match duplicates ~/Pictures",
     "clean": "media-match clean ~/Pictures --dry-run",
+    "restore": "media-match restore ~/Pictures --yes",
     "refine": "media-match refine ~/Pictures --classify",
     "people": "media-match people ~/Pictures --label 1=Alice",
     "tags": "media-match tags ~/Pictures --facets",
@@ -1264,7 +1334,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.14"
+_VERSION = "0.2.15"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1713,6 +1783,26 @@ def main(argv: list[str] | None = None) -> int:
                          help="show what would be trashed, then exit")
     p_clean.set_defaults(func=cmd_clean)
 
+    p_restore = sub.add_parser(
+        "restore",
+        help="move files back from the system Trash (undo 'clean')",
+        description=(
+            "List the files 'clean' moved to the system Trash — every batch, "
+            "or one with --batch — and move them back to their original paths "
+            "on confirmation (best-effort: the OS Trash may have renamed a "
+            "colliding name). Run 'scan' afterwards to re-index them."
+        ),
+    )
+    _add_common(p_restore)
+    p_restore.add_argument("--batch", help="only this batch id (see the listing)")
+    p_restore.add_argument("--limit", type=int, default=50,
+                           help="max files to list (default: 50)")
+    p_restore.add_argument("--dry-run", action="store_true",
+                           help="show what would be restored, then exit")
+    p_restore.add_argument("--yes", action="store_true",
+                           help="restore without prompting")
+    p_restore.set_defaults(func=cmd_restore)
+
     p_refine = sub.add_parser(
         "refine",
         help="clean keywords into canonical tags + facets; optionally type them",
@@ -1807,6 +1897,7 @@ def main(argv: list[str] | None = None) -> int:
     for name, parser_obj in (
         ("scan", p_scan), ("search", p_search), ("embed", p_embed),
         ("similar", p_sim), ("duplicates", p_dup), ("clean", p_clean),
+        ("restore", p_restore),
         ("refine", p_refine), ("people", p_people), ("tags", p_tags),
         ("stats", p_stats), ("about", p_about), ("version", p_version),
         ("info", p_info), ("help", p_help),

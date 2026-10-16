@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 DEFAULT_DB_NAME = ".media-match.db"
 
 # Bump when the schema changes and add the matching step to _MIGRATIONS.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -97,6 +97,16 @@ CREATE TABLE IF NOT EXISTS clusters (
     kind TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS trash_log (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'image',
+    size INTEGER NOT NULL DEFAULT 0,
+    batch TEXT NOT NULL DEFAULT '',
+    trashed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_trash_batch ON trash_log(batch);
 """
 
 
@@ -138,10 +148,18 @@ def _migrate_v2(db: "Database") -> None:
     _add_missing_columns(db.conn, "files", _EXIF_COLUMNS)
 
 
+def _migrate_v3(db: "Database") -> None:
+    """v3: the trash_log table (created by _SCHEMA; nothing to alter)."""
+    db.conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trash_batch ON trash_log(batch)"
+    )
+
+
 # (target_version, step) ascending. Each step upgrades the previous version.
 _MIGRATIONS = (
     (1, _migrate_v1),
     (2, _migrate_v2),
+    (3, _migrate_v3),
 )
 
 
@@ -914,6 +932,45 @@ class Database:
             "SELECT id FROM clusters WHERE label = ? COLLATE NOCASE ORDER BY id", (label,)
         ).fetchall()
         return [r["id"] for r in rows]
+
+    # -- trash log (undo support) -------------------------------------------
+
+    def record_trash(self, records, kind: str = "image", batch: str = "") -> int:
+        """Remember media moved to the OS Trash so it can be restored later."""
+        rows = [
+            (r.path, kind, int(getattr(r, "size", 0) or 0), batch)
+            for r in records if getattr(r, "path", None)
+        ]
+        if not rows:
+            return 0
+        self.conn.executemany(
+            "INSERT INTO trash_log(path, kind, size, batch) VALUES(?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def trash_log(self, batch: str | None = None) -> list[sqlite3.Row]:
+        if batch:
+            return self.conn.execute(
+                "SELECT * FROM trash_log WHERE batch = ? ORDER BY path", (batch,)
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM trash_log ORDER BY batch DESC, path"
+        ).fetchall()
+
+    def trash_batches(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT batch, COUNT(*) AS n, SUM(size) AS bytes, MIN(trashed_at) AS at "
+            "FROM trash_log GROUP BY batch ORDER BY batch DESC"
+        ).fetchall()
+
+    def clear_trash_log(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        self.conn.execute(f"DELETE FROM trash_log WHERE id IN ({marks})", ids)
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
