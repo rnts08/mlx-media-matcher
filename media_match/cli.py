@@ -414,41 +414,84 @@ def cmd_search(args: argparse.Namespace) -> int:
     if use_clip:
         allowed_images = db.file_ids_matching(img_filter, img_params) if img_filter else None
         allowed_videos = db.video_ids_matching(vid_filter, vid_params) if vid_filter else None
-        return _clip_search(db, " ".join(terms), args.limit,
+        hits = _clip_search(db, " ".join(terms), args.limit,
                             include_images=include_images,
                             include_videos=include_videos,
                             allowed_images=allowed_images,
                             allowed_videos=allowed_videos)
+        if hits is None:
+            db.close()
+            return 1
+        if args.json:
+            print(json.dumps(hits, indent=2, ensure_ascii=False))
+            db.close()
+            return 0 if hits else 1
+        if not hits:
+            print("No matches.")
+            db.close()
+            return 1
+        print(f"CLIP text->media search for {' '.join(terms)!r}:")
+        for h in hits:
+            when = _when(h["captured_at"]) if h["kind"] == "image" else _when(h["mtime"])
+            if h["kind"] == "image":
+                print(f"\n{h['path']}  ({h['width']}x{h['height']}, "
+                      f"{_mp(h['width'], h['height'])}"
+                      + (f", {when}" if when else "")
+                      + f")  similarity={h['similarity']:.3f}")
+            else:
+                print(f"\n{h['path']}  ({h['width']}x{h['height']}, "
+                      f"{_dur(h['duration'])}"
+                      + (f", {when}" if when else "")
+                      + f")  similarity={h['similarity']:.3f}  "
+                      f"@ {format_timestamp(h['timestamp'])}")
+            if h["keywords"]:
+                print(f"  keywords: {h['keywords']}")
+            if h["description"]:
+                print(f"  {h['description']}")
+        db.close()
+        return 0
 
-    count = 0
+    results: list[dict] = []
     if include_images:
         for r in db.search(terms, limit=args.limit, filters=img_filter,
                            params=img_params):
-            when = _when(r["captured_at"])
-            print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
-                  f"{_mp(r['width'], r['height'])}"
-                  + (f", {when}" if when else "") + ")")
-            if r["keywords"]:
-                print(f"  keywords: {r['keywords']}")
-            if r["description"]:
-                print(f"  {r['description']}")
-            count += 1
+            results.append({
+                "kind": "image", "path": r["path"], "width": r["width"],
+                "height": r["height"], "size": r["size"],
+                "captured_at": r["captured_at"], "camera": r["camera"],
+                "description": r["description"], "keywords": r["keywords"],
+            })
     if include_videos:
         for r in db.search_videos(terms, limit=args.limit, filters=vid_filter,
                                   params=vid_params):
-            when = _when(r["mtime"])
-            print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
-                  f"{_dur(r['duration'])}"
-                  + (f", {when}" if when else "") + ")")
-            if r["keywords"]:
-                print(f"  keywords: {r['keywords']}")
-            if r["description"]:
-                print(f"  {r['description']}")
-            count += 1
-    if not count:
+            results.append({
+                "kind": "video", "path": r["path"], "width": r["width"],
+                "height": r["height"], "size": r["size"], "duration": r["duration"],
+                "mtime": r["mtime"], "captured_at": "", "camera": "",
+                "description": r["description"], "keywords": r["keywords"],
+            })
+    if args.json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        db.close()
+        return 0 if results else 1
+    if not results:
         print("No matches.")
         db.close()
         return 1
+    for r in results:
+        when = _when(r["captured_at"]) if r["kind"] == "image" else _when(r["mtime"])
+        if r["kind"] == "image":
+            print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
+                  f"{_mp(r['width'], r['height'])}"
+                  + (f", {when}" if when else "") + ")")
+        else:
+            print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
+                  f"{_dur(r['duration'])}"
+                  + (f", {when}" if when else "") + ")")
+        if r["keywords"]:
+            print(f"  keywords: {r['keywords']}")
+        if r["description"]:
+            print(f"  {r['description']}")
     db.close()
     return 0
 
@@ -465,15 +508,15 @@ def _load_embedding_matrix(db: Database):
 def _clip_search(db: Database, query_text: str, limit: int, *,
                  include_images: bool = True, include_videos: bool = True,
                  allowed_images: set[int] | None = None,
-                 allowed_videos: set[int] | None = None) -> int:
+                 allowed_videos: set[int] | None = None) -> list[dict] | None:
+    """Rank media by CLIP similarity; None means 'no embeddings' (error shown)."""
     import numpy as np
 
     from .clip import ClipEncoder
 
     if not query_text.strip():
         print("Give a search query (CLIP search needs some text).")
-        db.close()
-        return 2
+        return None
 
     ids, matrix = _load_embedding_matrix(db)
     video_embeddings = db.video_embeddings() if include_videos else {}
@@ -482,12 +525,11 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
                             if v in allowed_videos}
     if (matrix is None or not include_images) and not video_embeddings:
         print("No CLIP embeddings yet. Run 'media-match scan' first.")
-        db.close()
-        return 1
+        return None
 
     query = ClipEncoder().embed_texts([query_text])[0]
 
-    hits: list[tuple[float, str, object, float | None]] = []
+    hits: list[dict] = []
     if include_images and matrix is not None:
         sims = matrix @ query
         found = 0
@@ -498,7 +540,13 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
             row = db.conn.execute(
                 "SELECT * FROM files WHERE id = ?", (fid,)
             ).fetchone()
-            hits.append((float(sims[int(idx)]), "image", row, None))
+            hits.append({
+                "kind": "image", "path": row["path"], "width": row["width"],
+                "height": row["height"], "size": row["size"],
+                "captured_at": row["captured_at"], "camera": row["camera"],
+                "description": row["description"], "keywords": row["keywords"],
+                "similarity": round(float(sims[int(idx)]), 4),
+            })
             found += 1
             if found >= limit:
                 break
@@ -510,25 +558,17 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
                 continue
             frame_map = {t: np.frombuffer(b, dtype=np.float32) for t, b in frames}
             score, ts = best_moment(query, frame_map)
-            hits.append((score, "video", record, ts))
+            hits.append({
+                "kind": "video", "path": record.path, "width": record.width,
+                "height": record.height, "size": record.size,
+                "duration": record.duration, "mtime": record.mtime,
+                "captured_at": "", "camera": "",
+                "description": record.description, "keywords": record.keywords,
+                "similarity": round(float(score), 4), "timestamp": ts,
+            })
 
-    hits.sort(key=lambda h: -h[0])
-    print(f"CLIP text->media search for {query_text!r}:")
-    for score, kind, record, ts in hits[:limit]:
-        if kind == "image":
-            when = _when(record["captured_at"])
-            print(f"\n{record['path']}  ({record['width']}x{record['height']}, "
-                  f"{_mp(record['width'], record['height'])}"
-                  + (f", {when}" if when else "")
-                  + f")  similarity={score:.3f}")
-        else:
-            when = _when(record.mtime)
-            print(f"\n{record.path}  ({record.width}x{record.height}, "
-                  f"{_dur(record.duration)}"
-                  + (f", {when}" if when else "")
-                  + f")  similarity={score:.3f}  @ {format_timestamp(ts)}")
-    db.close()
-    return 0
+    hits.sort(key=lambda h: -h["similarity"])
+    return hits[:limit]
 
 
 def cmd_embed(args: argparse.Namespace) -> int:
@@ -656,6 +696,16 @@ def cmd_similar(args: argparse.Namespace) -> int:
         db.close()
         return 0
 
+    if args.json:
+        print(json.dumps([
+            {"best": g.best.path,
+             "files": [{"path": r.path, "similarity": round(s, 4)}
+                       for r, s in g.others]}
+            for g in groups
+        ], indent=2, ensure_ascii=False))
+        db.close()
+        return 0
+
     total = sum(g.size for g in groups)
     print(f"{len(groups)} semantic group(s), {total} files "
           f"(cosine >= {args.threshold}; best version marked with *)\n")
@@ -713,6 +763,17 @@ def _similar_videos(db: Database, args) -> int:
         print(f"No semantic video groups at cosine threshold {args.threshold}.")
         db.close()
         return 0
+
+    if args.json:
+        print(json.dumps([
+            {"best": g.best.path,
+             "files": [{"path": r.path, "similarity": round(s, 4)}
+                       for r, s in g.others]}
+            for g in groups
+        ], indent=2, ensure_ascii=False))
+        db.close()
+        return 0
+
     total = sum(g.size for g in groups)
     print(f"{len(groups)} semantic video group(s), {total} videos "
           f"(cosine >= {args.threshold}; best version marked with *)\n")
@@ -837,6 +898,17 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return 0
 
     total_files = sum(g.size for g in groups)
+
+    if args.dry_run and args.json:
+        trash = print_plan(groups, root, lambda _s: None, trash_word="[would]")
+        print(json.dumps([
+            {"path": r.path, "kind": kind, "size": r.size,
+             "resolution": [r.width, r.height]}
+            for r in trash
+        ], indent=2, ensure_ascii=False))
+        db.close()
+        return 0
+
     print(f"{len(groups)} duplicate group(s), {total_files} files involved")
 
     if args.dry_run:
@@ -1224,6 +1296,7 @@ def cmd_tags(args: argparse.Namespace) -> int:
         return 1
 
     kind = "video" if args.video else "image"
+    payload: list | None = None
 
     if args.types:
         counts = db.type_counts()
@@ -1231,42 +1304,50 @@ def cmd_tags(args: argparse.Namespace) -> int:
             print("No image types yet. Run 'refine --classify' first.")
             db.close()
             return 1
-        width = max(len(name) for name, _ in counts)
-        for name, count in counts:
-            print(f"{name:<{width}}  {count}")
-        db.close()
-        return 0
-
-    if args.facets:
+        payload = [{"type": n, "count": c} for n, c in counts]
+        if not args.json:
+            width = max(len(name) for name, _ in counts)
+            for name, count in counts:
+                print(f"{name:<{width}}  {count}")
+    elif args.facets:
         grouped = db.facet_tag_counts(kind)
         if not grouped:
             print("No refined tags yet. Run 'refine' first.")
             db.close()
             return 1
         total_by_facet = dict(db.facet_counts(kind))
-        for facet, tags in grouped.items():
-            print(f"{facet} ({total_by_facet.get(facet, 0)} media)")
-            width = max(len(t) for t, _ in tags)
-            for tag, count in tags[: args.limit]:
-                print(f"  {tag:<{width}}  {count}")
-            print()
-        db.close()
-        return 0
-
-    if args.raw:
-        counts = db.keyword_counts(limit=args.limit, include_videos=args.video)
-        heading = "raw keywords"
+        payload = [
+            {"facet": facet, "total": total_by_facet.get(facet, 0),
+             "tags": [{"tag": t, "count": c} for t, c in tags]}
+            for facet, tags in grouped.items()
+        ]
+        if not args.json:
+            for facet, tags in grouped.items():
+                print(f"{facet} ({total_by_facet.get(facet, 0)} media)")
+                width = max(len(t) for t, _ in tags)
+                for tag, count in tags[: args.limit]:
+                    print(f"  {tag:<{width}}  {count}")
+                print()
     else:
-        counts = db.tag_counts(limit=args.limit, kind=kind)
-        heading = "refined tags"
-    if not counts:
-        print(f"No {heading} yet. Run 'scan' then 'refine'.")
-        db.close()
-        return 1
-    print(f"top {heading}:")
-    width = max(len(k) for k, _ in counts)
-    for kw, count in counts:
-        print(f"{kw:<{width}}  {count}")
+        if args.raw:
+            counts = db.keyword_counts(limit=args.limit, include_videos=args.video)
+            heading = "raw keywords"
+        else:
+            counts = db.tag_counts(limit=args.limit, kind=kind)
+            heading = "refined tags"
+        if not counts:
+            print(f"No {heading} yet. Run 'scan' then 'refine'.")
+            db.close()
+            return 1
+        payload = [{"tag": k, "count": c} for k, c in counts]
+        if not args.json:
+            print(f"top {heading}:")
+            width = max(len(k) for k, _ in counts)
+            for kw, count in counts:
+                print(f"{kw:<{width}}  {count}")
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     db.close()
     return 0
 
@@ -1294,28 +1375,72 @@ def cmd_stats(args: argparse.Namespace) -> int:
     vdescribed = db.conn.execute(
         "SELECT COUNT(*) AS n FROM videos WHERE description != ''"
     ).fetchone()["n"]
+    tagged = db.has_tags("image")
+    typed = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE type != ''"
+    ).fetchone()["n"]
+    people = len(db.all_clusters("image"))
+    dim = db.embedding_dim()
+    lo, hi = db.date_range()
+    summary = db.scan_summary()
+    img_counts, img_sizes = db.image_extensions()
+    vid_counts, vid_sizes = db.video_extensions()
+    img_groups = find_duplicate_groups(db.all_files())
+    vid_groups = find_video_duplicate_groups(db.all_videos_with_frames())
+    img_extra, img_reclaim = _reclaimable(img_groups)
+    vid_extra, vid_reclaim = _reclaimable(vid_groups)
+
+    payload = {
+        "index": db.path,
+        "root": db.get_meta("root", root),
+        "clip_model": db.get_meta("clip_model", ""),
+        "vlm_model": db.get_meta("vlm_model", ""),
+        "files": {"total": total, "described": described, "embedded": embedded},
+        "videos": {"total": videos, "frames": frames, "embedded": vembedded,
+                   "described": vdescribed},
+        "tags": {"refined": tagged, "typed": typed, "person_clusters": people},
+        "embeddings": {"image_vectors": embedded, "dimension": dim,
+                       "video_frame_vectors": vembedded},
+        "dates": {"earliest": lo, "latest": hi} if lo else None,
+        "compute": {
+            "scans": summary["scans"], "items": summary["items"],
+            "frames": summary["frames"], "bytes": summary["bytes"],
+            "wall": summary["wall"], "cpu": summary["cpu"], "gpu": summary["gpu"],
+            "last_scan_at": summary["last_scan_at"],
+        },
+        "formats": {
+            "image": [{"extension": e, "count": c, "bytes": img_sizes[e]}
+                      for e, c in img_counts],
+            "video": [{"extension": e, "count": c, "bytes": vid_sizes[e]}
+                      for e, c in vid_counts],
+        },
+        "duplicates": {
+            "image": {"groups": len(img_groups), "extra_files": img_extra,
+                      "reclaimable_bytes": img_reclaim},
+            "video": {"groups": len(vid_groups), "extra_files": vid_extra,
+                      "reclaimable_bytes": vid_reclaim},
+        },
+    }
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        db.close()
+        return 0
+
     print(f"index:  {db.path}")
     print(f"root:   {db.get_meta('root', root)}")
     print(f"clip:   {db.get_meta('clip_model', '(not set)')}")
     print(f"vlm:    {db.get_meta('vlm_model', '(not used)')}")
     print(f"files:  {total} ({described} described, {embedded} embedded)")
     print(f"videos: {videos} ({vframes_note(frames, vembedded, vdescribed)})")
-    lo, hi = db.date_range()
     if lo:
         print(f"dates:  {lo[:10]} .. {hi[:10]} (captured, else mtime)")
-    tagged = db.has_tags("image")
-    typed = db.conn.execute(
-        "SELECT COUNT(*) AS n FROM files WHERE type != ''"
-    ).fetchone()["n"]
-    people = len(db.all_clusters("image"))
     print(f"tags:   {tagged} refined tags, {typed} typed, {people} person clusters")
 
-    dim = db.embedding_dim()
     print(f"embeddings: {embedded} image vector(s)"
           + (f", dimension {dim}" if dim else "")
           + f", {vembedded} video frame vector(s)")
 
-    summary = db.scan_summary()
     print()
     if summary["scans"]:
         items = summary["items"]
@@ -1335,10 +1460,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
     print()
     print("formats:")
-    img_counts, img_sizes = db.image_extensions()
     for ext, count in img_counts:
         print(f"  image {ext:<8} {count:>6}  {_fmt_bytes(img_sizes[ext])}")
-    vid_counts, vid_sizes = db.video_extensions()
     for ext, count in vid_counts:
         print(f"  video {ext:<8} {count:>6}  {_fmt_bytes(vid_sizes[ext])}")
     if not img_counts and not vid_counts:
@@ -1346,10 +1469,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
     print()
     print("duplicates:")
-    img_groups = find_duplicate_groups(db.all_files())
-    vid_groups = find_video_duplicate_groups(db.all_videos_with_frames())
-    for label, groups in (("image", img_groups), ("video", vid_groups)):
-        extra, reclaim = _reclaimable(groups)
+    for label, groups, extra, reclaim in (
+        ("image", img_groups, img_extra, img_reclaim),
+        ("video", vid_groups, vid_extra, vid_reclaim),
+    ):
         print(f"  {label:<5} {len(groups):>5} group(s), {extra:>5} extra file(s), "
               f"{_fmt_bytes(reclaim)} reclaimable")
     if not img_groups and not vid_groups:
@@ -1408,7 +1531,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.16"
+_VERSION = "0.2.17"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1781,6 +1904,8 @@ def main(argv: list[str] | None = None) -> int:
                           help="only photos captured on/before DATE (YYYY-MM-DD)")
     p_search.add_argument("--camera", metavar="TEXT",
                           help="only photos whose camera make/model matches TEXT")
+    p_search.add_argument("--json", action="store_true",
+                          help="machine-readable output")
     p_search.add_argument("--limit", type=int, default=50)
     p_search.set_defaults(func=cmd_search)
 
@@ -1807,6 +1932,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="min cosine similarity for tree grouping (default: 0.85)")
     p_sim.add_argument("--limit", type=int, default=10,
                        help="max neighbors to show with --image")
+    p_sim.add_argument("--json", action="store_true", help="machine-readable output")
     p_sim.set_defaults(func=cmd_similar)
 
     p_dup = sub.add_parser("duplicates", help="group duplicates; best resolution wins")
@@ -1855,6 +1981,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="trash the algorithm's worse copies without prompting")
     p_clean.add_argument("--dry-run", action="store_true",
                          help="show what would be trashed, then exit")
+    p_clean.add_argument("--json", action="store_true",
+                          help="with --dry-run: machine-readable list of files to trash")
     p_clean.set_defaults(func=cmd_clean)
 
     p_restore = sub.add_parser(
@@ -1933,6 +2061,7 @@ def main(argv: list[str] | None = None) -> int:
     p_tags.add_argument("--raw", action="store_true",
                         help="show the original keywords instead of refined tags")
     p_tags.add_argument("--limit", type=int, default=40)
+    p_tags.add_argument("--json", action="store_true", help="machine-readable output")
     p_tags.set_defaults(func=cmd_tags)
 
     p_export = sub.add_parser(
@@ -1952,6 +2081,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_stats = sub.add_parser("stats", help="show index statistics")
     _add_common(p_stats)
+    p_stats.add_argument("--json", action="store_true", help="machine-readable output")
     p_stats.set_defaults(func=cmd_stats)
 
     p_help = sub.add_parser(

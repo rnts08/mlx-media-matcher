@@ -186,16 +186,16 @@ Group 1 (2 files)
 | Command | What it does | Key options |
 |---|---|---|
 | `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
-| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--limit` |
-| `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video` |
+| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--json`, `--limit` |
+| `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--json` |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
-| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio` |
-| `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--limit`, `--video` |
+| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--json` (with `--dry-run`) |
+| `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--json`, `--limit`, `--video` |
 | `export [root]` | dump the index (path, kind, size, capture date, camera, description, keywords, type, tags, cluster, duration) | `--format` (json/csv/md, default json), `--out` |
 | `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute` |
 | `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
-| `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters | |
+| `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters, dates, duplicates, reclaimable space | `--json` |
 | `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
 | `help [command]` | the full guide: every command, every flag with its default, and a runnable example | optional command name |
 
