@@ -48,6 +48,17 @@ def _fmt_seconds(s: float) -> str:
     return f"{h}h{m:02d}m"
 
 
+def _reclaimable(groups) -> tuple[int, int]:
+    """(extra files, bytes) recoverable by keeping only each group's best copy."""
+    files = 0
+    size = 0
+    for group in groups:
+        for record, _dist in group.others:
+            files += 1
+            size += int(getattr(record, "size", 0) or 0)
+    return files, size
+
+
 def _register_heif() -> None:
     try:
         from pillow_heif import register_heif_opener
@@ -672,7 +683,9 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
                 print(f"    {r.path}  ({r.width}x{r.height}, {_mp(r.width, r.height)}) "
                       f"hamming={dist}")
         print()
-    print(f"{len(groups)} group(s), {total} files")
+    extra, reclaim = _reclaimable(groups)
+    print(f"{len(groups)} group(s), {total} files — reclaimable "
+          f"{_fmt_bytes(reclaim)} in {extra} extra copy(ies)")
     db.close()
     return 0
 
@@ -1074,6 +1087,17 @@ def cmd_stats(args: argparse.Namespace) -> int:
     if not img_counts and not vid_counts:
         print("  (no media indexed yet)")
 
+    print()
+    print("duplicates:")
+    img_groups = find_duplicate_groups(db.all_files())
+    vid_groups = find_video_duplicate_groups(db.all_videos_with_frames())
+    for label, groups in (("image", img_groups), ("video", vid_groups)):
+        extra, reclaim = _reclaimable(groups)
+        print(f"  {label:<5} {len(groups):>5} group(s), {extra:>5} extra file(s), "
+              f"{_fmt_bytes(reclaim)} reclaimable")
+    if not img_groups and not vid_groups:
+        print("  no duplicates found")
+
     db.close()
     return 0
 
@@ -1123,7 +1147,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.11"
+_VERSION = "0.2.12"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
