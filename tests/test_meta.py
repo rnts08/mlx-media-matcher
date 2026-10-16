@@ -23,6 +23,14 @@ def test_about_leads_with_blurb_and_license(capsys):
     assert "License text" in out
 
 
+def test_help_has_no_program_blurb(capsys):
+    assert cli.main(["help"]) == 0
+    out = capsys.readouterr().out
+    assert "commands:" in out
+    assert "Local photo-library analyzer" not in out
+    assert "group duplicates across resolutions" not in out
+
+
 def test_pager_honours_PAGER(monkeypatch):
     monkeypatch.setenv("PAGER", "cat -v")
     assert cli._pager() == ["cat", "-v"]

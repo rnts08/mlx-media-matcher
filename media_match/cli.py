@@ -1123,7 +1123,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.9"
+_VERSION = "0.2.10"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1206,16 +1206,6 @@ def _command_section(name: str) -> str:
 
 def _print_full_help() -> None:
     lines = [
-        "Local photo-library analyzer built on Apple's MLX. Point it at a folder",
-        "and it builds an index that lets you:",
-        "",
-        "  - find photos by person, object or free text (CLIP vector search)",
-        "  - group duplicates across resolutions, and mark the best version",
-        "  - group semantic near-duplicates",
-        "  - refine tags into facets (person/scene/object/...) and type each photo",
-        "  - cluster photos of the same person and name the clusters",
-        "  - index video files (keyframes at ~1 fps) with the same machinery",
-        "",
         "usage: media-match [--help] <command> [command options] [args...]",
         "",
         "commands:",
@@ -1416,16 +1406,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="media-match",
         add_help=False,
-        description=(
-            "Local photo-library analyzer built on Apple's MLX. Point it at a "
-            "folder and it builds an index that lets you:\n"
-            "  - find photos by person, object or free text (CLIP vector search)\n"
-            "  - group duplicates across resolutions, and mark the best version\n"
-            "  - group semantic near-duplicates\n"
-            "  - refine tags into facets (person/scene/object/...) and type each photo\n"
-            "  - cluster photos of the same person and name the clusters\n"
-            "  - index video files (keyframes at ~1 fps) with the same machinery"
-        ),
         epilog=(
             "Run 'media-match help' (or -h/--help) for this guide, "
             "'media-match help <command>' for one command, "
