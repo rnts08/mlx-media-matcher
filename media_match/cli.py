@@ -1122,7 +1122,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.1.0"
+_VERSION = "0.2.7"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
