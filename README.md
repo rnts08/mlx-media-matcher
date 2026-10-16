@@ -141,6 +141,7 @@ needs a face-embedding model). `people --label N=Name` names a cluster and
 .venv/bin/media-match tags ~/Pictures    # keyword counts from captions
 .venv/bin/media-match stats ~/Pictures   # index, models, coverage
 .venv/bin/media-match embed ~/Pictures   # backfill CLIP embeddings only
+.venv/bin/media-match export ~/Pictures --format json --out index.json
 
 # 6. refine the captions into clean tags/facets, and type each photo
 .venv/bin/media-match refine ~/Pictures              # canonical tags + facets
@@ -191,6 +192,7 @@ Group 1 (2 files)
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio` |
 | `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--limit`, `--video` |
+| `export [root]` | dump the index (path, kind, size, capture date, camera, description, keywords, type, tags, cluster, duration) | `--format` (json/csv/md, default json), `--out` |
 | `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute` |
 | `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
 | `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters | |

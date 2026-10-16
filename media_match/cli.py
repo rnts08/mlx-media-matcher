@@ -958,6 +958,78 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0 if not missing else 1
 
 
+_EXPORT_KEYS = (
+    "kind", "path", "width", "height", "size", "captured_at", "camera",
+    "description", "keywords", "type", "tags", "cluster", "duration",
+)
+
+
+def _render_export(rows: list[dict], fmt: str) -> str:
+    if fmt == "json":
+        return json.dumps(rows, indent=2, ensure_ascii=False) + "\n"
+    if fmt == "csv":
+        import csv
+        import io
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(_EXPORT_KEYS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in _EXPORT_KEYS})
+        return buf.getvalue()
+    lines = [
+        "| path | kind | size | captured | camera | type | tags | cluster |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['path']} | {r['kind']} | {_fmt_bytes(r['size'])} | "
+            f"{r['captured_at'][:10]} | {r['camera']} | {r['type']} | "
+            f"{r['tags']} | {r['cluster']} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    image_clusters = db.cluster_labels("image")
+    rows: list[dict] = []
+    for r in db.all_files():
+        tags = ", ".join(t for t, _f in db.tags_for("image", r.id))
+        cluster = image_clusters.get(r.cluster_id, "") if r.cluster_id else ""
+        rows.append({
+            "kind": "image", "path": r.path, "width": r.width, "height": r.height,
+            "size": r.size, "captured_at": r.captured_at, "camera": r.camera,
+            "description": r.description, "keywords": r.keywords, "type": r.type,
+            "tags": tags, "cluster": cluster, "duration": "",
+        })
+    for v in db.all_videos():
+        tags = ", ".join(t for t, _f in db.tags_for("video", v.id))
+        rows.append({
+            "kind": "video", "path": v.path, "width": v.width, "height": v.height,
+            "size": v.size, "captured_at": "", "camera": "",
+            "description": v.description, "keywords": v.keywords, "type": "",
+            "tags": tags, "cluster": "", "duration": v.duration,
+        })
+    rows.sort(key=lambda r: r["path"])
+
+    text = _render_export(rows, args.format)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print(f"wrote {len(rows)} item(s) to {args.out}")
+    else:
+        print(text, end="")
+    db.close()
+    return 0
+
+
 def cmd_refine(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -1308,6 +1380,7 @@ _COMMAND_SUMMARIES = {
     "refine": "rewrite keywords into canonical tags/facets; type photos",
     "people": "cluster person photos by similarity and name the clusters",
     "tags": "list refined tags, facets or image types",
+    "export": "dump the index to JSON, CSV or Markdown",
     "stats": "show index statistics (media, compute, formats)",
     "about": "show what this program does, its license and project links",
     "version": "print version, license and author",
@@ -1327,6 +1400,7 @@ _EXAMPLES = {
     "refine": "media-match refine ~/Pictures --classify",
     "people": "media-match people ~/Pictures --label 1=Alice",
     "tags": "media-match tags ~/Pictures --facets",
+    "export": "media-match export ~/Pictures --format json --out index.json",
     "stats": "media-match stats ~/Pictures",
     "about": "media-match about",
     "version": "media-match version",
@@ -1334,7 +1408,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.15"
+_VERSION = "0.2.16"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1861,6 +1935,21 @@ def main(argv: list[str] | None = None) -> int:
     p_tags.add_argument("--limit", type=int, default=40)
     p_tags.set_defaults(func=cmd_tags)
 
+    p_export = sub.add_parser(
+        "export",
+        help="dump the index to JSON, CSV or Markdown",
+        description=(
+            "Export every indexed item (path, kind, size, capture date, camera, "
+            "description, keywords, type, tags, cluster, duration) as JSON, CSV "
+            "or a Markdown table. Writes to --out, or stdout when omitted."
+        ),
+    )
+    _add_common(p_export)
+    p_export.add_argument("--format", choices=("json", "csv", "md"), default="json",
+                          help="output format (default: json)")
+    p_export.add_argument("--out", help="write to this file instead of stdout")
+    p_export.set_defaults(func=cmd_export)
+
     p_stats = sub.add_parser("stats", help="show index statistics")
     _add_common(p_stats)
     p_stats.set_defaults(func=cmd_stats)
@@ -1899,6 +1988,7 @@ def main(argv: list[str] | None = None) -> int:
         ("similar", p_sim), ("duplicates", p_dup), ("clean", p_clean),
         ("restore", p_restore),
         ("refine", p_refine), ("people", p_people), ("tags", p_tags),
+        ("export", p_export),
         ("stats", p_stats), ("about", p_about), ("version", p_version),
         ("info", p_info), ("help", p_help),
     ):

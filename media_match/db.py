@@ -182,6 +182,7 @@ class FileRecord:
     camera: str = ""
     gps_lat: float | None = None
     gps_lon: float | None = None
+    cluster_id: int | None = None
 
 
 @dataclass
@@ -362,6 +363,7 @@ class Database:
                 type=r["type"], type_score=r["type_score"],
                 captured_at=r["captured_at"], camera=r["camera"],
                 gps_lat=r["gps_lat"], gps_lon=r["gps_lon"],
+                cluster_id=r["cluster_id"],
             )
             for r in rows
         ]
@@ -932,6 +934,19 @@ class Database:
             "SELECT id FROM clusters WHERE label = ? COLLATE NOCASE ORDER BY id", (label,)
         ).fetchall()
         return [r["id"] for r in rows]
+
+    def tags_for(self, kind: str, media_id: int) -> list[tuple[str, str | None]]:
+        """(tag, facet) pairs for one media item, sorted by tag."""
+        rows = self.conn.execute(
+            "SELECT tag, facet FROM media_tags WHERE kind = ? AND media_id = ? "
+            "ORDER BY tag",
+            (kind, media_id),
+        ).fetchall()
+        return [(r["tag"], r["facet"]) for r in rows]
+
+    def cluster_labels(self, kind: str = "image") -> dict[int, str]:
+        """cluster id -> label (may be empty)."""
+        return {r["id"]: r["label"] for r in self.all_clusters(kind)}
 
     # -- trash log (undo support) -------------------------------------------
 
