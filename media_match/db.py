@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 DEFAULT_DB_NAME = ".media-match.db"
 
 # Bump when the schema changes and add the matching step to _MIGRATIONS.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS files (
     description TEXT NOT NULL DEFAULT '',
     keywords TEXT NOT NULL DEFAULT '',
     embedding BLOB,
+    captured_at TEXT NOT NULL DEFAULT '',
+    camera TEXT NOT NULL DEFAULT '',
+    gps_lat REAL,
+    gps_lon REAL,
     scanned_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
@@ -108,6 +112,12 @@ _FILE_COLUMNS = (
 _VIDEO_COLUMNS = (
     ("raw_keywords", "TEXT NOT NULL DEFAULT ''"),
 )
+_EXIF_COLUMNS = (
+    ("captured_at", "TEXT NOT NULL DEFAULT ''"),
+    ("camera", "TEXT NOT NULL DEFAULT ''"),
+    ("gps_lat", "REAL"),
+    ("gps_lon", "REAL"),
+)
 
 
 def _add_missing_columns(conn: sqlite3.Connection, table: str, columns) -> None:
@@ -123,9 +133,15 @@ def _migrate_v1(db: "Database") -> None:
     _add_missing_columns(db.conn, "videos", _VIDEO_COLUMNS)
 
 
+def _migrate_v2(db: "Database") -> None:
+    """v2: EXIF capture time, camera and GPS on images."""
+    _add_missing_columns(db.conn, "files", _EXIF_COLUMNS)
+
+
 # (target_version, step) ascending. Each step upgrades the previous version.
 _MIGRATIONS = (
     (1, _migrate_v1),
+    (2, _migrate_v2),
 )
 
 
@@ -144,6 +160,10 @@ class FileRecord:
     raw_keywords: str = ""
     type: str = ""
     type_score: float = 0.0
+    captured_at: str = ""
+    camera: str = ""
+    gps_lat: float | None = None
+    gps_lon: float | None = None
 
 
 @dataclass
@@ -277,12 +297,17 @@ class Database:
         description: str,
         keywords: str,
         embedding: bytes | None = None,
+        captured_at: str = "",
+        camera: str = "",
+        gps_lat: float | None = None,
+        gps_lon: float | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO files(path, size, mtime, sha1, width, height, phash,
-                              description, keywords, embedding)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              description, keywords, embedding, captured_at,
+                              camera, gps_lat, gps_lon)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 size = excluded.size, mtime = excluded.mtime,
                 sha1 = excluded.sha1, width = excluded.width,
@@ -290,10 +315,14 @@ class Database:
                 description = excluded.description,
                 keywords = excluded.keywords,
                 embedding = excluded.embedding,
+                captured_at = excluded.captured_at,
+                camera = excluded.camera,
+                gps_lat = excluded.gps_lat,
+                gps_lon = excluded.gps_lon,
                 scanned_at = datetime('now')
             """,
             (path, size, mtime, sha1, width, height, phash, description,
-             keywords, embedding),
+             keywords, embedding, captured_at, camera, gps_lat, gps_lon),
         )
         if self._fts_available:
             row = self.conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
@@ -313,6 +342,8 @@ class Database:
                 phash=r["phash"], description=r["description"],
                 keywords=r["keywords"], raw_keywords=r["raw_keywords"],
                 type=r["type"], type_score=r["type_score"],
+                captured_at=r["captured_at"], camera=r["camera"],
+                gps_lat=r["gps_lat"], gps_lon=r["gps_lon"],
             )
             for r in rows
         ]

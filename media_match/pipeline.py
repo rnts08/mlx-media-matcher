@@ -20,6 +20,7 @@ import numpy as np
 
 from .clip_processor import process_image
 from .db import Database
+from .exif import read_exif
 from .hashing import hash_to_hex, phash
 from .video import VideoMeta, extract_frames, probe, sample_count
 
@@ -54,6 +55,10 @@ class ScanResult:
     video_meta: VideoMeta | None = None
     signature: str = ""
     vectors: list[np.ndarray] = field(default_factory=list)
+    captured_at: str = ""
+    camera: str = ""
+    gps_lat: float | None = None
+    gps_lon: float | None = None
 
 
 @dataclass
@@ -185,11 +190,14 @@ def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
     if job.kind == "image":
         with Image.open(job.path) as img:
             width, height = img.size
+            meta = read_exif(img)
             frame_hash = hash_to_hex(phash(img))
             array = process_image(img.convert("RGB"))
         return ScanResult(
             job=job, sha1=sha1, width=width, height=height,
             phashes=[frame_hash], arrays=[array], signature=frame_hash,
+            captured_at=meta["captured_at"], camera=meta["camera"],
+            gps_lat=meta["gps_lat"], gps_lon=meta["gps_lon"],
         )
 
     meta = probe(job.path)
@@ -364,6 +372,8 @@ def store_result(db: Database, result: ScanResult) -> None:
             width=result.width, height=result.height, phash=result.phashes[0],
             description=job.prev_description, keywords=job.prev_keywords,
             embedding=embedding,
+            captured_at=result.captured_at, camera=result.camera,
+            gps_lat=result.gps_lat, gps_lon=result.gps_lon,
         )
         return
 
