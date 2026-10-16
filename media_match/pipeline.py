@@ -19,6 +19,7 @@ from functools import partial
 import numpy as np
 
 from .clip_processor import process_image
+from .config import is_ignored
 from .db import Database
 from .exif import read_exif
 from .hashing import hash_to_hex, phash
@@ -88,8 +89,14 @@ def _sha1_of(path: str) -> str:
     return h.hexdigest()
 
 
-def iter_media(root: str, include_video: bool) -> list[tuple[str, str]]:
-    """(kind, path) for every image (and, optionally, video) under root."""
+def iter_media(root: str, include_video: bool, *,
+                ignore: list[str] | None = None) -> list[tuple[str, str]]:
+    """(kind, path) for every image (and, optionally, video) under root.
+
+    ``ignore`` is a list of .media-matchignore globs; matching paths are left
+    out of the index entirely.
+    """
+    ignore = ignore or []
     paths: list[tuple[str, str]] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
@@ -99,6 +106,8 @@ def iter_media(root: str, include_video: bool) -> list[tuple[str, str]]:
                 continue
             ext = os.path.splitext(name)[1].lower()
             path = os.path.join(dirpath, name)
+            if ignore and is_ignored(os.path.relpath(path, root), ignore):
+                continue
             if ext in IMAGE_EXTENSIONS:
                 paths.append(("image", path))
             elif include_video and ext in VIDEO_EXTENSIONS:
@@ -113,9 +122,10 @@ def build_jobs(
     include_video: bool,
     reanalyze: bool,
     limit: int | None = None,
+    ignore: list[str] | None = None,
 ) -> tuple[list[ScanJob], int, int]:
     """Return (jobs, total, up_to_date) after applying the mtime/size check."""
-    media = iter_media(root, include_video)
+    media = iter_media(root, include_video, ignore=ignore)
     if limit:
         media = media[:limit]
     jobs: list[ScanJob] = []
@@ -151,29 +161,37 @@ def _under(path: str, root: str, prefix: str) -> bool:
     return path == root or path.startswith(prefix)
 
 
-def prune_missing(root: str, db: Database, *, include_video: bool) -> int:
+def prune_missing(root: str, db: Database, *, include_video: bool,
+                  ignore: list[str] | None = None) -> int:
     """Drop index rows for media under ``root`` no longer present on disk.
 
     Scoped to ``root`` so scanning a subtree never touches the rest of the
     index, and skipped entirely when ``root`` itself is gone, so an unmounted
-    or renamed drive cannot wipe the index. Returns the number of rows removed.
+    or renamed drive cannot wipe the index. Paths matched by
+    ``.media-matchignore`` are treated as absent. Returns rows removed.
     """
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         return 0
     prefix = root + os.sep
+    ignore = ignore or []
     file_rows, video_rows = db.all_paths()
 
-    stale_files = [
-        r["id"] for r in file_rows
-        if _under(r["path"], root, prefix) and not os.path.exists(r["path"])
-    ]
+    def _stale(rows: list) -> list[int]:
+        out = []
+        for r in rows:
+            if not _under(r["path"], root, prefix):
+                continue
+            if not os.path.exists(r["path"]):
+                out.append(r["id"])
+            elif ignore and is_ignored(os.path.relpath(r["path"], root), ignore):
+                out.append(r["id"])
+        return out
+
+    stale_files = _stale(file_rows)
     stale_videos: list[int] = []
     if include_video:
-        stale_videos = [
-            r["id"] for r in video_rows
-            if _under(r["path"], root, prefix) and not os.path.exists(r["path"])
-        ]
+        stale_videos = _stale(video_rows)
 
     if stale_files:
         db.delete_files(stale_files)

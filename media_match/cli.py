@@ -146,12 +146,26 @@ def _require_ffmpeg() -> bool:
 def cmd_scan(args: argparse.Namespace) -> int:
     _register_heif()
 
+    from .config import load_config, load_ignore
+
+    cfg = load_config()
     root = os.path.abspath(args.root)
+    ignore = load_ignore(root)
+
+    # An explicit flag wins, then the config file, then the built-in default.
+    clip_model = args.clip_model or cfg.get("clip_model") or DEFAULT_CLIP_MODEL
+    model = args.model or cfg.get("model") or DEFAULT_MODEL
+    workers = args.workers if args.workers is not None else (cfg.get("workers") or 4)
+    batch = args.batch if args.batch is not None else (cfg.get("batch") or 16)
+    interval = args.interval if args.interval is not None else (cfg.get("interval") or 1.0)
+    max_frames = (args.max_frames if args.max_frames is not None
+                  else (cfg.get("max_frames") or 120))
+
     db = Database(db_path_for(root, args.db))
     db.set_meta("root", root)
-    db.set_meta("clip_model", args.clip_model)
+    db.set_meta("clip_model", clip_model)
     if args.describe:
-        db.set_meta("vlm_model", args.model)
+        db.set_meta("vlm_model", model)
 
     if args.video and not _require_ffmpeg():
         db.close()
@@ -160,7 +174,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # With --prune, drop index rows for media moved or deleted since the last
     # scan, so the index tracks the folder instead of accumulating ghosts.
     if args.prune:
-        pruned = prune_missing(root, db, include_video=args.video)
+        pruned = prune_missing(root, db, include_video=args.video, ignore=ignore)
         if pruned:
             print(f"removed {pruned} stale index row(s) "
                   f"(moved or deleted since last scan)")
@@ -169,13 +183,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     jobs, total, up_to_date = build_jobs(
         root, db, include_video=args.video, reanalyze=args.reanalyze,
-        limit=args.limit,
+        limit=args.limit, ignore=ignore,
     )
     print(f"{total} media found, {up_to_date} up to date, {len(jobs)} to analyze")
 
     from .clip import ClipEncoder
 
-    encoder = ClipEncoder(model_id=args.clip_model, batch_size=args.batch)
+    encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
     errors = 0
 
     def on_error(path: str, exc: Exception) -> None:
@@ -200,8 +214,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     scan_stats = ScanStats()
     analyzed = run_scan(
-        jobs, encoder, interval=args.interval, max_frames=args.max_frames,
-        batch_size=args.batch, workers=args.workers,
+        jobs, encoder, interval=interval, max_frames=max_frames,
+        batch_size=batch, workers=workers,
         on_result=on_result, progress=progress, on_error=on_error,
         stats=scan_stats,
     )
@@ -797,14 +811,21 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.")
         return 1
 
+    from .config import load_config
+
+    cfg = load_config()
+    threshold = (args.threshold if args.threshold is not None
+                 else (cfg.get("threshold") or 8))
+    prefer = args.prefer or cfg.get("prefer") or "resolution"
+
     if args.video:
         groups = find_video_duplicate_groups(
             db.all_videos_with_frames(),
             frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
         )
     else:
-        groups = find_duplicate_groups(db.all_files(), threshold=args.threshold,
-                                       prefer=args.prefer)
+        groups = find_duplicate_groups(db.all_files(), threshold=threshold,
+                                       prefer=prefer)
     if not groups:
         print("No duplicate groups found.")
         db.close()
@@ -1531,7 +1552,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.17"
+_VERSION = "0.2.18"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1858,17 +1879,22 @@ def main(argv: list[str] | None = None) -> int:
                              "(selfie/scene/object/...; implies --refine)")
     p_scan.add_argument("--video", action="store_true",
                         help="also index video files (keyframes each)")
-    p_scan.add_argument("--model", default=DEFAULT_MODEL,
-                        help=f"MLX vision model for --describe (default: {DEFAULT_MODEL})")
-    p_scan.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
-                        help=f"CLIP model for embeddings (default: {DEFAULT_CLIP_MODEL})")
-    p_scan.add_argument("--batch", type=int, default=16, help="CLIP batch size")
-    p_scan.add_argument("--workers", type=int, default=4,
-                        help="parallel CPU prep threads feeding the GPU (default: 4)")
-    p_scan.add_argument("--interval", type=float, default=1.0,
-                        help="target seconds between video keyframes (default: 1.0)")
-    p_scan.add_argument("--max-frames", type=int, default=120,
-                        help="cap on keyframes per video (default: 120)")
+    p_scan.add_argument("--model", default=None,
+                        help="MLX vision model for --describe "
+                             f"(default: {DEFAULT_MODEL}, or config 'model')")
+    p_scan.add_argument("--clip-model", default=None,
+                        help="CLIP model for embeddings "
+                             f"(default: {DEFAULT_CLIP_MODEL}, or config 'clip_model')")
+    p_scan.add_argument("--batch", type=int, default=None,
+                        help="CLIP batch size (default: 16, or config 'batch')")
+    p_scan.add_argument("--workers", type=int, default=None,
+                        help="parallel CPU prep threads feeding the GPU "
+                             "(default: 4, or config 'workers')")
+    p_scan.add_argument("--interval", type=float, default=None,
+                        help="target seconds between video keyframes "
+                             "(default: 1.0, or config 'interval')")
+    p_scan.add_argument("--max-frames", type=int, default=None,
+                        help="cap on keyframes per video (default: 120, or config 'max_frames')")
     p_scan.add_argument("--limit", type=int, help="only scan first N media items")
     p_scan.add_argument("--reanalyze", action="store_true",
                         help="re-analyze files even if unchanged")
@@ -1939,14 +1965,16 @@ def main(argv: list[str] | None = None) -> int:
     _add_common(p_dup)
     p_dup.add_argument("--video", action="store_true",
                        help="group duplicate/re-encode videos by keyframe pHash")
-    p_dup.add_argument("--threshold", type=int, default=8,
-                       help="max pHash hamming distance 0-64 for images (default: 8)")
+    p_dup.add_argument("--threshold", type=int, default=None,
+                       help="max pHash hamming distance 0-64 for images "
+                            "(default: 8, or config 'threshold')")
     p_dup.add_argument("--frame-threshold", type=int, default=12,
                        help="max keyframe pHash hamming distance for videos (default: 12)")
     p_dup.add_argument("--ratio", type=float, default=0.6,
                        help="min fraction of matching keyframes for videos (default: 0.6)")
-    p_dup.add_argument("--prefer", choices=("resolution", "date"), default="resolution",
-                       help="which copy is 'best': largest (default) or newest capture")
+    p_dup.add_argument("--prefer", choices=("resolution", "date"), default=None,
+                       help="which copy is 'best': largest (default) or newest "
+                            "capture (or config 'prefer')")
     p_dup.add_argument("--json", action="store_true", help="machine-readable output")
     p_dup.set_defaults(func=cmd_duplicates)
 

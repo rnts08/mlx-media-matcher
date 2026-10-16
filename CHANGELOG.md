@@ -13,6 +13,7 @@ naturally against the work that produced it.
 
 ## 0.2.x — video support
 
+- **0.2.18** feat: `~/.config/media-match/config.toml` defaults and `.media-matchignore` globs
 - **0.2.17** feat: `--json` output for `search`, `tags`, `stats`, `similar` and `clean --dry-run`
 - **0.2.16** feat: `export` the index to JSON, CSV or Markdown
 - **0.2.15** feat: `restore` command — undo `clean` by moving files back from the OS Trash

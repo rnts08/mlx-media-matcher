@@ -89,6 +89,31 @@ same-looking people group together. It is honest about its limits: CLIP groups
 needs a face-embedding model). `people --label N=Name` names a cluster and
 `search --cluster Name` lists it.
 
+## Configuration
+
+Defaults you usually repeat can live in `~/.config/media-match/config.toml`. An
+explicit command-line flag always wins, then the config, then the built-in
+default:
+
+```toml
+[media-match]
+clip_model = "mlx-community/clip-vit-base-patch32"
+workers = 8
+threshold = 8
+```
+
+To keep paths out of the index, add a `.media-matchignore` in the scanned root
+(globs, one per line, `#` comments). Matching is against the path relative to
+the root and its basename, so directory entries and bare names both work:
+
+```
+node_modules/
+*_export/
+*.tmp
+```
+
+Ignored paths are skipped by `scan` and dropped by `scan --prune`.
+
 ## Usage
 
 ```bash
