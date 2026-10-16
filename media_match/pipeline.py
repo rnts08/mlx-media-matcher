@@ -139,6 +139,41 @@ def build_jobs(
     return jobs, len(media), up_to_date
 
 
+def _under(path: str, root: str, prefix: str) -> bool:
+    return path == root or path.startswith(prefix)
+
+
+def prune_missing(root: str, db: Database, *, include_video: bool) -> int:
+    """Drop index rows for media under ``root`` no longer present on disk.
+
+    Scoped to ``root`` so scanning a subtree never touches the rest of the
+    index, and skipped entirely when ``root`` itself is gone, so an unmounted
+    or renamed drive cannot wipe the index. Returns the number of rows removed.
+    """
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        return 0
+    prefix = root + os.sep
+    file_rows, video_rows = db.all_paths()
+
+    stale_files = [
+        r["id"] for r in file_rows
+        if _under(r["path"], root, prefix) and not os.path.exists(r["path"])
+    ]
+    stale_videos: list[int] = []
+    if include_video:
+        stale_videos = [
+            r["id"] for r in video_rows
+            if _under(r["path"], root, prefix) and not os.path.exists(r["path"])
+        ]
+
+    if stale_files:
+        db.delete_files(stale_files)
+    if stale_videos:
+        db.delete_videos(stale_videos)
+    return len(stale_files) + len(stale_videos)
+
+
 def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
     """CPU-only work for one file: hash, decode, perceptual-hash, preprocess."""
     from PIL import Image

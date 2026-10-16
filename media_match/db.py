@@ -455,6 +455,16 @@ class Database:
         ).fetchone()
         return row["embedding"] if row else None
 
+    def all_paths(self) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        """``(image rows, video rows)`` with only ``id`` and ``path`` selected.
+
+        Cheap enough to load whole tables: just two columns, used by scan to
+        prune index rows for media that has since been moved or deleted.
+        """
+        files = self.conn.execute("SELECT id, path FROM files").fetchall()
+        videos = self.conn.execute("SELECT id, path FROM videos").fetchall()
+        return files, videos
+
     def delete_files(self, ids: list[int]) -> None:
         if not ids:
             return

@@ -11,7 +11,7 @@ import textwrap
 
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
-from .pipeline import ScanStats, build_jobs, run_scan, store_result
+from .pipeline import ScanStats, build_jobs, prune_missing, run_scan, store_result
 from .tags import facet_of, refine
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
@@ -82,6 +82,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if args.video and not _require_ffmpeg():
         db.close()
         return 2
+
+    # With --prune, drop index rows for media moved or deleted since the last
+    # scan, so the index tracks the folder instead of accumulating ghosts.
+    if args.prune:
+        pruned = prune_missing(root, db, include_video=args.video)
+        if pruned:
+            print(f"removed {pruned} stale index row(s) "
+                  f"(moved or deleted since last scan)")
+        else:
+            print("no stale index rows to remove")
 
     jobs, total, up_to_date = build_jobs(
         root, db, include_video=args.video, reanalyze=args.reanalyze,
@@ -172,6 +182,11 @@ def _describe_images(db: Database, root: str, args, on_error) -> None:
         for member in [group.best] + [rec for rec, _ in group.others]:
             group_best[member.id] = group.best.id
     pending = [r for r in records if not r.description]
+    missing = [r for r in pending if not os.path.exists(r.path)]
+    if missing:
+        print(f"{len(missing)} undescribed image(s) skipped: no longer on disk "
+              f"(stale index; run 'media-match scan --prune' to refresh)")
+        pending = [r for r in pending if os.path.exists(r.path)]
     to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
     shadowed = len(pending) - len(to_describe)
     if shadowed:
@@ -205,6 +220,11 @@ def _describe_videos(db: Database, root: str, args, on_error) -> None:
         for member in [group.best] + [rec for rec, _ in group.others]:
             group_best[member.id] = group.best.id
     pending = [r for r in records if not r.description]
+    missing = [r for r in pending if not os.path.exists(r.path)]
+    if missing:
+        print(f"{len(missing)} undescribed video(s) skipped: no longer on disk "
+              f"(stale index; run 'media-match scan --prune' to refresh)")
+        pending = [r for r in pending if os.path.exists(r.path)]
     to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
     shadowed = len(pending) - len(to_describe)
     if shadowed:
@@ -1408,6 +1428,9 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--limit", type=int, help="only scan first N media items")
     p_scan.add_argument("--reanalyze", action="store_true",
                         help="re-analyze files even if unchanged")
+    p_scan.add_argument("--prune", action="store_true",
+                        help="also drop index rows for files moved or deleted "
+                             "since the last scan (keeps the index in sync)")
     p_scan.set_defaults(func=cmd_scan)
 
     p_search = sub.add_parser("search", help="find media by person/object/text")

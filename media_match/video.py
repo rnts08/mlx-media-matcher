@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 from dataclasses import dataclass
 
@@ -89,6 +90,21 @@ def sample_count(
     return max(min_frames, min(max_frames, n))
 
 
+def _run(cmd: list[str], what: str) -> bytes:
+    """Run ffmpeg and return stdout, or raise a short, readable error.
+
+    ``check=True`` would surface the whole command line; the last stderr line
+    ("No such file or directory", "Invalid data found", ...) is far more useful
+    in a scan log.
+    """
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = err[-1] if err else f"exit status {proc.returncode}"
+        raise RuntimeError(f"{what} failed: {detail}")
+    return proc.stdout
+
+
 def extract_frames(
     path: str,
     meta: VideoMeta,
@@ -108,13 +124,13 @@ def extract_frames(
         return []
 
     fps = count / meta.duration
-    raw = subprocess.run(
+    raw = _run(
         [FFMPEG, "-v", "error", "-nostdin", "-i", path,
          "-vf", f"fps={fps:.6f},scale={frame_size}:{frame_size}",
          "-frames:v", str(count), "-an",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-        capture_output=True, check=True,
-    ).stdout
+        what=f"decoding {os.path.basename(path)}",
+    )
 
     frame_bytes = frame_size * frame_size * 3
     n = len(raw) // frame_bytes
@@ -127,10 +143,10 @@ def extract_frames(
 
 def extract_still_png(path: str, at: float, size: int = 448) -> bytes:
     """A single PNG frame at ``at`` seconds — used to caption a video."""
-    return subprocess.run(
+    return _run(
         [FFMPEG, "-v", "error", "-nostdin", "-ss", f"{max(at, 0):.3f}", "-i", path,
          "-frames:v", "1", "-an", "-vf", f"scale={size}:{size}",
          "-f", "image2pipe", "-vcodec", "png", "-"],
-        capture_output=True, check=True,
-    ).stdout
+        what=f"frame extraction from {os.path.basename(path)}",
+    )
 
