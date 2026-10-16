@@ -1122,12 +1122,24 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.7"
+_VERSION = "0.2.8"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
 _LICENSE_URL = f"{_REPO}/blob/main/LICENSE"
 _ISSUES_URL = f"{_REPO}/issues"
+
+# Where people can fund development. Kept in one place so 'info' and the
+# license stay in step.
+_SUPPORT_LINES = (
+    "Support development of media-match",
+    "  - EVM: 0x6e8e3c2b31424266e7cff59e910df1587c317427 (ERC-20, BEP-20, TRC-20, Base)",
+    "  - BTC: bc1qzzvcguvqjc6qhwe2y5vy38w2zke7hksukjhm68",
+    "  - LTC: MPfm5QLKH1r9XxgWmH75Gyps4LDfX5c53L",
+    "  - SOL: GEaCMpnyM8tB5BU4RMuLm6tgMr3q9FgMHodxDxxAGby",
+    "  - https://buymeacoffee.com/timhbergsta",
+    "  - https://ko-fi.com/rnts08",
+)
 
 
 def _flag_lines(parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
@@ -1317,6 +1329,9 @@ def cmd_info(args: argparse.Namespace) -> int:
         print("Last scan:    no index at this folder yet")
 
     print(f"Free storage: {_free_storage(root)}")
+    print()
+    for line in _SUPPORT_LINES:
+        print(line)
     return 0
 
 
