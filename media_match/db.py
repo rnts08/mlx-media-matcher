@@ -14,9 +14,12 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 DEFAULT_DB_NAME = ".media-match.db"
+
+# Bump when the schema changes and add the matching step to _MIGRATIONS.
+SCHEMA_VERSION = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -93,6 +96,39 @@ CREATE TABLE IF NOT EXISTS clusters (
 """
 
 
+# Columns added after the first released schema; migration v1 backfills them on
+# databases created before schema versioning existed.
+_FILE_COLUMNS = (
+    ("embedding", "BLOB"),
+    ("raw_keywords", "TEXT NOT NULL DEFAULT ''"),
+    ("type", "TEXT NOT NULL DEFAULT ''"),
+    ("type_score", "REAL NOT NULL DEFAULT 0"),
+    ("cluster_id", "INTEGER"),
+)
+_VIDEO_COLUMNS = (
+    ("raw_keywords", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns) -> None:
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _migrate_v1(db: "Database") -> None:
+    """v1: the columns that predate schema versioning (idempotent)."""
+    _add_missing_columns(db.conn, "files", _FILE_COLUMNS)
+    _add_missing_columns(db.conn, "videos", _VIDEO_COLUMNS)
+
+
+# (target_version, step) ascending. Each step upgrades the previous version.
+_MIGRATIONS = (
+    (1, _migrate_v1),
+)
+
+
 @dataclass
 class FileRecord:
     id: int
@@ -148,27 +184,43 @@ class Database:
         self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
+        self._setup_pragmas()
         self.conn.executescript(_SCHEMA)
         self._migrate()
         self._fts_available = self._setup_fts()
         self.conn.commit()
 
-    def _migrate(self) -> None:
-        file_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
-        for name, decl in (
-            ("embedding", "BLOB"),
-            ("raw_keywords", "TEXT NOT NULL DEFAULT ''"),
-            ("type", "TEXT NOT NULL DEFAULT ''"),
-            ("type_score", "REAL NOT NULL DEFAULT 0"),
-            ("cluster_id", "INTEGER"),
+    def _setup_pragmas(self) -> None:
+        """WAL + a busy timeout so a read and a scan can coexist without
+        'database is locked'; synchronous=NORMAL is the usual WAL pairing."""
+        for pragma in (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA busy_timeout=5000",
         ):
-            if name not in file_cols:
-                self.conn.execute(f"ALTER TABLE files ADD COLUMN {name} {decl}")
-        video_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(videos)")}
-        if "raw_keywords" not in video_cols:
-            self.conn.execute(
-                "ALTER TABLE videos ADD COLUMN raw_keywords TEXT NOT NULL DEFAULT ''"
-            )
+            try:
+                self.conn.execute(pragma)
+            except sqlite3.OperationalError:
+                pass  # e.g. a read-only filesystem; keep the defaults
+
+    def _schema_version(self) -> int:
+        try:
+            return int(self.get_meta("schema_version", "0") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _migrate(self) -> None:
+        """Apply pending migrations, then stamp the schema version.
+
+        Steps are idempotent, so a database created before versioning (version
+        0) is upgraded in place without losing data.
+        """
+        version = self._schema_version()
+        for target, step in _MIGRATIONS:
+            if version < target:
+                step(self)
+                version = target
+        self._set_meta_no_commit("schema_version", str(version))
 
     def _setup_fts(self) -> bool:
         try:
@@ -197,12 +249,15 @@ class Database:
         return row["value"] if row else default
 
     def set_meta(self, key: str, value: str) -> None:
+        self._set_meta_no_commit(key, value)
+        self.conn.commit()
+
+    def _set_meta_no_commit(self, key: str, value: str) -> None:
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
-        self.conn.commit()
 
     # -- files --------------------------------------------------------------
 
@@ -397,9 +452,20 @@ class Database:
         marks = ",".join("?" * len(ids))
         self.conn.execute(f"DELETE FROM videos WHERE id IN ({marks})", ids)
         self.conn.execute(f"DELETE FROM video_frames WHERE video_id IN ({marks})", ids)
+        self.conn.execute(
+            f"DELETE FROM media_tags WHERE kind = 'video' AND media_id IN ({marks})", ids
+        )
         if self._fts_available:
             self.conn.execute(f"DELETE FROM videos_fts WHERE rowid IN ({marks})", ids)
         self.conn.commit()
+
+    def _drop_empty_clusters(self, kind: str, table: str) -> None:
+        """Remove cluster rows left with no members after media was deleted."""
+        self.conn.execute(
+            f"DELETE FROM clusters WHERE kind = ? AND id NOT IN "
+            f"(SELECT DISTINCT cluster_id FROM {table} WHERE cluster_id IS NOT NULL)",
+            (kind,),
+        )
 
     def count_videos(self) -> int:
         return self.conn.execute("SELECT COUNT(*) AS n FROM videos").fetchone()["n"]
@@ -470,10 +536,14 @@ class Database:
             return
         marks = ",".join("?" * len(ids))
         self.conn.execute(f"DELETE FROM files WHERE id IN ({marks})", ids)
+        self.conn.execute(
+            f"DELETE FROM media_tags WHERE kind = 'image' AND media_id IN ({marks})", ids
+        )
         if self._fts_available:
             self.conn.execute(
                 f"DELETE FROM files_fts WHERE rowid IN ({marks})", ids
             )
+        self._drop_empty_clusters("image", "files")
         self.conn.commit()
 
     # -- search -------------------------------------------------------------
@@ -539,20 +609,26 @@ class Database:
         cpu: float,
         gpu: float,
     ) -> None:
-        """Accumulate one scan run's measured cost into meta (totals + count)."""
-        for key, value in (
-            ("scan_items", items),
-            ("scan_frames", frames),
-            ("scan_bytes", bytes_read),
-            ("scan_wall", wall),
-            ("scan_cpu", cpu),
-            ("scan_gpu", gpu),
-        ):
-            total = float(self.get_meta(key, "0") or 0) + value
-            self.set_meta(key, str(total))
-        runs = int(self.get_meta("scans", "0") or 0) + 1
-        self.set_meta("scans", str(runs))
-        self.set_meta("last_scan_at", datetime.now().isoformat(timespec="seconds"))
+        """Accumulate one scan run's measured cost into meta (totals + count).
+
+        Written in a single transaction so a concurrent reader never sees a
+        half-updated total, and timestamped in UTC to match ``scanned_at``.
+        """
+        scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self.conn:
+            for key, value in (
+                ("scan_items", items),
+                ("scan_frames", frames),
+                ("scan_bytes", bytes_read),
+                ("scan_wall", wall),
+                ("scan_cpu", cpu),
+                ("scan_gpu", gpu),
+            ):
+                total = float(self.get_meta(key, "0") or 0) + value
+                self._set_meta_no_commit(key, str(total))
+            runs = int(self.get_meta("scans", "0") or 0) + 1
+            self._set_meta_no_commit("scans", str(runs))
+            self._set_meta_no_commit("last_scan_at", scanned_at)
 
     def scan_summary(self) -> dict:
         def num(key: str) -> float:

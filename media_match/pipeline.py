@@ -89,6 +89,9 @@ def iter_media(root: str, include_video: bool) -> list[tuple[str, str]]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
         for name in sorted(filenames):
+            # skip dotfiles: macOS .trashed-*, AppleDouble ._*, the index itself
+            if name.startswith("."):
+                continue
             ext = os.path.splitext(name)[1].lower()
             path = os.path.join(dirpath, name)
             if ext in IMAGE_EXTENSIONS:

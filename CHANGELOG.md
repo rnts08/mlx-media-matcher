@@ -13,6 +13,7 @@ naturally against the work that produced it.
 
 ## 0.2.x — video support
 
+- **0.2.11** fix(db): clear orphaned `media_tags`/clusters on delete; WAL + busy timeout; schema versioning; UTC timestamps; skip dotfiles on scan
 - **0.2.10** fix(cli): drop the program blurb from help output; it lives in `about` now
 - **0.2.9** feat(cli): page `about` through `$PAGER`/`less`/`more` and lead with the feature blurb
 - **0.2.8** feat(cli): show "Support development" details (crypto addresses, Buy Me a Coffee, Ko-fi) in `info`
