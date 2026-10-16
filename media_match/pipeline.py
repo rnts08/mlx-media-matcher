@@ -11,6 +11,7 @@ queue, so both kinds of media fill the same pipeline.
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
@@ -53,6 +54,23 @@ class ScanResult:
     video_meta: VideoMeta | None = None
     signature: str = ""
     vectors: list[np.ndarray] = field(default_factory=list)
+
+
+@dataclass
+class ScanStats:
+    """Measured cost of one scan run, accumulated into the index for `stats`.
+
+    ``gpu`` is the time spent inside CLIP embedding forward passes (a good
+    proxy for GPU-busy time); ``cpu`` is process CPU time (includes decoding,
+    hashing and the DB writes done from the result callback).
+    """
+
+    items: int = 0
+    frames: int = 0
+    bytes_read: int = 0
+    wall: float = 0.0
+    cpu: float = 0.0
+    gpu: float = 0.0
 
 
 def _sha1_of(path: str) -> str:
@@ -165,6 +183,7 @@ def run_scan(
     on_result=None,
     progress=None,
     on_error=None,
+    stats: ScanStats | None = None,
 ) -> int:
     """Prepare jobs concurrently and embed their frames in GPU batches.
 
@@ -176,7 +195,12 @@ def run_scan(
     A failed embedding batch leaves the affected frames' vectors as ``None`` but
     keeps *positional* alignment: ``result.vectors[i]`` always belongs to
     ``result.phashes[i]`` / ``result.timestamps[i]``.
+
+    When ``stats`` is given it is filled with the measured cost of this run
+    (items, frames, bytes read, and wall/CPU/GPU seconds).
     """
+    t_wall = time.perf_counter()
+    t_cpu = time.process_time()
     results: dict[int, ScanResult] = {}
     owners: dict[int, list[np.ndarray | None]] = {}
     remaining: dict[int, int] = {}
@@ -199,11 +223,14 @@ def run_scan(
             return
         arrays = [arr for _, _, arr in batch]
         vectors = None
+        t_gpu = time.perf_counter()
         try:
             vectors = encoder.embed_images(arrays)
         except Exception as exc:  # noqa: BLE001 - report, drop this batch
             if on_error:
                 on_error("<batch>", exc)
+        if stats is not None:
+            stats.gpu += time.perf_counter() - t_gpu
         completed: list[int] = []
         for k, (owner, frame, _) in enumerate(batch):
             if vectors is not None:
@@ -235,6 +262,9 @@ def run_scan(
 
     def handle(result: ScanResult) -> None:
         nonlocal next_owner
+        if stats is not None:
+            stats.frames += len(result.arrays)
+            stats.bytes_read += result.job.size
         owner = next_owner
         next_owner += 1
         results[owner] = result
@@ -272,6 +302,10 @@ def run_scan(
             fill(iterator)
         flush()
 
+    if stats is not None:
+        stats.items = emitted
+        stats.wall = time.perf_counter() - t_wall
+        stats.cpu = time.process_time() - t_cpu
     return emitted
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime
 
 DEFAULT_DB_NAME = ".media-match.db"
 
@@ -516,6 +517,80 @@ class Database:
                     if kw:
                         counts[kw] = counts.get(kw, 0) + 1
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+    # -- scan cost accounting ---------------------------------------------------
+
+    def record_scan(
+        self,
+        items: int,
+        frames: int,
+        bytes_read: int,
+        wall: float,
+        cpu: float,
+        gpu: float,
+    ) -> None:
+        """Accumulate one scan run's measured cost into meta (totals + count)."""
+        for key, value in (
+            ("scan_items", items),
+            ("scan_frames", frames),
+            ("scan_bytes", bytes_read),
+            ("scan_wall", wall),
+            ("scan_cpu", cpu),
+            ("scan_gpu", gpu),
+        ):
+            total = float(self.get_meta(key, "0") or 0) + value
+            self.set_meta(key, str(total))
+        runs = int(self.get_meta("scans", "0") or 0) + 1
+        self.set_meta("scans", str(runs))
+        self.set_meta("last_scan_at", datetime.now().isoformat(timespec="seconds"))
+
+    def scan_summary(self) -> dict:
+        def num(key: str) -> float:
+            try:
+                return float(self.get_meta(key, "0") or 0)
+            except ValueError:
+                return 0.0
+
+        return {
+            "scans": int(num("scans")),
+            "items": int(num("scan_items")),
+            "frames": int(num("scan_frames")),
+            "bytes": int(num("scan_bytes")),
+            "wall": num("scan_wall"),
+            "cpu": num("scan_cpu"),
+            "gpu": num("scan_gpu"),
+            "last_scan_at": self.get_meta("last_scan_at", ""),
+        }
+
+    def embedding_dim(self) -> int:
+        row = self.conn.execute(
+            "SELECT embedding FROM files WHERE embedding IS NOT NULL LIMIT 1"
+        ).fetchone()
+        return len(row["embedding"]) // 4 if row else 0
+
+    def distinct_tag_count(self, kind: str = "image") -> int:
+        return self.conn.execute(
+            "SELECT COUNT(DISTINCT tag) AS n FROM media_tags WHERE kind = ?",
+            (kind,),
+        ).fetchone()["n"]
+
+    def _extensions(self, table: str) -> tuple[list[tuple[str, int]], dict[str, int]]:
+        """(ext, count) by count desc, plus ext -> total bytes."""
+        from collections import Counter, defaultdict
+
+        counts: Counter[str] = Counter()
+        sizes: dict[str, int] = defaultdict(int)
+        for r in self.conn.execute(f"SELECT path, size FROM {table}"):
+            ext = os.path.splitext(r["path"])[1].lower() or "(none)"
+            counts[ext] += 1
+            sizes[ext] += r["size"]
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])), dict(sizes)
+
+    def image_extensions(self) -> tuple[list[tuple[str, int]], dict[str, int]]:
+        return self._extensions("files")
+
+    def video_extensions(self) -> tuple[list[tuple[str, int]], dict[str, int]]:
+        return self._extensions("videos")
 
     # -- tag refinement -----------------------------------------------------
 

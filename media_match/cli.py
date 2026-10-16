@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import textwrap
 
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
-from .pipeline import build_jobs, run_scan, store_result
+from .pipeline import ScanStats, build_jobs, run_scan, store_result
 from .tags import facet_of, refine
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
@@ -22,6 +23,28 @@ _mp = lambda w, h: f"{w * h / 1_000_000:.1f}MP"
 
 def _dur(seconds: float) -> str:
     return format_timestamp(seconds)
+
+
+def _fmt_bytes(n: float) -> str:
+    """Human-readable byte size: 512.0B / 3.4MB / 1.2GB."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}TB"
+
+
+def _fmt_seconds(s: float) -> str:
+    """Human duration: 0s / 3.2s / 4m12s / 2h05m."""
+    if s <= 0:
+        return "0s"
+    if s < 60:
+        return f"{s:.1f}s"
+    m, sec = divmod(int(round(s)), 60)
+    if m < 60:
+        return f"{m}m{sec:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
 
 
 def _register_heif() -> None:
@@ -91,11 +114,24 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if total > 20 and (done % step == 0 or done == total):
             print(f"  preparing [{done}/{total}]", file=sys.stderr)
 
+    scan_stats = ScanStats()
     analyzed = run_scan(
         jobs, encoder, interval=args.interval, max_frames=args.max_frames,
         batch_size=args.batch, workers=args.workers,
         on_result=on_result, progress=progress, on_error=on_error,
+        stats=scan_stats,
     )
+    # Accumulate this run's measured cost so `stats` can show it.
+    db.record_scan(
+        items=scan_stats.items, frames=scan_stats.frames,
+        bytes_read=scan_stats.bytes_read, wall=scan_stats.wall,
+        cpu=scan_stats.cpu, gpu=scan_stats.gpu,
+    )
+    if scan_stats.items:
+        print(f"  measured: {_fmt_seconds(scan_stats.wall)} wall, "
+              f"{_fmt_seconds(scan_stats.gpu)} gpu, "
+              f"{_fmt_seconds(scan_stats.cpu)} cpu, "
+              f"{_fmt_bytes(scan_stats.bytes_read)} read")
 
     # Optional keep-tags-fresh step: refine keywords into canonical tags/facets
     # (and, with --classify, type each image) before releasing the CLIP model.
@@ -982,6 +1018,41 @@ def cmd_stats(args: argparse.Namespace) -> int:
     ).fetchone()["n"]
     people = len(db.all_clusters("image"))
     print(f"tags:   {tagged} refined tags, {typed} typed, {people} person clusters")
+
+    dim = db.embedding_dim()
+    print(f"embeddings: {embedded} image vector(s)"
+          + (f", dimension {dim}" if dim else "")
+          + f", {vembedded} video frame vector(s)")
+
+    summary = db.scan_summary()
+    print()
+    if summary["scans"]:
+        items = summary["items"]
+        wall = summary["wall"]
+        rate = f"{items / wall:.1f} items/s" if wall > 0 else "n/a"
+        io_rate = f"{_fmt_bytes(summary['bytes'] / wall)}/s" if wall > 0 else "n/a"
+        print(f"compute: {summary['scans']} scan run(s), {items} items, "
+              f"{summary['frames']} frames")
+        print(f"  cpu {_fmt_seconds(summary['cpu'])}, "
+              f"gpu {_fmt_seconds(summary['gpu'])}, "
+              f"wall {_fmt_seconds(wall)}")
+        print(f"  I/O: {_fmt_bytes(summary['bytes'])} read ({io_rate}), {rate}")
+        if summary["last_scan_at"]:
+            print(f"  last scan: {summary['last_scan_at']}")
+    else:
+        print("compute: no scan runs recorded yet (run 'media-match scan')")
+
+    print()
+    print("formats:")
+    img_counts, img_sizes = db.image_extensions()
+    for ext, count in img_counts:
+        print(f"  image {ext:<8} {count:>6}  {_fmt_bytes(img_sizes[ext])}")
+    vid_counts, vid_sizes = db.video_extensions()
+    for ext, count in vid_counts:
+        print(f"  video {ext:<8} {count:>6}  {_fmt_bytes(vid_sizes[ext])}")
+    if not img_counts and not vid_counts:
+        print("  (no media indexed yet)")
+
     db.close()
     return 0
 
@@ -1006,7 +1077,10 @@ _COMMAND_SUMMARIES = {
     "refine": "rewrite keywords into canonical tags/facets; type photos",
     "people": "cluster person photos by similarity and name the clusters",
     "tags": "list refined tags, facets or image types",
-    "stats": "show index statistics",
+    "stats": "show index statistics (media, compute, formats)",
+    "about": "show what this program does, its license and project links",
+    "version": "print version, license and author",
+    "info": "print program information (models, last scan, storage)",
     "help": "show this guide; 'help <cmd>' describes one command",
 }
 
@@ -1022,7 +1096,18 @@ _EXAMPLES = {
     "people": "media-match people ~/Pictures --label 1=Alice",
     "tags": "media-match tags ~/Pictures --facets",
     "stats": "media-match stats ~/Pictures",
+    "about": "media-match about",
+    "version": "media-match version",
+    "info": "media-match info ~/Pictures",
 }
+
+# Project metadata shown by 'about', 'version' and 'info'.
+_VERSION = "0.1.0"
+_LICENSE = "Non-Commercial Licence"
+_AUTHOR = "Timh Bergström"
+_REPO = "https://github.com/rnts08/mlx-media-matcher"
+_LICENSE_URL = f"{_REPO}/blob/main/LICENSE"
+_ISSUES_URL = f"{_REPO}/issues"
 
 
 def _flag_lines(parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
@@ -1129,6 +1214,92 @@ def _cmd_help(args: argparse.Namespace) -> int:
     return 0
 
 
+def _license_text() -> str:
+    """The full license text from the LICENSE file, or a short pointer."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING"):
+        path = os.path.join(root, name)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read().rstrip("\n")
+            except OSError:
+                break
+    return f"{_LICENSE}\nFull text: {_LICENSE_URL}"
+
+
+def cmd_about(args: argparse.Namespace) -> int:
+    print(
+        "media-match — local photo-library analyzer built on Apple's MLX.\n"
+        "Point it at a folder and it builds an index that lets you:\n"
+        "\n"
+        "  - find photos by person, object or free text (CLIP vector search)\n"
+        "  - group duplicates across resolutions, and mark the best version\n"
+        "  - group semantic near-duplicates\n"
+        "  - refine tags into facets (person/scene/object/...) and type each photo\n"
+        "  - cluster photos of the same person and name the clusters\n"
+        "  - index video files (keyframes at ~1 fps) with the same machinery\n"
+        "\n"
+        f"Version:    {_VERSION}\n"
+        f"Author:     {_AUTHOR}\n"
+        f"License:    {_LICENSE}\n"
+        f"Repository: {_REPO}\n"
+        f"Report:     {_ISSUES_URL}\n"
+        f"Support:    {_REPO}\n"
+        "\n"
+        "License text\n"
+        "------------"
+    )
+    print(_license_text())
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    print(f"media-match {_VERSION}")
+    print(f"Licensed under {_LICENSE}")
+    print(f"Developed by {_AUTHOR}")
+    print(f"Repository: {_REPO}")
+    print(f"Found a bug or want to help? {_ISSUES_URL}")
+    return 0
+
+
+def _free_storage(path: str) -> str:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return "n/a"
+    return (f"{_fmt_bytes(usage.free)} free of {_fmt_bytes(usage.total)} "
+            f"({path})")
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    root = os.path.abspath(args.root)
+    print(f"Version:      {_VERSION}")
+    print(f"License:      {_LICENSE}")
+    print(f"Author:       {_AUTHOR}")
+    print(f"Repository:   {_REPO}")
+    print(f"Model engine: CLIP on Apple MLX (local, no cloud)")
+    print(f"Models:       {DEFAULT_CLIP_MODEL} (CLIP embeddings)")
+    print(f"              {DEFAULT_MODEL} (vision captions)")
+
+    db = open_db(root, args.db, create=False)
+    if db is not None:
+        summary = db.scan_summary()
+        if summary["scans"]:
+            print(f"Last scan:    {summary['last_scan_at'] or 'unknown'} "
+                  f"({summary['scans']} run(s), {summary['items']} items, "
+                  f"{_fmt_seconds(summary['wall'])} wall, "
+                  f"{_fmt_seconds(summary['gpu'])} gpu)")
+        else:
+            print("Last scan:    no scan runs recorded yet")
+        db.close()
+    else:
+        print("Last scan:    no index at this folder yet")
+
+    print(f"Free storage: {_free_storage(root)}")
+    return 0
+
+
 # -- parser ------------------------------------------------------------------
 
 
@@ -1138,22 +1309,77 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--db", help="index database path (default: <root>/.media-match.db)")
 
 
+class _HelpAction(argparse.Action):
+    """Print the full guide for -h/--help, exactly like the 'help' command."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings=option_strings, dest=dest,
+                         default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _print_full_help()
+        parser.exit()
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Version/info/about are global: accept them anywhere on the line, with or
+    # without a command, and with no other positional arguments.
+    for i, token in enumerate(argv):
+        if token in ("-v", "--version"):
+            cmd_version(argparse.Namespace())
+            return 0
+        if token in ("--info", "--about"):
+            root = None
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                root = argv[i + 1]
+            if token == "--about":
+                cmd_about(argparse.Namespace())
+            else:
+                cmd_info(argparse.Namespace(root=root or ".", db=None))
+            return 0
+
     parser = argparse.ArgumentParser(
         prog="media-match",
+        add_help=False,
         description=(
-            "Local photo-library analyzer built on Apple's MLX. Index photos "
-            "and videos locally (no cloud, no PyTorch), then find, group, tag "
-            "and clean them with CLIP embeddings, perceptual hashes and "
-            "optional vision-model captions."
+            "Local photo-library analyzer built on Apple's MLX. Point it at a "
+            "folder and it builds an index that lets you:\n"
+            "  - find photos by person, object or free text (CLIP vector search)\n"
+            "  - group duplicates across resolutions, and mark the best version\n"
+            "  - group semantic near-duplicates\n"
+            "  - refine tags into facets (person/scene/object/...) and type each photo\n"
+            "  - cluster photos of the same person and name the clusters\n"
+            "  - index video files (keyframes at ~1 fps) with the same machinery"
         ),
         epilog=(
-            "Run 'media-match help' for the full guide (every command and "
-            "flag), or 'media-match <command> --help' for one command."
+            "Run 'media-match help' (or -h/--help) for this guide, "
+            "'media-match help <command>' for one command, "
+            "'media-match version' for version/license, and "
+            "'media-match info [folder]' for program information."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "-h", "--help", action=_HelpAction,
+        help="show this guide and exit (same as the 'help' command)",
+    )
+    parser.add_argument(
+        "-v", "--version", action="store_true",
+        help="print version, license and author",
+    )
+    parser.add_argument(
+        "--info", action="store_true",
+        help="print program information (models, last scan, free storage)",
+    )
+    parser.add_argument(
+        "--about", action="store_true",
+        help="show what the program does, its license and project links",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     p_scan = sub.add_parser("scan", help="analyze new/changed media in a folder")
     _add_common(p_scan)
@@ -1353,15 +1579,42 @@ def main(argv: list[str] | None = None) -> int:
                         help="command to describe in detail (default: the whole guide)")
     p_help.set_defaults(func=_cmd_help)
 
+    p_about = sub.add_parser(
+        "about",
+        help="show what this program does, its license and project links",
+    )
+    p_about.set_defaults(func=cmd_about)
+
+    p_version = sub.add_parser("version", help="print version, license and author")
+    p_version.set_defaults(func=cmd_version)
+
+    p_info = sub.add_parser(
+        "info",
+        help="print program information (models, last scan, free storage)",
+    )
+    _add_common(p_info)
+    p_info.set_defaults(func=cmd_info)
+
     for name, parser_obj in (
         ("scan", p_scan), ("search", p_search), ("embed", p_embed),
         ("similar", p_sim), ("duplicates", p_dup), ("clean", p_clean),
         ("refine", p_refine), ("people", p_people), ("tags", p_tags),
-        ("stats", p_stats), ("help", p_help),
+        ("stats", p_stats), ("about", p_about), ("version", p_version),
+        ("info", p_info), ("help", p_help),
     ):
         _SUBPARSERS[name] = parser_obj
 
+    # No command at all: show the full guide, exactly like 'help'.
+    if not argv:
+        _print_full_help()
+        return 0
+
     args = parser.parse_args(argv)
+
+    if getattr(args, "command", None) is None:
+        _print_full_help()
+        return 0
+
     return args.func(args)
 
 
