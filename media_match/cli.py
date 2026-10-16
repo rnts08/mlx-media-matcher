@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime
 
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
@@ -57,6 +59,66 @@ def _reclaimable(groups) -> tuple[int, int]:
             files += 1
             size += int(getattr(record, "size", 0) or 0)
     return files, size
+
+
+def _when(value) -> str:
+    """'YYYY-MM-DD' from a captured_at string, or an epoch mtime; '' if none."""
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return str(value or "")[:10]
+
+
+def _parse_day(text: str | None, *, end: bool) -> str | None:
+    """Normalize YYYY / YYYY-MM / YYYY-MM-DD to a comparable boundary string."""
+    text = (text or "").strip().replace("/", "-")
+    if not text:
+        return None
+    fmt = ""
+    dt = None
+    for candidate in ("%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            dt = datetime.strptime(text, candidate)
+            fmt = candidate
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return None
+    if fmt == "%Y":
+        return f"{dt.year:04d}" + ("-12-31T23:59:59" if end else "-01-01")
+    if fmt == "%Y-%m":
+        if end:
+            last = calendar.monthrange(dt.year, dt.month)[1]
+            return f"{dt.year:04d}-{dt.month:02d}-{last:02d}T23:59:59"
+        return f"{dt.year:04d}-{dt.month:02d}-01"
+    return dt.strftime("%Y-%m-%d") + ("T23:59:59" if end else "")
+
+
+def _date_filters(args) -> tuple[str, list, str, list]:
+    """(image SQL, image params, video SQL, video params) for --since/--until/--camera."""
+    since = _parse_day(getattr(args, "since", None), end=False)
+    until = _parse_day(getattr(args, "until", None), end=True)
+    camera = getattr(args, "camera", None)
+    img, img_p, vid, vid_p = [], [], [], []
+    img_when = "COALESCE(NULLIF(captured_at,''), datetime(mtime,'unixepoch'))"
+    vid_when = "datetime(mtime,'unixepoch')"
+    if since is not None:
+        img.append(f"{img_when} >= ?")
+        img_p.append(since)
+        vid.append(f"{vid_when} >= ?")
+        vid_p.append(since)
+    if until is not None:
+        img.append(f"{img_when} <= ?")
+        img_p.append(until)
+        vid.append(f"{vid_when} <= ?")
+        vid_p.append(until)
+    if camera:
+        img.append("camera LIKE ?")
+        img_p.append(f"%{camera}%")
+    return " AND ".join(img), img_p, " AND ".join(vid), vid_p
 
 
 def _register_heif() -> None:
@@ -274,8 +336,10 @@ def _list_by_type(db: Database, args) -> int:
         db.close()
         return 1
     for r in rows[: args.limit]:
+        when = _when(r["captured_at"])
         print(f"{r['path']}  ({r['width']}x{r['height']}, "
-              f"{_mp(r['width'], r['height'])})  type={r['type']} "
+              f"{_mp(r['width'], r['height'])}"
+              + (f", {when}" if when else "") + f")  type={r['type']} "
               f"({r['type_score']:.3f})")
     print(f"\n{len(rows)} image(s) of type '{args.type}'"
           + (f", showing {args.limit}" if len(rows) > args.limit else ""))
@@ -294,8 +358,10 @@ def _list_by_cluster(db: Database, args) -> int:
     for cid in cluster_ids:
         rows.extend(db.files_in_cluster(cid))
     for r in rows[: args.limit]:
+        when = _when(r["captured_at"])
         print(f"{r['path']}  ({r['width']}x{r['height']}, "
-              f"{_mp(r['width'], r['height'])})")
+              f"{_mp(r['width'], r['height'])}"
+              + (f", {when}" if when else "") + ")")
     print(f"\n{len(rows)} photo(s) of '{args.cluster}'"
           + (f", showing {args.limit}" if len(rows) > args.limit else ""))
     db.close()
@@ -313,6 +379,15 @@ def cmd_search(args: argparse.Namespace) -> int:
         return _list_by_type(db, args)
     if args.cluster:
         return _list_by_cluster(db, args)
+    for name in ("since", "until"):
+        value = getattr(args, name, None)
+        if value and _parse_day(value, end=(name == "until")) is None:
+            print(f"--{name}: expected a date like YYYY-MM-DD")
+            db.close()
+            return 2
+
+    img_filter, img_params, vid_filter, vid_params = _date_filters(args)
+
     terms: list[str] = []
     if args.person:
         terms.extend(args.person.split())
@@ -330,28 +405,41 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     use_clip = args.clip
     if not use_clip and not args.fts:
-        _, blobs = db.all_embeddings()
-        use_clip = bool(blobs) or bool(db.video_embeddings())
+        if not terms and (img_filter or vid_filter):
+            use_clip = False  # a date/camera-only listing has no text to embed
+        else:
+            _, blobs = db.all_embeddings()
+            use_clip = bool(blobs) or bool(db.video_embeddings())
 
     if use_clip:
+        allowed_images = db.file_ids_matching(img_filter, img_params) if img_filter else None
+        allowed_videos = db.video_ids_matching(vid_filter, vid_params) if vid_filter else None
         return _clip_search(db, " ".join(terms), args.limit,
                             include_images=include_images,
-                            include_videos=include_videos)
+                            include_videos=include_videos,
+                            allowed_images=allowed_images,
+                            allowed_videos=allowed_videos)
 
     count = 0
     if include_images:
-        for r in db.search(terms, limit=args.limit):
+        for r in db.search(terms, limit=args.limit, filters=img_filter,
+                           params=img_params):
+            when = _when(r["captured_at"])
             print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
-                  f"{_mp(r['width'], r['height'])})")
+                  f"{_mp(r['width'], r['height'])}"
+                  + (f", {when}" if when else "") + ")")
             if r["keywords"]:
                 print(f"  keywords: {r['keywords']}")
             if r["description"]:
                 print(f"  {r['description']}")
             count += 1
     if include_videos:
-        for r in db.search_videos(terms, limit=args.limit):
+        for r in db.search_videos(terms, limit=args.limit, filters=vid_filter,
+                                  params=vid_params):
+            when = _when(r["mtime"])
             print(f"\n{r['path']}  ({r['width']}x{r['height']}, "
-                  f"{_dur(r['duration'])})")
+                  f"{_dur(r['duration'])}"
+                  + (f", {when}" if when else "") + ")")
             if r["keywords"]:
                 print(f"  keywords: {r['keywords']}")
             if r["description"]:
@@ -375,13 +463,23 @@ def _load_embedding_matrix(db: Database):
 
 
 def _clip_search(db: Database, query_text: str, limit: int, *,
-                 include_images: bool = True, include_videos: bool = True) -> int:
+                 include_images: bool = True, include_videos: bool = True,
+                 allowed_images: set[int] | None = None,
+                 allowed_videos: set[int] | None = None) -> int:
     import numpy as np
 
     from .clip import ClipEncoder
 
+    if not query_text.strip():
+        print("Give a search query (CLIP search needs some text).")
+        db.close()
+        return 2
+
     ids, matrix = _load_embedding_matrix(db)
     video_embeddings = db.video_embeddings() if include_videos else {}
+    if allowed_videos is not None:
+        video_embeddings = {v: f for v, f in video_embeddings.items()
+                            if v in allowed_videos}
     if (matrix is None or not include_images) and not video_embeddings:
         print("No CLIP embeddings yet. Run 'media-match scan' first.")
         db.close()
@@ -392,11 +490,18 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
     hits: list[tuple[float, str, object, float | None]] = []
     if include_images and matrix is not None:
         sims = matrix @ query
-        for idx in np.argsort(-sims)[:limit]:
+        found = 0
+        for idx in np.argsort(-sims):
+            fid = ids[int(idx)]
+            if allowed_images is not None and fid not in allowed_images:
+                continue
             row = db.conn.execute(
-                "SELECT * FROM files WHERE id = ?", (ids[int(idx)],)
+                "SELECT * FROM files WHERE id = ?", (fid,)
             ).fetchone()
             hits.append((float(sims[int(idx)]), "image", row, None))
+            found += 1
+            if found >= limit:
+                break
     if video_embeddings:
         by_id = {r.id: r for r in db.all_videos()}
         for vid, frames in video_embeddings.items():
@@ -411,12 +516,17 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
     print(f"CLIP text->media search for {query_text!r}:")
     for score, kind, record, ts in hits[:limit]:
         if kind == "image":
+            when = _when(record["captured_at"])
             print(f"\n{record['path']}  ({record['width']}x{record['height']}, "
-                  f"{_mp(record['width'], record['height'])})  similarity={score:.3f}")
+                  f"{_mp(record['width'], record['height'])}"
+                  + (f", {when}" if when else "")
+                  + f")  similarity={score:.3f}")
         else:
+            when = _when(record.mtime)
             print(f"\n{record.path}  ({record.width}x{record.height}, "
-                  f"{_dur(record.duration)})  similarity={score:.3f}  "
-                  f"@ {format_timestamp(ts)}")
+                  f"{_dur(record.duration)}"
+                  + (f", {when}" if when else "")
+                  + f")  similarity={score:.3f}  @ {format_timestamp(ts)}")
     db.close()
     return 0
 
@@ -632,7 +742,8 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
             frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
         )
     else:
-        groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
+        groups = find_duplicate_groups(db.all_files(), threshold=args.threshold,
+                                       prefer=args.prefer)
     if not groups:
         print("No duplicate groups found.")
         db.close()
@@ -678,10 +789,13 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
                 print(f"    {r.path}  ({r.width}x{r.height}, {_dur(r.duration)}) "
                       f"hamming_min={dist}")
         else:
-            print(f"  * {b.path}  ({b.width}x{b.height}, {_mp(b.width, b.height)}) [best]")
+            when = _when(b.captured_at)
+            print(f"  * {b.path}  ({b.width}x{b.height}, {_mp(b.width, b.height)}"
+                  + (f", {when}" if when else "") + ") [best]")
             for r, dist in g.others:
-                print(f"    {r.path}  ({r.width}x{r.height}, {_mp(r.width, r.height)}) "
-                      f"hamming={dist}")
+                w = _when(r.captured_at)
+                print(f"    {r.path}  ({r.width}x{r.height}, {_mp(r.width, r.height)}"
+                      + (f", {w}" if w else "") + f") hamming={dist}")
         print()
     extra, reclaim = _reclaimable(groups)
     print(f"{len(groups)} group(s), {total} files — reclaimable "
@@ -1046,6 +1160,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"vlm:    {db.get_meta('vlm_model', '(not used)')}")
     print(f"files:  {total} ({described} described, {embedded} embedded)")
     print(f"videos: {videos} ({vframes_note(frames, vembedded, vdescribed)})")
+    lo, hi = db.date_range()
+    if lo:
+        print(f"dates:  {lo[:10]} .. {hi[:10]} (captured, else mtime)")
     tagged = db.has_tags("image")
     typed = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE type != ''"
@@ -1147,7 +1264,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.13"
+_VERSION = "0.2.14"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -1177,7 +1294,12 @@ def _flag_lines(parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
             continue
         flags = ", ".join(action.option_strings)
         if action.nargs != 0:
-            metavar = action.metavar or action.dest.upper()
+            if action.metavar:
+                metavar = action.metavar
+            elif action.choices:
+                metavar = "{" + ",".join(str(c) for c in action.choices) + "}"
+            else:
+                metavar = action.dest.upper()
             flags = f"{flags} {metavar}"
         text = action.help or ""
         default = action.default
@@ -1508,6 +1630,13 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--cluster",
                           help="list photos of a named person cluster "
                                "(needs 'people --label N=Name')")
+    p_search.add_argument("--since", metavar="DATE",
+                          help="only photos captured on/after DATE "
+                               "(YYYY-MM-DD; falls back to file mtime)")
+    p_search.add_argument("--until", metavar="DATE",
+                          help="only photos captured on/before DATE (YYYY-MM-DD)")
+    p_search.add_argument("--camera", metavar="TEXT",
+                          help="only photos whose camera make/model matches TEXT")
     p_search.add_argument("--limit", type=int, default=50)
     p_search.set_defaults(func=cmd_search)
 
@@ -1546,6 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="max keyframe pHash hamming distance for videos (default: 12)")
     p_dup.add_argument("--ratio", type=float, default=0.6,
                        help="min fraction of matching keyframes for videos (default: 0.6)")
+    p_dup.add_argument("--prefer", choices=("resolution", "date"), default="resolution",
+                       help="which copy is 'best': largest (default) or newest capture")
     p_dup.add_argument("--json", action="store_true", help="machine-readable output")
     p_dup.set_defaults(func=cmd_duplicates)
 

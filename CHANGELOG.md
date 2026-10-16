@@ -13,6 +13,7 @@ naturally against the work that produced it.
 
 ## 0.2.x — video support
 
+- **0.2.14** feat: `search --since/--until/--camera`, show capture dates, `duplicates --prefer date`, `stats` date range
 - **0.2.13** feat(exif): index capture time, camera and GPS from image EXIF
 - **0.2.12** feat: report reclaimable space (extra-copy bytes) in `duplicates` and `stats`
 - **0.2.11** fix(db): clear orphaned `media_tags`/clusters on delete; WAL + busy timeout; schema versioning; UTC timestamps; skip dotfiles on scan

@@ -579,42 +579,84 @@ class Database:
 
     # -- search -------------------------------------------------------------
 
-    def search(self, terms: list[str], limit: int = 50) -> list[sqlite3.Row]:
-        """AND-search over image description + keywords."""
-        return self._fts_like_search("files", "files_fts", terms, limit)
+    def search(self, terms: list[str], limit: int = 50, *,
+               filters: str = "", params=()) -> list[sqlite3.Row]:
+        """AND-search over image description + keywords, plus SQL filters."""
+        return self._fts_like_search("files", "files_fts", terms, limit,
+                                     filters=filters, params=params)
 
-    def search_videos(self, terms: list[str], limit: int = 50) -> list[sqlite3.Row]:
-        """AND-search over video description + keywords."""
-        return self._fts_like_search("videos", "videos_fts", terms, limit)
+    def search_videos(self, terms: list[str], limit: int = 50, *,
+                      filters: str = "", params=()) -> list[sqlite3.Row]:
+        """AND-search over video description + keywords, plus SQL filters."""
+        return self._fts_like_search("videos", "videos_fts", terms, limit,
+                                     filters=filters, params=params)
+
+    def file_ids_matching(self, filters: str, params=()) -> set[int]:
+        """Ids of images matching a filter clause (used to constrain CLIP search)."""
+        if not filters:
+            return set()
+        rows = self.conn.execute(
+            f"SELECT id FROM files WHERE {filters}", tuple(params)
+        ).fetchall()
+        return {r["id"] for r in rows}
+
+    def video_ids_matching(self, filters: str, params=()) -> set[int]:
+        if not filters:
+            return set()
+        rows = self.conn.execute(
+            f"SELECT id FROM videos WHERE {filters}", tuple(params)
+        ).fetchall()
+        return {r["id"] for r in rows}
+
+    def date_range(self) -> tuple[str | None, str | None]:
+        """(earliest, latest) capture time, falling back to mtime, as strings."""
+        row = self.conn.execute(
+            "SELECT MIN(COALESCE(NULLIF(captured_at,''), datetime(mtime,'unixepoch'))) AS lo, "
+            "MAX(COALESCE(NULLIF(captured_at,''), datetime(mtime,'unixepoch'))) AS hi "
+            "FROM files"
+        ).fetchone()
+        return (row["lo"], row["hi"])
 
     def _fts_like_search(
-        self, table: str, fts_table: str, terms: list[str], limit: int
+        self, table: str, fts_table: str, terms: list[str], limit: int, *,
+        filters: str = "", params=(),
     ) -> list[sqlite3.Row]:
         terms = [t.strip() for t in terms if t.strip()]
+        params = list(params)
         if not terms:
-            return []
+            if not filters:
+                return []
+            return self.conn.execute(
+                f"SELECT * FROM {table} WHERE {filters} ORDER BY path LIMIT ?",
+                (*params, limit),
+            ).fetchall()
         if self._fts_available and all(len(t) >= 3 for t in terms):
             match = " AND ".join(f'"{t}"' for t in terms)
+            where = f"{fts_table} MATCH ?"
+            if filters:
+                where += f" AND {filters}"
             try:
                 return self.conn.execute(
                     f"""
                     SELECT f.* FROM {table} f
                     JOIN {fts_table} ON {fts_table}.rowid = f.id
-                    WHERE {fts_table} MATCH ?
+                    WHERE {where}
                     ORDER BY rank LIMIT ?
                     """,
-                    (match, limit),
+                    (match, *params, limit),
                 ).fetchall()
             except sqlite3.OperationalError:
                 pass  # fall through to LIKE
-        clauses, params = [], []
+        clauses, like_params = [], []
         for t in terms:
             clauses.append("(description LIKE ? OR keywords LIKE ?)")
-            params.extend([f"%{t}%", f"%{t}%"])
-        params.append(limit)
+            like_params.extend([f"%{t}%", f"%{t}%"])
+        where = " AND ".join(clauses)
+        if filters:
+            where += f" AND {filters}"
         return self.conn.execute(
-            f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} LIMIT ?",
-            params,
+            f"SELECT * FROM {table} WHERE {where} LIMIT ?",
+            (*like_params, *params, limit),
         ).fetchall()
 
     def keyword_counts(self, limit: int = 40, include_videos: bool = False) -> list[tuple[str, int]]:

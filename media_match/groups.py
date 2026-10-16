@@ -51,8 +51,13 @@ def _megapixels(r: FileRecord) -> int:
     return r.width * r.height
 
 
+def _taken_key(r: FileRecord) -> tuple[str, float]:
+    """Sort key for ``prefer="date"``: newest capture first (mtime tiebreak)."""
+    return (getattr(r, "captured_at", "") or "", getattr(r, "mtime", 0.0))
+
+
 def find_duplicate_groups(
-    records: list[FileRecord], threshold: int = 8
+    records: list[FileRecord], threshold: int = 8, prefer: str = "resolution"
 ) -> list[DuplicateGroup]:
     n = len(records)
     if n == 0:
@@ -80,7 +85,14 @@ def find_duplicate_groups(
     for members in clusters.values():
         if len(members) < 2:
             continue
-        best_idx = max(members, key=lambda i: (_megapixels(records[i]), records[i].size))
+        if prefer == "date":
+            best_idx = max(members, key=lambda i: (
+                _taken_key(records[i]), _megapixels(records[i]), records[i].size
+            ))
+        else:
+            best_idx = max(members, key=lambda i: (
+                _megapixels(records[i]), records[i].size
+            ))
         best_hash = hex_to_hash(records[best_idx].phash)
         others = [
             (records[i], (hex_to_hash(records[i].phash) ^ best_hash).bit_count())

@@ -58,6 +58,11 @@ for the measurements that justify the design):
 The index lives in `<root>/.media-match.db` (SQLite + FTS5). Read-only
 commands never create it — run `scan` first.
 
+Images also record EXIF **capture time, camera and GPS**, so you can search by
+date (`--since`/`--until`) or camera, `stats` reports the captured date range,
+and `duplicates --prefer date` marks the newest capture as the best copy (the
+default picks the largest).
+
 **Videos** are indexed by sampling keyframes (~1 fps, capped at 120 for long
 clips) with `ffmpeg`, then running those frames through the same CLIP + pHash
 layers. Keyframes are sampled on a fixed time grid, so duplicate copies line up
@@ -103,6 +108,10 @@ needs a face-embedding model). `people --label N=Name` names a cluster and
 .venv/bin/media-match search ~/Pictures "woman red jacket"
 .venv/bin/media-match search ~/Pictures --object bicycle
 .venv/bin/media-match search ~/Pictures "birthday cake" --fts   # caption search
+
+#    by capture date / camera (EXIF; falls back to file mtime)
+.venv/bin/media-match search ~/Pictures --since 2021-06 --until 2021-12
+.venv/bin/media-match search ~/Pictures --camera iPhone
 
 # 3. duplicate groups; best-resolution version marked with *
 .venv/bin/media-match duplicates ~/Pictures
@@ -176,10 +185,10 @@ Group 1 (2 files)
 | Command | What it does | Key options |
 |---|---|---|
 | `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
-| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--limit` |
+| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--limit` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video` |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
-| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio` |
+| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio` |
 | `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--limit`, `--video` |
 | `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute` |
