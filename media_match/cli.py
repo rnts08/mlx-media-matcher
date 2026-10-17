@@ -823,9 +823,8 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
             db.all_videos_with_frames(),
             frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
         )
-    else:
-        groups = find_duplicate_groups(db.all_files(), threshold=threshold,
-                                       prefer=prefer)
+    groups = find_duplicate_groups(db.all_files(), threshold=threshold,
+                                   prefer=prefer, exact_phash=args.exact_phash)
     if not groups:
         print("No duplicate groups found.")
         db.close()
@@ -1968,6 +1967,9 @@ def main(argv: list[str] | None = None) -> int:
     p_dup.add_argument("--threshold", type=int, default=None,
                        help="max pHash hamming distance 0-64 for images "
                             "(default: 8, or config 'threshold')")
+    p_dup.add_argument("--exact-phash", action="store_true",
+                       help="group files that share the exact same phash "
+                            "(Hamming distance = 0; faster than general threshold)")
     p_dup.add_argument("--frame-threshold", type=int, default=12,
                        help="max keyframe pHash hamming distance for videos (default: 12)")
     p_dup.add_argument("--ratio", type=float, default=0.6,

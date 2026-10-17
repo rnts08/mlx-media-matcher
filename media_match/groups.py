@@ -57,7 +57,8 @@ def _taken_key(r: FileRecord) -> tuple[str, float]:
 
 
 def find_duplicate_groups(
-    records: list[FileRecord], threshold: int = 8, prefer: str = "resolution"
+    records: list[FileRecord], threshold: int = 8, prefer: str = "resolution",
+    exact_phash: bool = False
 ) -> list[DuplicateGroup]:
     n = len(records)
     if n == 0:
@@ -72,10 +73,32 @@ def find_duplicate_groups(
         else:
             by_sha1[r.sha1] = i
 
-    # visually near-identical files (resolution independent)
-    hashes = [r.phash for r in records]
-    for i, j, _dist in hamming_pairs(hashes, threshold):
-        uf.union(i, j)
+    if exact_phash:
+        # fast path: group files with identical perceptual hash (Hamming distance = 0)
+        phash_groups: dict[str, list[int]] = {}
+        for i, r in enumerate(records):
+            ph_key = r.phash  # already hex string from hashing
+            phash_groups.setdefault(ph_key, []).append(i)
+        # Only keep groups with 2+ files that share the exact same phash
+        for ph_key, members in phash_groups.items():
+            if len(members) >= 2:
+                best_idx = members[0]
+                others = [
+                    (records[i], 0)  # Hamming distance 0 since phash is identical
+                    for i in members
+                    if i != best_idx
+                ]
+                others.sort(key=lambda t: -_megapixels(records[i]))
+                groups.append(DuplicateGroup(best=records[best_idx], others=others))
+        # Fall through to the normal Hamming-distance-based grouping for all other files
+        hashes = [r.phash for r in records]
+        for i, j, _dist in hamming_pairs(hashes, threshold):
+            uf.union(i, j)
+    else:
+        # visually near-identical files (resolution independent)
+        hashes = [r.phash for r in records]
+        for i, j, _dist in hamming_pairs(hashes, threshold):
+            uf.union(i, j)
 
     clusters: dict[int, list[int]] = {}
     for i in range(n):
