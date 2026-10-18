@@ -828,6 +828,126 @@ class Database:
         ).fetchall()
         return [(r["tag"], r["n"]) for r in rows]
 
+    def clear_metadata(self, media_id: int, kind: str = "image") -> None:
+        """Clear description, keywords, type and tags for one media item."""
+        self.batch_clear_metadata([media_id], kind)
+
+    def batch_clear_metadata(self, ids: list[int], kind: str = "image") -> None:
+        """Clear metadata for multiple media items in one transaction.
+
+        Empties description/keywords/raw_keywords (and type on images), drops
+        the FTS rows and the refined tags, so `refine` cannot resurrect the
+        old keywords from `raw_keywords`.
+        """
+        if not ids:
+            return
+        table = "files" if kind == "image" else "videos"
+        fts = "files_fts" if kind == "image" else "videos_fts"
+        marks = ",".join("?" * len(ids))
+        if kind == "image":
+            self.conn.execute(
+                f"UPDATE {table} SET description = '', keywords = '', "
+                f"raw_keywords = '', type = '', type_score = 0 "
+                f"WHERE id IN ({marks})", ids,
+            )
+        else:
+            # the videos table has no type/type_score columns
+            self.conn.execute(
+                f"UPDATE {table} SET description = '', keywords = '', "
+                f"raw_keywords = '' WHERE id IN ({marks})", ids,
+            )
+        if self._fts_available:
+            # FTS5 rowid mirrors the media row id
+            self.conn.execute(f"DELETE FROM {fts} WHERE rowid IN ({marks})", ids)
+        self.conn.execute(
+            f"DELETE FROM media_tags WHERE kind = ? AND media_id IN ({marks})",
+            [kind] + ids,
+        )
+        self.conn.commit()
+
+    def set_metadata(
+        self, kind: str,
+        items: list[tuple[int, str, str, str]],
+    ) -> int:
+        """Write imported metadata rows in one transaction.
+
+        Each item is ``(media_id, description, keywords, type)``; ``type`` is
+        only applied to images (videos have no type column). The FTS row is
+        rebuilt per item. Returns the number of rows written.
+        """
+        if not items:
+            return 0
+        table = "files" if kind == "image" else "videos"
+        fts = "files_fts" if kind == "image" else "videos_fts"
+        existing = {r["id"] for r in self.conn.execute(f"SELECT id FROM {table}")}
+        written = 0
+        for media_id, description, keywords, mtype in items:
+            if media_id not in existing:
+                continue
+            if kind == "image":
+                self.conn.execute(
+                    f"UPDATE {table} SET description = ?, keywords = ?, type = ?, "
+                    f"type_score = 1.0, raw_keywords = ? WHERE id = ?",
+                    (description, keywords, mtype, keywords, media_id),
+                )
+            else:
+                self.conn.execute(
+                    f"UPDATE {table} SET description = ?, keywords = ?, "
+                    f"raw_keywords = ? WHERE id = ?",
+                    (description, keywords, keywords, media_id),
+                )
+            if self._fts_available:
+                self.conn.execute(f"DELETE FROM {fts} WHERE rowid = ?", (media_id,))
+                self.conn.execute(
+                    f"INSERT INTO {fts}(rowid, description, keywords) VALUES(?, ?, ?)",
+                    (media_id, description, keywords),
+                )
+            written += 1
+        self.conn.commit()
+        return written
+
+    def media_ids_for_paths(
+        self, paths: list[str], kind: str | None = None,
+    ) -> tuple[list[tuple[str, str, int]], list[str]]:
+        """Resolve paths to (kind, path, id) rows.
+
+        ``kind`` restricts the lookup to one table; None tries images first,
+        then videos. Unknown paths come back in the second list.
+        """
+        kinds = (kind,) if kind else ("image", "video")
+        found: list[tuple[str, str, int]] = []
+        missing: list[str] = []
+        for path in paths:
+            for k in kinds:
+                table = "files" if k == "image" else "videos"
+                row = self.conn.execute(
+                    f"SELECT id FROM {table} WHERE path = ?", (path,)
+                ).fetchone()
+                if row:
+                    found.append((k, path, row["id"]))
+                    break
+            else:
+                missing.append(path)
+        return found, missing
+
+    def clear_all(self) -> None:
+        """Empty every index table, keeping the schema and settings.
+
+        The counterpart of `reset` (which deletes the database file): this
+        wipes the contents in place so the same connection stays usable.
+        """
+        for table in ("files", "videos", "video_frames", "media_tags",
+                      "clusters", "trash_log", "meta"):
+            self.conn.execute(f"DELETE FROM {table}")
+        if self._fts_available:
+            self.conn.execute("DELETE FROM files_fts")
+            self.conn.execute("DELETE FROM videos_fts")
+        self.conn.commit()
+        try:
+            self.conn.execute("VACUUM")
+        except sqlite3.OperationalError:
+            pass  # VACUUM is an optimization, not a requirement
+
     def facet_tag_counts(self, kind: str = "image") -> dict[str, list[tuple[str, int]]]:
         rows = self.conn.execute(
             "SELECT facet, tag, COUNT(*) AS n FROM media_tags "

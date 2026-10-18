@@ -89,6 +89,16 @@ def _sha1_of(path: str) -> str:
     return h.hexdigest()
 
 
+def _clear_mlx_cache() -> None:
+    """Return MLX's cached (unused) memory to the OS; best effort."""
+    try:
+        import mlx.core as mx
+
+        (mx.clear_cache if hasattr(mx, "clear_cache") else mx.metal.clear_cache)()
+    except (ImportError, AttributeError):
+        pass
+
+
 def iter_media(root: str, include_video: bool, *,
                 ignore: list[str] | None = None) -> list[tuple[str, str]]:
     """(kind, path) for every image (and, optionally, video) under root.
@@ -200,17 +210,48 @@ def prune_missing(root: str, db: Database, *, include_video: bool,
     return len(stale_files) + len(stale_videos)
 
 
+def _open_image_tolerant(path: str):
+    """Open and fully decode an image, tolerating truncated files.
+
+    Returns a loaded PIL.Image (the caller owns it and must ``close()`` it).
+    Raises OSError/ValueError if the file cannot be identified or decoded at
+    all — those are corrupt, not merely truncated.
+    """
+    from PIL import Image, ImageFile
+
+    try:
+        img = Image.open(path)
+        img.load()
+        return img
+    except (OSError, IOError, ValueError):
+        pass
+    # the file may be truncated; retry with PIL's truncation tolerance. The
+    # flag is global, but the race with other threads is benign: tolerance
+    # only affects files that are already truncated.
+    previous = ImageFile.LOAD_TRUNCATED_IMAGES
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        img = Image.open(path)
+        img.load()
+        return img
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+
+
 def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
     """CPU-only work for one file: hash, decode, perceptual-hash, preprocess."""
     from PIL import Image
 
     sha1 = _sha1_of(job.path)
     if job.kind == "image":
-        with Image.open(job.path) as img:
+        img = _open_image_tolerant(job.path)
+        try:
             width, height = img.size
             meta = read_exif(img)
             frame_hash = hash_to_hex(phash(img))
             array = process_image(img.convert("RGB"))
+        finally:
+            img.close()
         return ScanResult(
             job=job, sha1=sha1, width=width, height=height,
             phashes=[frame_hash], arrays=[array], signature=frame_hash,
@@ -271,6 +312,7 @@ def run_scan(
     batch: list[tuple[int, int, np.ndarray]] = []
     next_owner = 0
     emitted = 0
+    clear_every = 200  # return the MLX cache to the OS periodically
 
     def emit(owner: int) -> None:
         nonlocal emitted
@@ -278,6 +320,8 @@ def run_scan(
         result.vectors = owners.pop(owner)
         remaining.pop(owner, None)
         emitted += 1
+        if emitted % clear_every == 0:
+            _clear_mlx_cache()
         if on_result is not None:
             on_result(result)
 

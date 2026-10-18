@@ -57,8 +57,10 @@ def parse_keywords(text: str) -> list[str]:
 class Describer:
     """Loads the MLX vision model once and describes images with it."""
 
-    def __init__(self, model_id: str = DEFAULT_MODEL):
-        self.model_id = model_id
+    def __init__(self, model_id: str | None = DEFAULT_MODEL):
+        # a None --model (flag not given) must not reach mlx_vlm.load, which
+        # fails on Path(None); fall back to the default instead
+        self.model_id = model_id or DEFAULT_MODEL
         self._model = None
         self._processor = None
 
@@ -68,7 +70,8 @@ class Describer:
 
             self._model, self._processor = load(self.model_id)
 
-    def _ask(self, prompt_text: str, image_path: str, max_tokens: int) -> str:
+    def _ask(self, prompt_text: str, image, max_tokens: int) -> str:
+        """One prompt against one image (a path or an already-decoded PIL image)."""
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -80,17 +83,17 @@ class Describer:
             self._model,
             self._processor,
             prompt,
-            image=image_path,
+            image=image,
             max_tokens=max_tokens,
             verbose=False,
         )
         return result.text if hasattr(result, "text") else str(result)
 
-    def describe(self, image_path: str) -> tuple[str, list[str]]:
-        """Return (description, keywords) for one image."""
-        description = self._ask(_DESC_PROMPT, image_path, max_tokens=60)
+    def describe(self, image) -> tuple[str, list[str]]:
+        """Return (description, keywords) for one image (path or PIL image)."""
+        description = self._ask(_DESC_PROMPT, image, max_tokens=60)
         description = description.replace("\n", " ").strip()
-        keywords = parse_keywords(self._ask(_KEYWORDS_PROMPT, image_path, max_tokens=40))
+        keywords = parse_keywords(self._ask(_KEYWORDS_PROMPT, image, max_tokens=40))
         return description, keywords
 
     def unload(self) -> None:

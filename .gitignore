@@ -5,3 +5,9 @@ __pycache__/
 .media-match.db
 dist/
 build/
+
+# private / local-only files
+.hermes/
+docs/error-example.rtf
+LICENSE1
+LICENSE_example

@@ -1,0 +1,131 @@
+"""Image loadability check and interactive repair.
+
+Some files in a real photo library are not what they seem: a JPEG whose last
+bytes were lost in a copy (truncated — PIL can still decode the valid part
+with ``LOAD_TRUNCATED_IMAGES``), or a file that is not an image at all
+(corrupt — PIL cannot even identify the format).
+
+The scan pipeline tolerates truncation (see ``pipeline._open_image_tolerant``)
+so truncated photos are still indexed. This module answers the follow-up
+question — *which* files are affected, and shall we fix them? — and offers
+interactive repair:
+
+  * truncated  -> re-encode the decodable part (the original is kept as
+                  ``<name>.truncated``), so the file loads cleanly everywhere
+  * corrupt    -> move to a quarantine folder (never deleted outright)
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+
+from .pipeline import IMAGE_EXTENSIONS, iter_media
+
+# what _check_image returns
+OK = "ok"
+TRUNCATED = "truncated"
+CORRUPT = "corrupt"
+
+
+def check_image(path: str) -> str:
+    """Classify one image file: 'ok', 'truncated' or 'corrupt'.
+
+    'truncated' means PIL needs ``LOAD_TRUNCATED_IMAGES`` to decode it — the
+    file is damaged but the recoverable part is usable. 'corrupt' means PIL
+    cannot identify or decode the file at all.
+    """
+    from PIL import Image, ImageFile
+
+    try:
+        with Image.open(path) as img:
+            img.load()
+        return OK
+    except (OSError, IOError, ValueError):
+        pass
+    previous = ImageFile.LOAD_TRUNCATED_IMAGES
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        with Image.open(path) as img:
+            img.load()
+        return TRUNCATED
+    except (OSError, IOError, ValueError):
+        return CORRUPT
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+
+
+def check_tree(root: str, *, include_video: bool = False,
+               ignore: list[str] | None = None) -> dict[str, list[str]]:
+    """Classify every image (and, optionally, video) under ``root``.
+
+    Returns ``{"ok": [...], "truncated": [...], "corrupt": [...]}`` with
+    absolute paths, in tree order.
+    """
+    from .config import is_ignored
+
+    ignore = ignore or []
+    out: dict[str, list[str]] = {OK: [], TRUNCATED: [], CORRUPT: []}
+    for kind, path in iter_media(root, include_video, ignore=ignore):
+        if kind == "video":
+            # videos are probed with ffmpeg during the scan; a file that
+            # ffprobe cannot read is corrupt
+            from .video import probe
+
+            try:
+                probe(path)
+                out[OK].append(path)
+            except Exception:  # noqa: BLE001 - any probe failure is corrupt
+                out[CORRUPT].append(path)
+            continue
+        out[check_image(path)].append(path)
+    return out
+
+
+def repair_truncated(path: str, *, backup_suffix: str = ".truncated") -> str:
+    """Re-encode a truncated image so it loads cleanly everywhere.
+
+    The original bytes are kept as ``path + backup_suffix`` (an existing
+    backup is never overwritten). Returns a short human-readable result.
+    """
+    import tempfile
+
+    from PIL import Image, ImageFile
+
+    backup = path + backup_suffix
+    if os.path.exists(backup):
+        return f"backup exists, skipped: {backup}"
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        with Image.open(path) as img:
+            img.load()
+            # re-encode from the decoded pixels; the truncated tail is lost
+            # but the file becomes complete and loadable. Write to a temp
+            # file first so the original is never at risk.
+            fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(path)[1],
+                                       dir=os.path.dirname(path))
+            os.close(fd)
+            try:
+                img.save(tmp)
+            except Exception:
+                os.unlink(tmp)
+                raise
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+    os.replace(path, backup)
+    os.replace(tmp, path)
+    return f"repaired (backup: {backup})"
+
+
+def quarantine(path: str, quarantine_dir: str) -> str:
+    """Move a corrupt file into ``quarantine_dir``, preserving its name."""
+    os.makedirs(quarantine_dir, exist_ok=True)
+    dest = os.path.join(quarantine_dir, os.path.basename(path))
+    n = 1
+    while os.path.exists(dest):
+        stem, ext = os.path.splitext(os.path.basename(path))
+        dest = os.path.join(quarantine_dir, f"{stem}.{n}{ext}")
+        n += 1
+    shutil.move(path, dest)
+    return dest

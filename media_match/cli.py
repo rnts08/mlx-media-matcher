@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
 from .pipeline import ScanStats, build_jobs, prune_missing, run_scan, store_result
+from .analyze import describe_targets, run_describe_stage
+from .check import CORRUPT, OK, TRUNCATED, check_tree, quarantine, repair_truncated
 from .tags import facet_of, refine
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
@@ -246,100 +248,91 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Optional VLM captions, best version of each duplicate group only.
     if args.describe:
-        _describe_images(db, root, args, on_error)
-        if args.video:
-            _describe_videos(db, root, args, on_error)
+        described = _describe_all(db, root, model, args, on_error)
+        if described:
+            print(f"described {described} item(s)")
 
-    described = db.conn.execute(
+    described_count = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
     ).fetchone()["n"]
     vdescribed = db.conn.execute(
         "SELECT COUNT(*) AS n FROM videos WHERE description != ''"
     ).fetchone()["n"]
     print(f"Done: analyzed {analyzed}, errors {errors}. Index: "
-          f"{db.count_files()} images ({described} described), "
+          f"{db.count_files()} images ({described_count} described), "
           f"{db.count_videos()} videos ({vdescribed} described) ({db.path})")
     db.close()
     return 0
 
 
-def _describe_images(db: Database, root: str, args, on_error) -> None:
-    records = db.all_files()
-    group_best: dict[int, int] = {}
-    for group in find_duplicate_groups(records):
-        for member in [group.best] + [rec for rec, _ in group.others]:
-            group_best[member.id] = group.best.id
-    pending = [r for r in records if not r.description]
-    missing = [r for r in pending if not os.path.exists(r.path)]
-    if missing:
-        print(f"{len(missing)} undescribed image(s) skipped: no longer on disk "
+def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
+    """Caption undescribed images and videos through one pipelined stage.
+
+    ``model`` must already be resolved (flag > config > default) — passing the
+    raw ``args.model`` here is what used to make every caption fail with
+    "Path(None)" when --model was omitted.
+    """
+    plan = describe_targets(db, root, include_videos=args.video)
+    if plan.missing:
+        print(f"{plan.missing} undescribed item(s) skipped: no longer on disk "
               f"(stale index; run 'media-match scan --prune' to refresh)")
-        pending = [r for r in pending if os.path.exists(r.path)]
-    to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
-    shadowed = len(pending) - len(to_describe)
-    if shadowed:
-        print(f"{shadowed} undescribed image duplicate(s) skipped; "
+    if plan.shadowed:
+        print(f"{plan.shadowed} undescribed duplicate(s) skipped; "
               f"their best-resolution version is described instead")
-    if not to_describe:
-        return
+    if not plan.jobs:
+        return 0
+    counts = " + ".join(f"{n} {kind}(s)" for kind, n in plan.pending.items() if n)
+    print(f"describing {len(plan.jobs)} item(s): {counts}")
 
     from .vision import Describer
 
-    describer = Describer(model_id=args.model)
-    for n, record in enumerate(to_describe, 1):
-        print(f"[{n}/{len(to_describe)}] describing "
-              f"{os.path.relpath(record.path, root)}", file=sys.stderr)
-        try:
-            description, keywords = describer.describe(record.path)
-            db.set_description(record.id, description, ", ".join(keywords))
-        except Exception as exc:  # noqa: BLE001
-            on_error(record.path, exc)
-    describer.unload()
+    describer = Describer(model_id=model)
+    total = len(plan.jobs)
+    done = 0
+
+    def progress(job) -> None:
+        nonlocal done
+        done += 1
+        print(f"[{done}/{total}] describing {job.kind} {job.label}",
+              file=sys.stderr)
+
+    try:
+        described = run_describe_stage(
+            plan.jobs, describer, db,
+            workers=getattr(args, "describe_workers", None) or 3,
+            on_error=on_error, progress=progress,
+        )
+    finally:
+        describer.unload()
+    return described
 
 
-def _describe_videos(db: Database, root: str, args, on_error) -> None:
-    import tempfile
+def cmd_describe(args: argparse.Namespace) -> int:
+    """Describe-only command: caption indexed media that has no caption yet."""
+    _register_heif()
+    from .config import load_config
 
-    from .video import extract_still_png
+    cfg = load_config()
+    root = os.path.abspath(args.root)
+    model = args.model or cfg.get("model") or DEFAULT_MODEL
 
-    records = db.all_videos_with_frames()
-    group_best: dict[int, int] = {}
-    for group in find_video_duplicate_groups(records):
-        for member in [group.best] + [rec for rec, _ in group.others]:
-            group_best[member.id] = group.best.id
-    pending = [r for r in records if not r.description]
-    missing = [r for r in pending if not os.path.exists(r.path)]
-    if missing:
-        print(f"{len(missing)} undescribed video(s) skipped: no longer on disk "
-              f"(stale index; run 'media-match scan --prune' to refresh)")
-        pending = [r for r in pending if os.path.exists(r.path)]
-    to_describe = [r for r in pending if group_best.get(r.id, r.id) == r.id]
-    shadowed = len(pending) - len(to_describe)
-    if shadowed:
-        print(f"{shadowed} undescribed video duplicate(s) skipped; "
-              f"their best-resolution version is described instead")
-    if not to_describe:
-        return
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
 
-    from .vision import Describer
+    errors = 0
 
-    describer = Describer(model_id=args.model)
-    for n, record in enumerate(to_describe, 1):
-        print(f"[{n}/{len(to_describe)}] describing "
-              f"{os.path.relpath(record.path, root)}", file=sys.stderr)
-        try:
-            png = extract_still_png(record.path, at=record.duration / 2)
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                tmp.write(png)
-                tmp_path = tmp.name
-            try:
-                description, keywords = describer.describe(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-            db.set_video_description(record.id, description, ", ".join(keywords))
-        except Exception as exc:  # noqa: BLE001
-            on_error(record.path, exc)
-    describer.unload()
+    def on_error(path: str, exc: Exception) -> None:
+        nonlocal errors
+        errors += 1
+        print(f"  ERROR {path}: {exc}", file=sys.stderr)
+
+    described = _describe_all(db, root, model, args, on_error)
+    print(f"Done: described {described}, errors {errors} ({db.path})")
+    db.close()
+    return 0
 
 
 def _list_by_type(db: Database, args) -> int:
@@ -1122,6 +1115,378 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clear_metadata(args: argparse.Namespace) -> int:
+    """Clear description/keywords/type/tags for listed items — or everything."""
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    targets: dict[str, list[int]] = {}
+    if args.items:
+        # paths are given as printed by the tool: relative to the root
+        paths = [p if os.path.isabs(p) else os.path.join(root, p)
+                 for p in args.items]
+        found, missing = db.media_ids_for_paths(paths, kind=args.kind)
+        for kind, _path, media_id in found:
+            targets.setdefault(kind, []).append(media_id)
+        for path in missing:
+            print(f"not in index: {os.path.relpath(path, root)}")
+    else:
+        for kind in ("image", "video") if args.kind is None else (args.kind,):
+            table = "files" if kind == "image" else "videos"
+            rows = db.conn.execute(f"SELECT id FROM {table}").fetchall()
+            targets[kind] = [r["id"] for r in rows]
+
+    total = sum(len(ids) for ids in targets.values())
+    if not total:
+        print("Nothing to clear.")
+        db.close()
+        return 0
+
+    if not args.yes and sys.stdin.isatty():
+        answer = input(f"Clear metadata for {total} item(s)? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            db.close()
+            return 1
+
+    for kind, ids in targets.items():
+        db.batch_clear_metadata(ids, kind)
+        print(f"cleared metadata for {len(ids)} {kind}(s)")
+    db.close()
+    return 0
+
+
+def cmd_import_metadata(args: argparse.Namespace) -> int:
+    """Import description/keywords/type for indexed items from JSON or CSV."""
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    try:
+        with open(args.file, encoding="utf-8-sig") as fh:
+            if args.file.lower().endswith(".csv"):
+                import csv
+
+                rows = list(csv.DictReader(fh))
+            else:
+                data = json.load(fh)
+                rows = data if isinstance(data, list) else data.get("items", [])
+                if not isinstance(rows, list):
+                    print("import file must be a JSON list (or CSV)")
+                    db.close()
+                    return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read {args.file}: {exc}")
+        db.close()
+        return 2
+
+    fields = [f.strip().lower() for f in args.fields.split(",") if f.strip()]
+    unknown = [f for f in fields if f not in ("description", "keywords", "type")]
+    if unknown:
+        print(f"unknown field(s): {', '.join(unknown)} — use description, keywords, type")
+        db.close()
+        return 2
+
+    per_kind: dict[str, list[tuple[int, str, str, str]]] = {}
+    missing: list[str] = []
+    for row in rows:
+        rel = (row.get("path") or "").strip()
+        if not rel:
+            continue
+        path = rel if os.path.isabs(rel) else os.path.join(root, rel)
+        kind = (row.get("kind") or args.kind or "").strip() or None
+        found, _miss = db.media_ids_for_paths([path], kind=kind or None)
+        if not found:
+            missing.append(rel)
+            continue
+        _k, _p, media_id = found[0]
+        kind = found[0][0]
+        per_kind.setdefault(kind, []).append((
+            media_id,
+            row.get("description") or "" if "description" in fields else "",
+            row.get("keywords") or "" if "keywords" in fields else "",
+            row.get("type") or "" if ("type" in fields and kind == "image") else "",
+        ))
+
+    written = 0
+    for kind, items in per_kind.items():
+        written += db.set_metadata(kind, items)
+    for rel in missing:
+        print(f"not in index: {rel}")
+    print(f"imported metadata for {written} item(s) from {args.file}")
+    db.close()
+    return 0 if written else 1
+
+
+def cmd_export_metadata(args: argparse.Namespace) -> int:
+    """Export editable metadata (description/keywords/type) as JSON.
+
+    The output round-trips with 'import-metadata', so it works as a backup
+    before 'clear-metadata' or as a hand-edited caption batch.
+    """
+    root = os.path.abspath(args.root)
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.")
+        return 1
+
+    kinds = ("image", "video") if args.kind is None else (args.kind,)
+    items: list[dict] = []
+    for kind in kinds:
+        table = "files" if kind == "image" else "videos"
+        for r in db.conn.execute(f"SELECT * FROM {table} ORDER BY path"):
+            item = {
+                "kind": kind,
+                "path": os.path.relpath(r["path"], root),
+                "description": r["description"],
+                "keywords": r["keywords"],
+            }
+            if kind == "image":
+                item["type"] = r["type"]
+            items.append(item)
+
+    text = json.dumps(items, indent=2, ensure_ascii=False)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        print(f"wrote {len(items)} item(s) to {args.out}")
+    else:
+        print(text)
+    db.close()
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    """Delete the index database — a full reset. Media files are not touched."""
+    root = os.path.abspath(args.root)
+    path = db_path_for(root, args.db)
+    if not os.path.exists(path):
+        print(f"No index at {path} — nothing to reset.")
+        return 0
+
+    if not args.yes and sys.stdin.isatty():
+        answer = input(
+            f"Delete the index at {path}?\n"
+            f"(media files are NOT touched; 'scan' rebuilds from scratch) [y/N] "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return 1
+
+    for suffix in ("", "-wal", "-shm"):
+        side = path + suffix
+        if os.path.exists(side):
+            os.unlink(side)
+    print(f"removed {path} — index reset; run 'media-match scan' to rebuild")
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Check which media files are loadable, and offer to repair them.
+
+    Truncated images are re-encoded (the original is kept as a backup); corrupt
+    files are moved to a quarantine folder. Both steps ask first in a terminal
+    and can be skipped with --yes (repair) / --quarantine (corrupt).
+    """
+    from .config import load_ignore
+
+    root = os.path.abspath(args.root)
+    ignore = load_ignore(root)
+    include_video = args.video
+
+    print(f"checking media under {root} ...")
+    result = check_tree(root, include_video=include_video, ignore=ignore)
+    ok, truncated, corrupt = result[OK], result[TRUNCATED], result[CORRUPT]
+    print(f"{len(ok)} ok, {len(truncated)} truncated, {len(corrupt)} corrupt")
+
+    for path in truncated:
+        print(f"  truncated: {os.path.relpath(path, root)}")
+    for path in corrupt:
+        print(f"  corrupt:   {os.path.relpath(path, root)}")
+
+    if not truncated and not corrupt:
+        return 0
+
+    def _confirm(prompt: str) -> bool:
+        if args.yes:
+            return True
+        if not sys.stdin.isatty():
+            print(prompt, "(not a terminal — skipping)")
+            return False
+        answer = input(prompt + " [y/N] ")
+        return answer.strip().lower() in ("y", "yes")
+
+    repaired = 0
+    if truncated and _confirm(
+            f"Repair {len(truncated)} truncated image(s)? "
+            f"(re-encodes them; originals kept as *.truncated)"):
+        for path in truncated:
+            outcome = repair_truncated(path)
+            print(f"  {os.path.relpath(path, root)}: {outcome}")
+            repaired += 1
+
+    if corrupt and _confirm(
+            f"Quarantine {len(corrupt)} corrupt file(s)? "
+            f"(moves them to {os.path.join(root, args.quarantine)})"):
+        qdir = os.path.join(root, args.quarantine)
+        for path in corrupt:
+            dest = quarantine(path, qdir)
+            print(f"  {os.path.relpath(path, root)} -> {dest}")
+
+    print(f"done: {len(ok)} ok, {repaired} repaired, "
+          f"{len(truncated) - repaired} still truncated, "
+          f"{len(corrupt)} corrupt (quarantined)")
+    # after repairs/quarantine the index may be stale; hint at the fix
+    if repaired or corrupt:
+        print("run 'media-match scan --prune' to sync the index")
+    return 0
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """One integrated pass: scan, describe, refine and classify everything.
+
+    Images and videos share every stage. The scan pipeline overlaps CPU
+    decoding with GPU CLIP batches; the describe stage overlaps CPU frame
+    extraction with GPU VLM captions, so the GPU is never waiting on the CPU.
+    """
+    _register_heif()
+
+    from .config import load_config, load_ignore
+
+    cfg = load_config()
+    root = os.path.abspath(args.root)
+    ignore = load_ignore(root)
+
+    # An explicit flag wins, then the config file, then the built-in default.
+    # Resolved once here and passed down — the raw flag can be None and must
+    # never reach the model loaders directly.
+    clip_model = args.clip_model or cfg.get("clip_model") or DEFAULT_CLIP_MODEL
+    model = args.model or cfg.get("model") or DEFAULT_MODEL
+    workers = args.workers if args.workers is not None else (cfg.get("workers") or 4)
+    batch = args.batch if args.batch is not None else (cfg.get("batch") or 16)
+    interval = args.interval if args.interval is not None else (cfg.get("interval") or 1.0)
+    max_frames = (args.max_frames if args.max_frames is not None
+                  else (cfg.get("max_frames") or 120))
+    describe_workers = (args.describe_workers if args.describe_workers is not None
+                        else max(2, min(workers, 4)))
+
+    db = Database(db_path_for(root, args.db))
+    db.set_meta("root", root)
+    db.set_meta("clip_model", clip_model)
+    if args.describe:
+        db.set_meta("vlm_model", model)
+
+    if args.video and not _require_ffmpeg():
+        db.close()
+        return 2
+
+    if args.prune:
+        pruned = prune_missing(root, db, include_video=args.video, ignore=ignore)
+        if pruned:
+            print(f"removed {pruned} stale index row(s) "
+                  f"(moved or deleted since last scan)")
+        else:
+            print("no stale index rows to remove")
+
+    # -- pass 1: scan (pHash + EXIF + CLIP) ----------------------------------
+    jobs, total, up_to_date = build_jobs(
+        root, db, include_video=args.video, reanalyze=args.reanalyze,
+        limit=args.limit, ignore=ignore,
+    )
+    print(f"{total} media found, {up_to_date} up to date, {len(jobs)} to analyze")
+
+    from .clip import ClipEncoder
+
+    encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
+    errors = 0
+
+    def on_error(path: str, exc: Exception) -> None:
+        nonlocal errors
+        errors += 1
+        print(f"  ERROR {path}: {exc}", file=sys.stderr)
+
+    def on_result(result) -> None:
+        nonlocal errors
+        try:
+            store_result(db, result)
+        except Exception as exc:  # noqa: BLE001 - keep scanning past bad files
+            errors += 1
+            print(f"  ERROR storing {result.job.path}: {exc}", file=sys.stderr)
+
+    total_jobs = len(jobs)
+    step = max(1, total_jobs // 20)
+
+    def progress(done: int, n_total: int, _path: str) -> None:
+        if n_total > 20 and (done % step == 0 or done == n_total):
+            print(f"  analyzing [{done}/{n_total}]", file=sys.stderr)
+
+    scan_stats = ScanStats()
+    analyzed = run_scan(
+        jobs, encoder, interval=interval, max_frames=max_frames,
+        batch_size=batch, workers=workers,
+        on_result=on_result, progress=progress, on_error=on_error,
+        stats=scan_stats,
+    )
+    db.record_scan(
+        items=scan_stats.items, frames=scan_stats.frames,
+        bytes_read=scan_stats.bytes_read, wall=scan_stats.wall,
+        cpu=scan_stats.cpu, gpu=scan_stats.gpu,
+    )
+    if scan_stats.items:
+        print(f"  measured: {_fmt_seconds(scan_stats.wall)} wall, "
+              f"{_fmt_seconds(scan_stats.gpu)} gpu, "
+              f"{_fmt_seconds(scan_stats.cpu)} cpu, "
+              f"{_fmt_bytes(scan_stats.bytes_read)} read")
+
+    # -- pass 2: VLM captions (GPU), with CPU frame prefetch -----------------
+    # the CLIP encoder stays loaded when --classify needs it afterwards;
+    # otherwise it is unloaded first so the VLM has the memory to itself
+    if not args.classify:
+        encoder.unload()
+
+    described = 0
+    if args.describe:
+        described = _describe_all(db, root, model, args, on_error)
+        if described:
+            print(f"described {described} item(s)")
+
+    # -- pass 3: refine keywords into canonical tags -------------------------
+    refined = 0
+    if args.refine or args.classify:
+        refined = _refine_all(db, quiet=True)
+        if refined:
+            print(f"refined {refined} item(s)")
+
+    # -- pass 4: type each image with the already-loaded CLIP encoder --------
+    classified = 0
+    if args.classify:
+        classified = _classify_with(db, encoder, recompute=False)
+        if classified:
+            print(f"classified {classified} image(s)")
+    encoder.unload()
+
+    described_count = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE description != ''"
+    ).fetchone()["n"]
+    vdescribed = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM videos WHERE description != ''"
+    ).fetchone()["n"]
+    print(f"Done: analyzed {analyzed}, described {described}, "
+          f"refined {refined}, classified {classified}, errors {errors}. "
+          f"Index: {db.count_files()} images ({described_count} described), "
+          f"{db.count_videos()} videos ({vdescribed} described) ({db.path})")
+    db.close()
+    return 0
+
+
 def cmd_refine(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -1513,7 +1878,9 @@ _SUBPARSERS: dict[str, argparse.ArgumentParser] = {}
 
 # One-line summary for the top-level command listing and the `help` command.
 _COMMAND_SUMMARIES = {
+    "analyze": "one integrated pass: scan, describe, refine and classify",
     "scan": "index new/changed media (hash + pHash + CLIP)",
+    "describe": "caption indexed media that has no description yet",
     "search": "find media by person/object/text (CLIP by default)",
     "embed": "compute CLIP embeddings for indexed images",
     "similar": "group the tree by CLIP similarity, or find neighbors of one file",
@@ -1524,6 +1891,11 @@ _COMMAND_SUMMARIES = {
     "people": "cluster person photos by similarity and name the clusters",
     "tags": "list refined tags, facets or image types",
     "export": "dump the index to JSON, CSV or Markdown",
+    "export-metadata": "export editable metadata (description/keywords/type) to JSON",
+    "import-metadata": "import metadata from a JSON or CSV file",
+    "clear-metadata": "clear description, keywords, type and tags",
+    "reset": "delete the index database (media files are never touched)",
+    "check": "check which media files are loadable, and offer to repair them",
     "stats": "show index statistics (media, compute, formats)",
     "about": "show what this program does, its license and project links",
     "version": "print version, license and author",
@@ -1533,7 +1905,9 @@ _COMMAND_SUMMARIES = {
 
 # A runnable example per command, shown in `media-match help <cmd>`.
 _EXAMPLES = {
+    "analyze": "media-match analyze ~/Pictures --video --describe --classify",
     "scan": "media-match scan ~/Pictures --describe --refine --classify",
+    "describe": "media-match describe ~/Pictures --video",
     "search": "media-match search ~/Pictures --object bicycle",
     "embed": "media-match embed ~/Pictures",
     "similar": "media-match similar ~/Pictures --threshold 0.9",
@@ -1544,6 +1918,11 @@ _EXAMPLES = {
     "people": "media-match people ~/Pictures --label 1=Alice",
     "tags": "media-match tags ~/Pictures --facets",
     "export": "media-match export ~/Pictures --format json --out index.json",
+    "export-metadata": "media-match export-metadata ~/Pictures --out captions.json",
+    "import-metadata": "media-match import-metadata ~/Pictures captions.json",
+    "clear-metadata": "media-match clear-metadata ~/Pictures --yes",
+    "reset": "media-match reset ~/Pictures --yes",
+    "check": "media-match check ~/Pictures",
     "stats": "media-match stats ~/Pictures",
     "about": "media-match about",
     "version": "media-match version",
@@ -1902,6 +2281,84 @@ def main(argv: list[str] | None = None) -> int:
                              "since the last scan (keeps the index in sync)")
     p_scan.set_defaults(func=cmd_scan)
 
+    p_analyze = sub.add_parser(
+        "analyze",
+        help="one integrated pass: scan, describe, refine and classify",
+        description=(
+            "Run every analysis pass over a media tree in one go — indexing "
+            "(hash + pHash + CLIP), VLM captions, tag refinement and image "
+            "typing — for images and videos alike. The scan pipeline keeps the "
+            "GPU busy by overlapping CPU decoding with GPU embedding batches, "
+            "and the describe stage overlaps CPU frame extraction with GPU "
+            "caption generation. Flags map 1:1 onto 'scan'; add --describe, "
+            "--refine and/or --classify for the later passes."
+        ),
+    )
+    _add_common(p_analyze)
+    p_analyze.add_argument("--describe", action="store_true",
+                           help="caption media with the vision model "
+                                "(best version of each duplicate group only)")
+    p_analyze.add_argument("--refine", action="store_true",
+                           help="after scanning, rewrite keywords into canonical "
+                                "tags + facets (see 'refine')")
+    p_analyze.add_argument("--classify", action="store_true",
+                           help="after scanning, also type each image with CLIP "
+                                "(selfie/scene/object/...; implies --refine)")
+    p_analyze.add_argument("--video", action="store_true",
+                           help="also analyze video files (keyframes each)")
+    p_analyze.add_argument("--model", default=None,
+                           help="MLX vision model for --describe "
+                                f"(default: {DEFAULT_MODEL}, or config 'model')")
+    p_analyze.add_argument("--clip-model", default=None,
+                           help="CLIP model for embeddings "
+                                f"(default: {DEFAULT_CLIP_MODEL}, or config 'clip_model')")
+    p_analyze.add_argument("--batch", type=int, default=None,
+                           help="CLIP batch size (default: 16, or config 'batch')")
+    p_analyze.add_argument("--workers", type=int, default=None,
+                           help="parallel CPU prep threads feeding the GPU "
+                                "(default: 4, or config 'workers')")
+    p_analyze.add_argument("--describe-workers", type=int, default=None,
+                           metavar="N",
+                           help="CPU threads prefetching frames for the VLM "
+                                "(default: 2-4, bounded by --workers)")
+    p_analyze.add_argument("--interval", type=float, default=None,
+                           help="target seconds between video keyframes "
+                                "(default: 1.0, or config 'interval')")
+    p_analyze.add_argument("--max-frames", type=int, default=None,
+                           help="cap on keyframes per video (default: 120, or config 'max_frames')")
+    p_analyze.add_argument("--limit", type=int, help="only analyze first N media items")
+    p_analyze.add_argument("--reanalyze", action="store_true",
+                           help="re-analyze files even if unchanged")
+    p_analyze.add_argument("--prune", action="store_true",
+                           help="also drop index rows for files moved or deleted "
+                                "since the last scan (keeps the index in sync)")
+    p_analyze.set_defaults(func=cmd_analyze)
+
+    p_describe = sub.add_parser(
+        "describe",
+        help="caption indexed media that has no caption yet",
+        description=(
+            "Caption indexed images and videos that still lack a description, "
+            "using the vision model. Videos are reduced to a mid-clip still "
+            "before captioning; the best version of each duplicate group is "
+            "described, its copies inherit the match. Frames are prefetched on "
+            "CPU workers so VLM generation (GPU) never waits on a decode. "
+            "Use after 'scan' (or again later; it only touches items without "
+            "a description)."
+        ),
+    )
+    _add_common(p_describe)
+    p_describe.add_argument("--model", default=None,
+                            help="MLX vision model "
+                                 f"(default: {DEFAULT_MODEL}, or config 'model')")
+    p_describe.add_argument("--video", action="store_true",
+                            help="include videos (needs ffmpeg)")
+    p_describe.add_argument("--describe-workers", type=int, default=None,
+                            metavar="N",
+                            help="CPU threads prefetching frames "
+                                 "(default: 3)")
+    p_describe.set_defaults(func=cmd_describe)
+
     p_search = sub.add_parser("search", help="find media by person/object/text")
     _add_common(p_search)
     p_search.add_argument("query", nargs="*", metavar="QUERY",
@@ -2093,6 +2550,101 @@ def main(argv: list[str] | None = None) -> int:
     p_tags.add_argument("--limit", type=int, default=40)
     p_tags.add_argument("--json", action="store_true", help="machine-readable output")
     p_tags.set_defaults(func=cmd_tags)
+    p_clear = sub.add_parser(
+        "clear-metadata",
+        help="clear description, keywords, type and tags from media items",
+        description=(
+            "Clear metadata from one or more indexed items. Items may be "
+            "specified by position (paths relative to the root, as printed by "
+            "search/export), or every item in the index may be cleared with no "
+            "positional arguments. With items, --kind is only a filter; without "
+            "items it limits the wipe (default: both kinds). Media files are "
+            "never touched."
+        ),
+    )
+    _add_common(p_clear)
+    p_clear.add_argument("items", nargs="*", metavar="ITEM",
+                         help="paths to clear metadata for (relative to root)")
+    p_clear.add_argument("--kind", choices=("image", "video"), default=None,
+                         help="restrict to one kind (default: both)")
+    p_clear.add_argument("--yes", action="store_true",
+                         help="skip confirmation prompt")
+    p_clear.set_defaults(func=cmd_clear_metadata)
+
+    p_import = sub.add_parser(
+        "import-metadata",
+        help="import metadata from JSON or CSV",
+        description=(
+            "Import description, keywords and/or type for indexed items from a "
+            "JSON or CSV file. Rows need a 'path' field (relative to the root, "
+            "as written by export-metadata) and optionally 'kind', "
+            "'description', 'keywords' and 'type'. Existing metadata is "
+            "overwritten only for the fields listed in --fields."
+        ),
+    )
+    _add_common(p_import)
+    p_import.add_argument("file", help="path to the import file (JSON or CSV)")
+    p_import.add_argument("--kind", choices=("image", "video"), default=None,
+                          help="assume this kind when a row has none "
+                               "(default: try images, then videos)")
+    p_import.add_argument("--fields", default="description,keywords,type",
+                          help="comma-separated fields to import "
+                               "(default: description,keywords,type)")
+    p_import.set_defaults(func=cmd_import_metadata)
+
+    p_export_meta = sub.add_parser(
+        "export-metadata",
+        help="export editable metadata (description/keywords/type) to JSON",
+        description=(
+            "Export the human-editable metadata of every indexed item as JSON: "
+            "kind, path (relative to root), description, keywords and — for "
+            "images — type. The output round-trips with 'import-metadata', so "
+            "it works as a backup before 'clear-metadata' or as a batch to "
+            "edit and re-import. Writes to --out, or stdout when omitted."
+        ),
+    )
+    _add_common(p_export_meta)
+    p_export_meta.add_argument("--kind", choices=("image", "video"), default=None,
+                               help="restrict to one kind (default: both)")
+    p_export_meta.add_argument("--out", help="write to this file instead of stdout")
+    p_export_meta.set_defaults(func=cmd_export_metadata)
+
+    p_reset = sub.add_parser(
+        "reset",
+        help="delete the index database (media files are never touched)",
+        description=(
+            "Delete the index database and start over: removes the SQLite "
+            "file (with its -wal/-shm sidecars) so the next 'scan' rebuilds "
+            "the index from scratch. Media files are NOT touched. With --yes "
+            "the confirmation prompt is skipped."
+        ),
+    )
+    _add_common(p_reset)
+    p_reset.add_argument("--yes", action="store_true",
+                         help="skip confirmation prompt")
+    p_reset.set_defaults(func=cmd_reset)
+
+    p_check = sub.add_parser(
+        "check",
+        help="check which media files are loadable, and offer to repair them",
+        description=(
+            "Walk the media tree and classify every file: ok, truncated "
+            "(recoverable with tolerance) or corrupt (not decodable). "
+            "Truncated images can be re-encoded (originals kept as "
+            "*.truncated) and corrupt files quarantined to a folder. Both "
+            "steps ask first in a terminal; --yes repairs without asking."
+        ),
+    )
+    _add_common(p_check)
+    p_check.add_argument("--video", action="store_true",
+                         help="also probe videos with ffmpeg")
+    p_check.add_argument("--quarantine", default=".media-match-quarantine",
+                         metavar="DIR",
+                         help="folder for corrupt files, relative to root "
+                              "(default: .media-match-quarantine)")
+    p_check.add_argument("--yes", action="store_true",
+                         help="repair/quarantine without asking")
+    p_check.set_defaults(func=cmd_check)
 
     p_export = sub.add_parser(
         "export",
