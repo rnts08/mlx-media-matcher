@@ -69,6 +69,37 @@ the same idea: `--describe-batch N` sends N frames to the vision model per
 forward pass instead of one, which is the single biggest win when describing a
 large tree (default 1; raise it while watching memory).
 
+**Picking the flags from measurements.** `about bench` measures the machine
+instead of guessing — it times disk reads, CPU decoding and CLIP batches in
+isolation, then runs several real configurations end to end through the
+pipeline and reports which one was fastest:
+
+```bash
+.venv/bin/media-match about bench                 # synthetic corpus, ~30 s
+.venv/bin/media-match about bench ~/Pictures      # against your real files
+```
+
+Nothing is indexed and no file is touched. It prints, per configuration,
+throughput and the share of wall time spent in the GPU, and ends with a
+concrete recommendation:
+
+```
+fastest measured: --batch 16 --io-workers 4 --workers 8   (31 img/s, 38% of wall time in the GPU)
+recommended:     --batch 8  --io-workers 2 --workers 4   (cheapest of the tied configurations)
+at 29 img/s, 20,000 file(s) in this tree takes about 11 min 30s on this machine
+```
+
+When several configurations measure the same it says so and recommends the
+cheapest of them rather than the nominal winner: on a small corpus the
+run-to-run spread (~10% here) is larger than the gap between neighbouring
+settings, and picking the nominal winner would dress up a coin flip as a
+measurement. Raise `--files` and `--repeat` to separate them.
+
+The default corpus is synthetic on purpose — no photos needed, identical every
+run so numbers stay comparable between runs and machines. Pass a folder when
+your library does not resemble the built-in shapes (12MP phone photos down to
+thumbnails).
+
 Images also record EXIF **capture time, camera and GPS**, so you can search by
 date (`--since`/`--until`) or camera, `stats` reports the captured date range,
 and `duplicates --prefer date` marks the newest capture as the best copy (the

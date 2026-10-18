@@ -2210,14 +2210,14 @@ _EXAMPLES = {
     "check": "media-match check ~/Pictures",
     "bootstrap": "media-match bootstrap ~/Pictures --video",
     "stats": "media-match stats ~/Pictures",
-    "about": "media-match about",
+    "about": "media-match about bench",  # 'about' alone prints the blurb
     "version": "media-match version",
     "info": "media-match info ~/Pictures",
     "help": "media-match help bootstrap",
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.22"
+_VERSION = "0.2.23"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -2393,6 +2393,10 @@ def _license_text() -> str:
 
 
 def cmd_about(args: argparse.Namespace) -> int:
+    # 'about bench' measures this machine instead of printing the blurb, so
+    # the tuning advice lives next to what the program says about itself.
+    if (getattr(args, "topic", None) or "").lower() in ("bench", "benchmark"):
+        return cmd_bench(args)
     text = (
         f"{_ABOUT_BLURB}\n"
         "\n"
@@ -2409,6 +2413,90 @@ def cmd_about(args: argparse.Namespace) -> int:
     )
     _page(text)
     return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Time this machine's pipeline and recommend --batch/--io-workers/--workers."""
+    from .bench import TIE_THRESHOLD, run_benchmark
+
+    root = os.path.abspath(args.root) if getattr(args, "root", None) else None
+    count = getattr(args, "files", None) or 32
+    repeat = getattr(args, "repeat", None) or 1
+
+    where = root or "a synthetic corpus (pass a folder to use your own media)"
+    print(f"benchmarking {where} ...\n")
+    report = run_benchmark(
+        root=root, count=count, repeat=repeat,
+        clip_model=args.clip_model or DEFAULT_CLIP_MODEL,
+        video=getattr(args, "video", False),
+        ignore=load_bench_ignore(root),
+    )
+
+    if getattr(report, "note", ""):
+        print(report.note)
+        return 1
+    print(f"corpus: {report.corpus_items} file(s), "
+          f"{_fmt_bytes(report.corpus_bytes)} on disk")
+
+    if report.stages:
+        print("\nindividual stages")
+        for stage in report.stages:
+            print(f"  {stage.name:<12} {stage.seconds:7.3f}s  {stage.detail}")
+
+    if report.configs:
+        print("\nend-to-end scan configurations")
+        print(f"  {'batch':>5} {'io':>3} {'cpu':>4} {'img/s':>8} {'gpu':>7} "
+              f"{'cpu time':>9}  note")
+        for cfg in report.configs:
+            gpu = f"{cfg.gpu_share * 100:.0f}%" if cfg.ok else "-"
+            print(f"  {cfg.batch:>5} {cfg.io_workers:>3} {cfg.workers:>4} "
+                  f"{cfg.per_second:>8.1f} {gpu:>7} {cfg.cpu:>8.1f}s  {cfg.note}")
+
+    best = report.best
+    if best is None:
+        print("\nno configuration completed; nothing to recommend.")
+        return 1
+    pick = report.recommended or best
+
+    print(f"\nfastest measured: --batch {best.batch} --io-workers "
+          f"{best.io_workers} --workers {best.workers}   "
+          f"({best.per_second:,.0f} img/s, "
+          f"{best.gpu_share * 100:.0f}% of wall time in the GPU)")
+
+    ties = [c for c in report.ties if c is not best]
+    if ties:
+        others = ", ".join(f"batch {c.batch}/io {c.io_workers}/cpu {c.workers}"
+                           for c in ties)
+        print(f"\n{len(ties) + 1} configurations measured the same within "
+              f"{TIE_THRESHOLD:.0%} on {report.corpus_items} files ({others}) "
+              "— run-to-run variation at this corpus size is larger than the "
+              "gap between them, so this is a default, not a measured "
+              "optimum. Raise --files and --repeat to separate them.")
+    print(f"\nrecommended: --batch {pick.batch} --io-workers {pick.io_workers} "
+          f"--workers {pick.workers}"
+          + ("  (cheapest of the tied configurations)" if ties else ""))
+
+    # Project onto the user's real library so the number means something.
+    if root and pick.per_second:
+        from .bench import TIE_THRESHOLD, human_seconds
+        from .pipeline import iter_media
+
+        real = sum(1 for _ in iter_media(root, False))
+        if real:
+            print(f"\nat {pick.per_second:,.0f} img/s, {real:,} file(s) in this "
+                  f"tree takes about {human_seconds(real / pick.per_second)} "
+                  "on this machine")
+
+    print("\nNothing was indexed and no file was changed.")
+    return 0
+
+
+def load_bench_ignore(root: str | None) -> list[str]:
+    if not root:
+        return []
+    from .config import load_ignore
+
+    return load_ignore(root)
 
 
 def cmd_version(args: argparse.Namespace) -> int:
@@ -3114,9 +3202,31 @@ def main(argv: list[str] | None = None) -> int:
         help="show what this program does, its license and project links",
         description=(
             "Print what media-match is for, who wrote it, where the source "
-            "lives, and the licence it ships under."
+            "lives, and the licence it ships under.\n"
+            "\n"
+            "With 'bench', measure this machine instead: it times disk reads, "
+            "CPU decoding and CLIP batches in isolation, then runs several real "
+            "scan configurations and recommends --batch, --io-workers and "
+            "--workers. Nothing is indexed and no file is changed."
         ),
     )
+    p_about.add_argument("topic", nargs="?", metavar="TOPIC",
+                         choices=("bench",),
+                         help="'bench' to benchmark this machine (default: "
+                              "print the blurb)")
+    p_about.add_argument("root", nargs="?", metavar="ROOT",
+                         help="with 'bench': a folder of real media to benchmark "
+                              "against (default: a synthetic corpus)")
+    p_about.add_argument("--files", type=int, default=32, metavar="N",
+                         help="with 'bench': how many files to use (default: 32)")
+    p_about.add_argument("--repeat", type=int, default=1, metavar="N",
+                         help="with 'bench': run each configuration N times and "
+                              "keep the best (default: 1)")
+    p_about.add_argument("--clip-model", default=None,
+                         help="with 'bench': CLIP model to time (default: %s)"
+                              % DEFAULT_CLIP_MODEL)
+    p_about.add_argument("--video", action="store_true",
+                         help="with 'bench': include video files")
     p_about.set_defaults(func=cmd_about)
 
     p_version = sub.add_parser(
