@@ -10,6 +10,7 @@ queue, so both kinds of media fill the same pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -262,6 +263,268 @@ def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
     meta = probe(job.path)
     count = sample_count(meta.duration, interval=interval, max_frames=max_frames)
     frames = extract_frames(job.path, meta, count=count)
+    phashes: list[str] = []
+    arrays: list[np.ndarray] = []
+    timestamps: list[float] = []
+    for t, arr in frames:
+        img = Image.fromarray(arr)
+        phashes.append(hash_to_hex(phash(img)))
+        arrays.append(process_image(img))
+        timestamps.append(t)
+    return ScanResult(
+        job=job, sha1=sha1, width=meta.width, height=meta.height,
+        phashes=phashes, arrays=arrays, timestamps=timestamps,
+        video_meta=meta, signature=min(phashes) if phashes else "",
+    )
+
+
+@dataclass
+class RingBuffer:
+    """A bounded, back-pressured queue of raw file bytes.
+
+    Reader threads push ``(path, bytes)`` chunks; CPU workers pull them. The
+    total buffered bytes is capped at ``max_bytes`` so the buffer never grows
+    beyond ~1 GB. Producers block when full, consumers block when empty.
+    """
+
+    max_bytes: int = 1 << 30  # 1 GB
+
+    def __post_init__(self) -> None:
+        import queue
+
+        self._q: queue.Queue = queue.Queue()
+        self._bytes = 0
+        self._lock = __import__("threading").Lock()
+        self._not_full = __import__("threading").Condition(self._lock)
+        self._not_empty = __import__("threading").Condition(self._lock)
+        self._done = False
+
+    def put(self, item: tuple[str, bytes]) -> None:
+        data = item[1]
+        with self._not_full:
+            while self._bytes + len(data) > self.max_bytes and not self._done:
+                self._not_full.wait()
+            self._q.put(item)
+            self._bytes += len(data)
+            self._not_empty.notify()
+
+    def get(self) -> tuple[str, bytes]:
+        with self._not_empty:
+            while self._q.empty() and not self._done:
+                self._not_empty.wait()
+            if self._q.empty():
+                raise EOFError
+            item = self._q.get_nowait()
+            self._bytes -= len(item[1])
+            self._not_full.notify()
+            return item
+
+    def close(self) -> None:
+        with self._lock:
+            self._done = True
+            self._not_empty.notify_all()
+            self._not_full.notify_all()
+
+    def __len__(self) -> int:
+        return self._q.qsize()
+
+
+def run_staged_scan(
+    jobs: list[ScanJob],
+    encoder,
+    *,
+    interval: float,
+    max_frames: int,
+    batch_size: int = 16,
+    workers: int = 4,
+    io_workers: int = 2,
+    ring_bytes: int = 1 << 30,
+    on_result=None,
+    progress=None,
+    on_error=None,
+    stats: ScanStats | None = None,
+) -> int:
+    """Four-stage pipeline: Read → Preprocess → Embed → Store.
+
+    A ring buffer of raw file bytes (``ring_bytes`` cap) is always backfilled
+    by ``io_workers`` reader threads, so CPU workers never wait on disk. CPU
+    workers decode, pHash and preprocess into numpy arrays; the main thread
+    batches arrays and runs the GPU embedding. Results stream to ``on_result``.
+
+    Returns the number of results emitted.
+    """
+    t_wall = time.perf_counter()
+    t_cpu = time.process_time()
+    import queue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    emitted = 0
+    clear_every = 200
+    ring = RingBuffer(max_bytes=ring_bytes)
+    batch_queue: queue.Queue = queue.Queue(maxsize=batch_size * 2)
+    results_queue: queue.Queue = queue.Queue()
+
+    # -- stage 1: reader threads fill the ring buffer from disk
+    def reader() -> None:
+        try:
+            for job in jobs:
+                try:
+                    with open(job.path, "rb") as fh:
+                        data = fh.read()
+                    ring.put((job.path, data))
+                except OSError:
+                    continue
+        finally:
+            ring.close()
+
+    # -- stage 2: CPU workers decode/preprocess from the ring buffer
+    def cpu_worker() -> None:
+        while True:
+            try:
+                path, data = ring.get()
+            except EOFError:
+                return
+            # reconstruct a ScanJob from the path
+            job = next((j for j in jobs if j.path == path), None)
+            if job is None:
+                continue
+            try:
+                result = _prepare_bytes(job, data, interval=interval,
+                                        max_frames=max_frames)
+                batch_queue.put(result)
+            except Exception as exc:  # noqa: BLE001
+                if on_error:
+                    on_error(job.path, exc)
+
+    # -- stage 3: main thread batches and embeds on the GPU
+    readers = [threading.Thread(target=reader) for _ in range(max(1, io_workers))]
+    cpus = ThreadPoolExecutor(max_workers=max(1, workers))
+    cpu_futures = [cpus.submit(cpu_worker) for _ in range(max(1, workers))]
+
+    for t in readers:
+        t.start()
+
+    pending: dict[object, ScanResult] = {}
+    owners: dict[object, list] = {}
+    remaining: dict[object, int] = {}
+    batch: list[tuple[int, int, np.ndarray]] = []
+    next_owner = 0
+    jobs_iter = iter(jobs)
+    job_by_path = {j.path: j for j in jobs}
+
+    def flush() -> None:
+        nonlocal emitted, batch
+        if not batch:
+            return
+        arrays = [arr for _, _, arr in batch]
+        vectors = None
+        if stats is not None:
+            stats.gpu += 0.0  # measured below
+        t_gpu = time.perf_counter()
+        try:
+            vectors = encoder.embed_images(arrays)
+        except Exception as exc:  # noqa: BLE001
+            if on_error:
+                on_error("<batch>", exc)
+        if stats is not None:
+            stats.gpu += time.perf_counter() - t_gpu
+        completed: list[int] = []
+        for k, (owner, frame, _) in enumerate(batch):
+            if vectors is not None:
+                owners[owner][frame] = vectors[k]
+            remaining[owner] -= 1
+            if remaining[owner] == 0:
+                completed.append(owner)
+        batch = []
+        for owner in completed:
+            emit(owner)
+
+    def emit(owner: int) -> None:
+        nonlocal emitted
+        result = pending.pop(owner)
+        result.vectors = owners.pop(owner)
+        remaining.pop(owner, None)
+        emitted += 1
+        if emitted % clear_every == 0:
+            _clear_mlx_cache()
+        if on_result is not None:
+            on_result(result)
+        if progress is not None:
+            progress(emitted, len(jobs), result.job.path)
+
+    # feed batch_queue into the GPU loop
+    active = True
+    while active or pending:
+        # refill batch
+        while len(batch) < batch_size:
+            try:
+                result = batch_queue.get_nowait()
+            except queue.Empty:
+                break
+            owner = next_owner
+            next_owner += 1
+            pending[owner] = result
+            owners[owner] = [None] * len(result.arrays)
+            remaining[owner] = len(result.arrays)
+            for frame, array in enumerate(result.arrays):
+                batch.append((owner, frame, array))
+            if len(batch) >= batch_size:
+                flush()
+        if batch:
+            flush()
+        if not pending and batch_queue.empty():
+            # check if readers/CPUs are done
+            active = any(t.is_alive() for t in readers) or not ring._q.empty()
+            if not active:
+                break
+
+    cpus.shutdown(wait=True)
+    for t in readers:
+        t.join()
+
+    if stats is not None:
+        stats.items = emitted
+        stats.wall = time.perf_counter() - t_wall
+        stats.cpu = time.process_time() - t_cpu
+    return emitted
+
+
+def _prepare_bytes(job: ScanJob, data: bytes, *, interval: float,
+                   max_frames: int) -> ScanResult:
+    """Prepare a job from raw bytes (no disk read)."""
+    import io
+
+    from PIL import Image
+
+    sha1 = hashlib.sha1(data).hexdigest()
+    if job.kind == "image":
+        img = Image.open(io.BytesIO(data))
+        with img:
+            img.load()
+            width, height = img.size
+            meta = read_exif(img)
+            frame_hash = hash_to_hex(phash(img))
+            array = process_image(img.convert("RGB"))
+        return ScanResult(
+            job=job, sha1=sha1, width=width, height=height,
+            phashes=[frame_hash], arrays=[array], signature=frame_hash,
+            captured_at=meta["captured_at"], camera=meta["camera"],
+            gps_lat=meta["gps_lat"], gps_lon=meta["gps_lon"],
+        )
+    # video: write bytes to a temp file for ffmpeg
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(job.path)[1],
+                                     delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        meta = probe(tmp_path)
+        count = sample_count(meta.duration, interval=interval, max_frames=max_frames)
+        frames = extract_frames(tmp_path, meta, count=count)
+    finally:
+        os.unlink(tmp_path)
     phashes: list[str] = []
     arrays: list[np.ndarray] = []
     timestamps: list[float] = []

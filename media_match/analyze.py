@@ -133,6 +133,7 @@ def run_describe_stage(
     *,
     workers: int = 3,
     window: int = DEFAULT_WINDOW,
+    batch_size: int = 1,
     on_result=None,
     on_error=None,
     progress=None,
@@ -140,17 +141,23 @@ def run_describe_stage(
     """Caption every job, keeping the GPU fed with prefetched frames.
 
     CPU workers decode frames ``window`` items ahead; the calling thread runs
-    the VLM (one model, so generation stays serialized on the GPU) and stores
-    each result as soon as it is ready. Returns the number of items described.
+    the VLM and stores each result as soon as it is ready. Returns the number of
+    items described.
 
-    Every ``CLEAR_EVERY`` items the MLX cache is returned to the OS, so a
-    100k-item library cannot grow the process into a jetsam target.
+    When ``batch_size`` > 1 the VLM captions that many frames per forward pass
+    (``Describer.describe_batch``), which is significantly faster than one
+    call per image. Batch mode requires the describer to expose
+    ``describe_batch``; otherwise it falls back to one-at-a-time.
+
+    Every 100 items the MLX cache is returned to the OS, so a 100k-item
+    library cannot grow the process into a jetsam target.
     """
     if not jobs:
         return 0
     window = max(2, min(window, len(jobs)))
     emitted = 0
     clear_every = 100
+    use_batch = batch_size > 1 and hasattr(describer, "describe_batch")
 
     def store(job: DescribeJob, description: str, keywords: list[str]) -> None:
         joined = ", ".join(keywords)
@@ -160,6 +167,14 @@ def run_describe_stage(
             db.set_video_description(job.media_id, description, joined)
         if on_result is not None:
             on_result(job, description, keywords)
+
+    def store_batch(batch: list[tuple[DescribeJob, str, list[str]]]) -> None:
+        nonlocal emitted
+        for job, description, keywords in batch:
+            store(job, description, keywords)
+            emitted += 1
+        if emitted % clear_every < len(batch):
+            _clear_mlx_cache()
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         iterator = iter(jobs)
@@ -177,29 +192,67 @@ def run_describe_stage(
                 pending.add(future)
 
         fill()
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        ready: list[tuple[DescribeJob, object]] = []
+
+        def drain_ready() -> None:
+            """Move completed futures into the ready list."""
+            done, pending_set = wait(pending, return_when=FIRST_COMPLETED)
+            pending.clear()
+            pending.update(pending_set)
             for future in done:
-                job = job_of.pop(future)
+                ready.append((job_of.pop(future), future))
+
+        drain_ready()
+        while ready or pending:
+            # collect a batch of decoded frames
+            batch_jobs: list[DescribeJob] = []
+            batch_frames: list = []
+            while len(batch_jobs) < batch_size and ready:
+                job, future = ready.pop(0)
                 if progress is not None:
                     progress(job)
                 try:
-                    frame = future.result()
+                    batch_frames.append(future.result())
+                    batch_jobs.append(job)
                 except Exception as exc:  # noqa: BLE001 - keep describing
                     if on_error is not None:
                         on_error(job.path, exc)
+            if not batch_jobs:
+                if pending:
+                    drain_ready()
+                    fill()
                     continue
+                break
+            if use_batch and len(batch_jobs) > 1:
+                try:
+                    results = describer.describe_batch(batch_frames)
+                    store_batch(list(zip(batch_jobs, [r[0] for r in results],
+                                          [r[1] for r in results])))
+                except Exception as exc:  # noqa: BLE001 - fall back to one-by-one
+                    for job, frame in zip(batch_jobs, batch_frames):
+                        if on_error is not None:
+                            on_error(job.path, exc)
+                        try:
+                            d, k = describer.describe(frame)
+                            store(job, d, k)
+                            emitted += 1
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if emitted % clear_every == 0:
+                        _clear_mlx_cache()
+            else:
+                job, frame = batch_jobs[0], batch_frames[0]
                 try:
                     description, keywords = describer.describe(frame)
+                    store(job, description, keywords)
+                    emitted += 1
+                    if emitted % clear_every == 0:
+                        _clear_mlx_cache()
                 except Exception as exc:  # noqa: BLE001 - keep describing
                     if on_error is not None:
                         on_error(job.path, exc)
-                    continue
-                store(job, description, keywords)
-                emitted += 1
-                if emitted % clear_every == 0:
-                    _clear_mlx_cache()
             fill()
+            drain_ready()
 
     return emitted
 

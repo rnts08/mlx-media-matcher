@@ -1,0 +1,66 @@
+# TODO — Ring-buffer pipeline
+
+**Branch:** `perf/ring-buffer-pipeline`
+**Goal:** 20k files in 1-4h instead of ~1 day. Overlap disk I/O, CPU analytics,
+and GPU embedding so no stage waits on another.
+
+## Bottleneck
+
+The describe stage generates captions one at a time (20k × ~1-2 s = 11+ h).
+The scan already batches CLIP with 4 workers. The fix is two-fold:
+
+1. **VLM batching** — `mlx_vlm.generate` accepts a list of images, so one
+   forward pass captions 4-8 frames at once. Biggest win for describe.
+2. **Ring buffer** — a dedicated I/O stage keeps ~1 GB of raw file bytes in
+   flight from the NVMe, so CPU workers never wait on disk.
+
+## Design — four stages, three bounded queues
+
+```
+NVMe
+  → [ Read pool: 1-2 ]    read raw bytes → ring buffer (~1 GB, always full)
+  → [ CPU pool: 4-8 ]     decode, pHash, CLIP preprocess → arrays
+  → [ GPU: 1 ]            batch arrays → CLIP embed (streaming)
+  → [ Store: 1 ]          upsert rows, FTS
+```
+
+### Ring buffer
+
+- Bounded `queue.Queue` of raw `(path, bytes)` chunks, ~1 GB total.
+- Reader thread(s) pull paths from the job iterator, `read()` bytes, push.
+  Back-pressure when full.
+- CPU workers pull `(path, bytes)`, decode, hash, preprocess, push arrays to
+  the batch queue. Disk latency is decoupled from decode cost.
+
+### VLM batching
+
+- `Describer.describe_batch(frames: list[PIL.Image]) -> list[(desc, kw)]`
+  sends N frames per `generate` call (both the description pass and the
+  keywords pass are batched separately).
+- Batch size is a flag (`--describe-batch`, default 6), tuned so the KV cache
+  fits in unified memory.
+
+### Stage wiring
+
+| Stage | Pool | Queue in | Queue out |
+|---|---|---|---|
+| Read | 1-2 | file paths | raw bytes (~1 GB ring) |
+| Preprocess | 4-8 | raw bytes | numpy arrays |
+| Embed | 1 (GPU) | arrays | CLIP vectors |
+| Store | 1 | vectors | SQLite |
+
+## Files to change
+
+- `media_match/pipeline.py` — add `RingBuffer`; split `run_scan` into the
+  staged pipeline; keep the existing API so tests pass.
+- `media_match/analyze.py` — add `Describer.describe_batch`; feed
+  `run_describe_stage` from the ring buffer; batch the VLM calls.
+- `media_match/cli.py` — add `--describe-batch`, `--io-workers`; wire the new
+  pipeline into `cmd_analyze` / `cmd_scan`.
+
+## Success criteria
+
+- 20k images: wall time drops from ~1 day to 1-4h.
+- GPU utilisation stays high (no idle gaps between batches).
+- NVMe read throughput stays high (ring buffer always full).
+- All 137 existing tests pass; new tests for the ring buffer and VLM batching.

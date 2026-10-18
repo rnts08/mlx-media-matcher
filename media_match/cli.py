@@ -14,7 +14,14 @@ from datetime import datetime, timezone
 
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
-from .pipeline import ScanStats, build_jobs, prune_missing, run_scan, store_result
+from .pipeline import (
+    ScanStats,
+    build_jobs,
+    prune_missing,
+    run_scan,
+    run_staged_scan,
+    store_result,
+)
 from .analyze import describe_targets, run_describe_stage
 from .check import CORRUPT, OK, TRUNCATED, check_tree, quarantine, repair_truncated
 from .bootstrap import (
@@ -218,9 +225,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
             print(f"  preparing [{done}/{total}]", file=sys.stderr)
 
     scan_stats = ScanStats()
-    analyzed = run_scan(
+    analyzed = run_staged_scan(
         jobs, encoder, interval=interval, max_frames=max_frames,
         batch_size=batch, workers=workers,
+        io_workers=getattr(args, "io_workers", None) or 2,
         on_result=on_result, progress=progress, on_error=on_error,
         stats=scan_stats,
     )
@@ -303,6 +311,7 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
         described = run_describe_stage(
             plan.jobs, describer, db,
             workers=getattr(args, "describe_workers", None) or 3,
+            batch_size=getattr(args, "describe_batch", None) or 1,
             on_error=on_error, progress=progress,
         )
     finally:
@@ -1581,9 +1590,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             print(f"  analyzing [{done}/{n_total}]", file=sys.stderr)
 
     scan_stats = ScanStats()
-    analyzed = run_scan(
+    analyzed = run_staged_scan(
         jobs, encoder, interval=interval, max_frames=max_frames,
         batch_size=batch, workers=workers,
+        io_workers=getattr(args, "io_workers", None) or 2,
         on_result=on_result, progress=progress, on_error=on_error,
         stats=scan_stats,
     )
@@ -2422,6 +2432,12 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--workers", type=int, default=None,
                         help="parallel CPU prep threads feeding the GPU "
                              "(default: 4, or config 'workers')")
+    p_scan.add_argument("--io-workers", type=int, default=None,
+                        help="reader threads feeding the ring buffer from disk "
+                             "(default: 2)")
+    p_scan.add_argument("--describe-batch", type=int, default=None,
+                        help="VLM batch size: caption N frames per forward pass "
+                             "(default: 1, higher is faster but uses more memory)")
     p_scan.add_argument("--interval", type=float, default=None,
                         help="target seconds between video keyframes "
                              "(default: 1.0, or config 'interval')")
@@ -2475,6 +2491,14 @@ def main(argv: list[str] | None = None) -> int:
                            metavar="N",
                            help="CPU threads prefetching frames for the VLM "
                                 "(default: 2-4, bounded by --workers)")
+    p_analyze.add_argument("--describe-batch", type=int, default=None,
+                           metavar="N",
+                           help="VLM batch size: caption N frames per forward pass "
+                                "(default: 1, higher is faster but uses more memory)")
+    p_analyze.add_argument("--io-workers", type=int, default=None,
+                           metavar="N",
+                           help="reader threads feeding the ring buffer from disk "
+                                "(default: 2)")
     p_analyze.add_argument("--interval", type=float, default=None,
                            help="target seconds between video keyframes "
                                 "(default: 1.0, or config 'interval')")

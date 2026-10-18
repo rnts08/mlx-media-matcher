@@ -96,6 +96,46 @@ class Describer:
         keywords = parse_keywords(self._ask(_KEYWORDS_PROMPT, image, max_tokens=40))
         return description, keywords
 
+    def describe_batch(self, images: list) -> list[tuple[str, list[str]]]:
+        """Caption a batch of images in fewer VLM passes.
+
+        Sends all images per prompt (description pass, then keywords pass)
+        instead of one call per image. Returns one (description, keywords)
+        tuple per input image, in order.
+        """
+        if not images:
+            return []
+        descriptions = self._ask_batch(_DESC_PROMPT, images, max_tokens=60)
+        descriptions = [d.replace("\n", " ").strip() for d in descriptions]
+        raw_keywords = self._ask_batch(_KEYWORDS_PROMPT, images, max_tokens=40)
+        return [(d, parse_keywords(k)) for d, k in zip(descriptions, raw_keywords)]
+
+    def _ask_batch(self, prompt_text: str, images: list, max_tokens: int) -> list[str]:
+        """One prompt against a batch of images; returns one string per image."""
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        self._ensure_loaded()
+        # one prompt per image, batched together
+        prompts = [
+            apply_chat_template(self._processor, self._model.config, prompt_text,
+                                num_images=1)
+            for _ in images
+        ]
+        result = generate(
+            self._model,
+            self._processor,
+            prompts,
+            image=images,
+            max_tokens=max_tokens,
+            verbose=False,
+        )
+        if isinstance(result, list):
+            return [r.text if hasattr(r, "text") else str(r) for r in result]
+        # single GenerationResult or list of them
+        text = result.text if hasattr(result, "text") else str(result)
+        return [text] * len(images)
+
     def unload(self) -> None:
         self._model = None
         self._processor = None
