@@ -2112,6 +2112,7 @@ _EXAMPLES = {
     "about": "media-match about",
     "version": "media-match version",
     "info": "media-match info ~/Pictures",
+    "help": "media-match help bootstrap",
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
@@ -2380,6 +2381,37 @@ class _HelpAction(argparse.Action):
         parser.exit()
 
 
+class _CommandHelpAction(argparse.Action):
+    """-h/--help on a command: print the same page as 'help <cmd>'."""
+
+    def __init__(self, option_strings, command: str, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help=None):
+        super().__init__(option_strings=option_strings, dest=dest,
+                         default=default, nargs=0, help=help)
+        self.command = command
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(_command_section(self.command))
+        parser.exit()
+
+
+class _CommandParser(argparse.ArgumentParser):
+    """Subparser that routes -h/--help through the shared help page.
+
+    argparse's own --help is a bare option dump with no description and no
+    example. Sending it through _command_section keeps 'cmd --help',
+    'cmd help' and 'help cmd' byte-identical.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("add_help", False)
+        super().__init__(*args, **kwargs)
+        name = (self.prog or "").rsplit(" ", 1)[-1]
+        self.add_argument("-h", "--help", action=_CommandHelpAction,
+                          command=name,
+                          help="show this command's help and exit")
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -2427,9 +2459,21 @@ def main(argv: list[str] | None = None) -> int:
         "--about", action="store_true",
         help="show what the program does, its license and project links",
     )
-    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    sub = parser.add_subparsers(dest="command", metavar="<command>",
+                            parser_class=_CommandParser)
 
-    p_scan = sub.add_parser("scan", help="analyze new/changed media in a folder")
+    p_scan = sub.add_parser(
+        "scan",
+        help="analyze new/changed media in a folder",
+        description=(
+            "Walk the tree and index every new or changed media file: size, "
+            "dimensions, capture date, pHash (for exact duplicates) and a CLIP "
+            "embedding. Files already in the index are skipped, so re-running is "
+            "cheap. Add --describe to caption them, --refine/--classify to tidy "
+            "the keywords, --video to include videos, and --prune to drop index "
+            "rows for files that have since been moved or deleted."
+        ),
+    )
     _add_common(p_scan)
     p_scan.add_argument("--describe", action="store_true",
                         help="also caption media with the vision model "
@@ -2558,7 +2602,17 @@ def main(argv: list[str] | None = None) -> int:
                                  "(default: 3)")
     p_describe.set_defaults(func=cmd_describe)
 
-    p_search = sub.add_parser("search", help="find media by person/object/text")
+    p_search = sub.add_parser(
+        "search",
+        help="find media by person/object/text",
+        description=(
+            "Search the index. With words, results come from the captions and "
+            "refined tags; with --clip they come from CLIP text-to-image "
+            "similarity instead. Narrow the result set with --since/--until/"
+            "--camera, --person/--object, --type, --cluster, --image-only or "
+            "--video. Add --json for machine-readable output."
+        ),
+    )
     _add_common(p_search)
     p_search.add_argument("query", nargs="*", metavar="QUERY",
                           help="free-text search terms (ANDed together)")
@@ -2590,7 +2644,16 @@ def main(argv: list[str] | None = None) -> int:
     p_search.add_argument("--limit", type=int, default=50)
     p_search.set_defaults(func=cmd_search)
 
-    p_embed = sub.add_parser("embed", help="compute CLIP embeddings for indexed images")
+    p_embed = sub.add_parser(
+        "embed",
+        help="compute CLIP embeddings for indexed images",
+        description=(
+            "Fill in CLIP embeddings for indexed images that do not have one yet "
+            "(the usual case after importing an index from elsewhere). With "
+            "--recompute, every indexed image is embedded again, which is how "
+            "you switch to a different --clip-model."
+        ),
+    )
     _add_common(p_embed)
     p_embed.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
                          help=f"CLIP model (default: {DEFAULT_CLIP_MODEL})")
@@ -2602,6 +2665,14 @@ def main(argv: list[str] | None = None) -> int:
     p_sim = sub.add_parser(
         "similar",
         help="group the tree by CLIP similarity, or find neighbors of one file",
+        description=(
+            "Group media by CLIP similarity, or show the neighbours of one "
+            "file. Two modes: with no arguments it groups the whole tree into "
+            "semantic near-duplicate groups (photos of the same scene that "
+            "pHash would not catch, shot a moment apart); with --image it ranks "
+            "indexed media against that one image instead. --video searches "
+            "clips by their keyframes. --threshold tunes the cut-off."
+        ),
     )
     _add_common(p_sim)
     p_sim.add_argument("--video", action="store_true",
@@ -2616,7 +2687,17 @@ def main(argv: list[str] | None = None) -> int:
     p_sim.add_argument("--json", action="store_true", help="machine-readable output")
     p_sim.set_defaults(func=cmd_similar)
 
-    p_dup = sub.add_parser("duplicates", help="group duplicates; best resolution wins")
+    p_dup = sub.add_parser(
+        "duplicates",
+        help="group duplicates; best resolution wins",
+        description=(
+            "Group indexed media that are copies of each other, comparing them "
+            "by pHash so re-encodes and resizes are caught. The best copy of "
+            "each group (highest resolution, or newest with --prefer mtime) is "
+            "marked. This command only reports; 'clean' is what moves the "
+            "rejected copies to the Trash."
+        ),
+    )
     _add_common(p_dup)
     p_dup.add_argument("--video", action="store_true",
                        help="group duplicate/re-encode videos by keyframe pHash")
@@ -2736,7 +2817,15 @@ def main(argv: list[str] | None = None) -> int:
     p_people.add_argument("--json", action="store_true", help="machine-readable output")
     p_people.set_defaults(func=cmd_people)
 
-    p_tags = sub.add_parser("tags", help="list refined tags, facets or image types")
+    p_tags = sub.add_parser(
+        "tags",
+        help="list refined tags, facets or image types",
+        description=(
+            "List what 'refine' produced: the refined tags with counts, the "
+            "facets those tags belong to, or the classified image types. "
+            "Reads the index only; nothing is recomputed."
+        ),
+    )
     _add_common(p_tags)
     p_tags.add_argument("--video", action="store_true",
                         help="use video tags instead of image tags")
@@ -2893,7 +2982,15 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument("--out", help="write to this file instead of stdout")
     p_export.set_defaults(func=cmd_export)
 
-    p_stats = sub.add_parser("stats", help="show index statistics")
+    p_stats = sub.add_parser(
+        "stats",
+        help="show index statistics",
+        description=(
+            "Summarise the index: how many images, videos and captions it "
+            "holds, the formats and cameras you have, and what the last few "
+            "scans cost in wall time, GPU time and bytes read."
+        ),
+    )
     _add_common(p_stats)
     p_stats.add_argument("--json", action="store_true", help="machine-readable output")
     p_stats.set_defaults(func=cmd_stats)
@@ -2914,15 +3011,31 @@ def main(argv: list[str] | None = None) -> int:
     p_about = sub.add_parser(
         "about",
         help="show what this program does, its license and project links",
+        description=(
+            "Print what media-match is for, who wrote it, where the source "
+            "lives, and the licence it ships under."
+        ),
     )
     p_about.set_defaults(func=cmd_about)
 
-    p_version = sub.add_parser("version", help="print version, license and author")
+    p_version = sub.add_parser(
+        "version",
+        help="print version, license and author",
+        description=(
+            "Print the version, licence and author on one line."
+        ),
+    )
     p_version.set_defaults(func=cmd_version)
 
     p_info = sub.add_parser(
         "info",
         help="print program information (models, last scan, free storage)",
+        description=(
+            "Print what this installation is set up with: the CLIP and VLM "
+            "models in use, when the index was last scanned, and how much free "
+            "disk space is left. Takes an optional folder to pick the index "
+            "from; defaults to the current directory."
+        ),
     )
     _add_common(p_info)
     p_info.set_defaults(func=cmd_info)
