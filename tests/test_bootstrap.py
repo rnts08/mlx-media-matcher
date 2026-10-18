@@ -203,3 +203,118 @@ def test_bootstrap_fix_extensions(capsys, tmp_path):
     out = capsys.readouterr().out
     assert "1 file(s) to fix missing extensions" in out
     assert (root / "IMG_1234.jpg").exists()
+
+
+# -- --move-to: move non-media files instead of trashing them ------------------
+
+
+def test_move_to_moves_instead_of_trashing(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    (root / "docs").mkdir()
+    (root / "docs" / "notes.txt").write_text("hello")
+    dest = tmp_path / "elsewhere"
+
+    assert cli.main(["bootstrap", str(root), "--media-only",
+                     "--move-to", str(dest), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "moved 1 non-media file(s)" in out
+    assert "pruned" not in out
+    # media stayed put; the non-media file kept its layout under dest
+    assert (root / "a.jpg").exists()
+    assert not (root / "docs" / "notes.txt").exists()
+    assert (dest / "docs" / "notes.txt").read_text() == "hello"
+
+
+def test_move_to_dry_run_changes_nothing(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    (root / "notes.txt").write_text("hello")
+    dest = tmp_path / "elsewhere"
+
+    assert cli.main(["bootstrap", str(root), "--media-only",
+                     "--move-to", str(dest)]) == 0
+    out = capsys.readouterr().out
+    assert f"1 non-media file(s) to move to {dest}" in out
+    assert (root / "notes.txt").exists()
+    assert not dest.exists()
+
+
+def test_move_to_destination_inside_tree_is_not_rescanned(capsys, tmp_path):
+    # A destination under the root must not be walked, or the moved files
+    # would be found and moved again on the next run.
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    (root / "notes.txt").write_text("hello")
+    dest = root / "_nonmedia"
+
+    assert cli.main(["bootstrap", str(root), "--media-only",
+                     "--move-to", str(dest), "--yes"]) == 0
+    assert (dest / "notes.txt").exists()
+
+    assert cli.main(["bootstrap", str(root), "--media-only",
+                     "--move-to", str(dest), "--yes"]) == 0
+    assert "0 other" in capsys.readouterr().out
+    assert (dest / "notes.txt").read_text() == "hello"
+    assert not (dest / "notes (2).txt").exists()
+
+
+def test_move_to_avoids_overwriting_same_named_files(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    (root / "notes.txt").write_text("from tree")
+    dest = tmp_path / "elsewhere"
+    dest.mkdir()
+    (dest / "notes.txt").write_text("already there")
+
+    assert cli.main(["bootstrap", str(root), "--media-only",
+                     "--move-to", str(dest), "--yes"]) == 0
+    # the pre-existing file is untouched, the new one is renamed aside
+    assert (dest / "notes.txt").read_text() == "already there"
+    assert (dest / "notes (2).txt").read_text() == "from tree"
+
+
+def test_move_to_requires_media_only(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    assert cli.main(["bootstrap", str(root), "--move-to",
+                     str(tmp_path / "elsewhere")]) == 2
+    assert "--move-to only applies to --media-only" in capsys.readouterr().err
+
+
+def test_move_to_rejects_the_tree_itself(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    assert cli.main(["bootstrap", str(root), "--media-only",
+                     "--move-to", str(root)]) == 2
+    assert "other than the tree itself" in capsys.readouterr().err
+
+
+# -- help ----------------------------------------------------------------------
+
+
+def test_command_help_word_does_not_open_a_database(capsys, tmp_path):
+    # 'bootstrap help' used to treat 'help' as the root path and crash while
+    # opening a database inside a folder that does not exist.
+    assert cli.main(["bootstrap", "help"]) == 0
+    assert "bootstrap —" in capsys.readouterr().out
+
+
+def test_every_listed_command_has_help(capsys):
+    for name in cli._COMMAND_SUMMARIES:
+        if name == "help":
+            continue
+        assert cli.main(["help", name]) == 0, name
+        assert f"{name} —" in capsys.readouterr().out, name
+
+
+def test_command_help_word_is_ignored_as_an_option_value(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "a.jpg")
+    (root / "notes.txt").write_text("hello")
+    # 'help' here is the value of --db, not a request for help
+    assert cli.main(["bootstrap", str(root), "--db",
+                     str(tmp_path / "help"), "--media-only", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "1 non-media file(s) to prune" in out
+    assert (tmp_path / "help").exists()

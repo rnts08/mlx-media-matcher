@@ -189,6 +189,60 @@ def trash_files(
     return trashed, failed
 
 
+def unique_destination(dest_dir: str, name: str) -> str:
+    """A path in dest_dir for 'name' that does not exist yet.
+
+    Collisions get ' (2)', ' (3)' ... before the extension, so a second
+    'notes.txt' becomes 'notes (2).txt' rather than overwriting the first.
+    """
+    stem, ext = os.path.splitext(name)
+    candidate = os.path.join(dest_dir, name)
+    n = 1
+    while os.path.exists(candidate):
+        n += 1
+        candidate = os.path.join(dest_dir, f"{stem} ({n}){ext}")
+    return candidate
+
+
+def move_files(
+    paths: list[str], root: str, dest_root: str,
+    out: Callable[[str], None] = print,
+) -> tuple[list[str], list[str]]:
+    """Move files into dest_root, keeping their layout relative to root.
+
+    dest_root/a/b/notes.txt receives root/a/b/notes.txt, so two files with the
+    same basename in different folders never collide. Returns (moved, failed).
+
+    Unlike the Trash this is a plain move: the destination is yours to keep,
+    re-scan or delete, and nothing is recorded to undo it.
+    """
+    moved: list[str] = []
+    failed: list[str] = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue  # already gone; nothing to move
+        rel = os.path.relpath(path, root)
+        if rel.startswith(os.pardir):
+            # outside root — flatten it, there is no relative layout to keep
+            rel = os.path.basename(path)
+        dest_dir = os.path.join(dest_root, os.path.dirname(rel))
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = unique_destination(dest_dir, os.path.basename(rel))
+            # rename is atomic and cheap within a volume; fall back to a copy
+            # across volumes (e.g. a disk mounted under /Volumes).
+            try:
+                os.rename(path, dest)
+            except OSError:
+                shutil.move(path, dest)
+        except OSError as exc:
+            out(f"  FAILED {path}: {exc}")
+            failed.append(path)
+            continue
+        moved.append(path)
+    return moved, failed
+
+
 def trash_dirs() -> list[str]:
     """Candidate OS Trash directories on this platform."""
     home = os.path.expanduser("~")

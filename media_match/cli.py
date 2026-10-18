@@ -1307,12 +1307,29 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     Dry-run by default — builds the database but touches no files. Add
     --prune to trash exact duplicates (keeping the newest), --media-only to
     prune non-media files and consolidate extensions, and --fix-extensions
-    (with --media-only) to add/update missing extensions.
+    (with --media-only) to add/update missing extensions. With --move-to DIR,
+    --media-only moves the non-media files there instead of trashing them.
     """
     from .config import load_ignore
 
+    if getattr(args, "move_to", None) and not args.media_only:
+        print("--move-to only applies to --media-only", file=sys.stderr)
+        return 2
+
     root = os.path.abspath(args.root)
     ignore = load_ignore(root)
+
+    # Moving files into a folder inside the tree we are about to walk would
+    # make the walk find them again, so keep the destination out of it.
+    move_to = os.path.abspath(args.move_to) if args.move_to else None
+    if move_to == root:
+        print("--move-to must be a folder other than the tree itself",
+              file=sys.stderr)
+        return 2
+    if move_to:
+        rel = os.path.relpath(move_to, root)
+        if not rel.startswith(os.pardir):
+            ignore = list(ignore) + [rel]
 
     # Walk the whole tree (not just media) so --media-only can see the rest.
     rows = walk_tree(root, include_video=args.video, ignore=ignore)
@@ -1399,7 +1416,8 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             if len(consolidations) > 20:
                 print(f"  ... and {len(consolidations) - 20} more")
         if non_media:
-            print(f"\n{len(non_media)} non-media file(s) to prune:")
+            verb = f"move to {move_to}" if move_to else "prune"
+            print(f"\n{len(non_media)} non-media file(s) to {verb}:")
             for p in non_media[:20]:
                 print(f"  {os.path.relpath(p, root)}")
             if len(non_media) > 20:
@@ -1409,8 +1427,8 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         if total_ops and (args.yes or _confirm(
                 f"Apply {total_ops} file operation(s) "
                 f"({len(fixes)} fix, {len(consolidations)} consolidate, "
-                f"{len(non_media)} prune)?")):
-            from .cleanup import trash_files
+                f"{len(non_media)} {('move to ' + move_to) if move_to else 'prune'})?")):
+            from .cleanup import move_files, trash_files
 
             class _Rec:
                 def __init__(self, p):
@@ -1430,8 +1448,11 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
                     renamed += 1
                 except OSError as exc:
                     print(f"  FAILED {old}: {exc}")
-            # 3. prune non-media files (after fixes, so promoted files survive)
-            if non_media:
+            # 3. clear out non-media files (after fixes, so promoted files survive)
+            if non_media and move_to:
+                moved, _failed = move_files(non_media, root, move_to)
+                print(f"moved {len(moved)} non-media file(s) to {move_to}")
+            elif non_media:
                 trashed, failed = trash_files([_Rec(p) for p in non_media])
                 for f in failed:
                     print(f"  FAILED {f.path}")
@@ -2832,7 +2853,9 @@ def main(argv: list[str] | None = None) -> int:
             "the index — no decoding or hashing, so it is fast. Dry-run by "
             "default: builds the database but touches no files. Add --prune to "
             "trash exact duplicates (keeping the newest), --media-only to prune "
-            "non-media files and consolidate extensions, and --fix-extensions "
+            "non-media files and consolidate extensions, --move-to DIR (with "
+            "--media-only) to move the non-media files to a folder instead of "
+            "trashing them, and --fix-extensions "
             "(with --media-only) to add/update missing extensions. Works for "
             "images and videos."
         ),
@@ -2843,6 +2866,9 @@ def main(argv: list[str] | None = None) -> int:
     p_bootstrap.add_argument("--media-only", action="store_true",
                              help="prune non-media files and consolidate extensions "
                                   "to canonical form (.jpeg -> .jpg, etc.)")
+    p_bootstrap.add_argument("--move-to", metavar="DIR",
+                             help="with --media-only: move the non-media files to DIR "
+                                  "(keeping their layout) instead of trashing them")
     p_bootstrap.add_argument("--fix-extensions", action="store_true",
                              help="with --media-only: detect and add/update missing "
                                   "extensions (e.g. IMG_1234 -> IMG_1234.jpg)")
@@ -2901,16 +2927,40 @@ def main(argv: list[str] | None = None) -> int:
     _add_common(p_info)
     p_info.set_defaults(func=cmd_info)
 
+    # Every subparser must be registered here or 'help <command>' (and
+    # '<command> help') report it as unknown.
     for name, parser_obj in (
-        ("scan", p_scan), ("search", p_search), ("embed", p_embed),
-        ("similar", p_sim), ("duplicates", p_dup), ("clean", p_clean),
-        ("restore", p_restore),
+        ("analyze", p_analyze), ("scan", p_scan), ("describe", p_describe),
+        ("search", p_search), ("embed", p_embed), ("similar", p_sim),
+        ("duplicates", p_dup), ("clean", p_clean), ("restore", p_restore),
         ("refine", p_refine), ("people", p_people), ("tags", p_tags),
+        ("clear-metadata", p_clear), ("import-metadata", p_import),
+        ("export-metadata", p_export_meta), ("reset", p_reset),
+        ("check", p_check), ("bootstrap", p_bootstrap),
         ("export", p_export),
         ("stats", p_stats), ("about", p_about), ("version", p_version),
         ("info", p_info), ("help", p_help),
     ):
         _SUBPARSERS[name] = parser_obj
+
+    # 'help <command>' must cover everything 'help' lists, or the guide
+    # advertises commands it cannot describe.
+    missing = sorted(set(_COMMAND_SUMMARIES) - set(_SUBPARSERS))
+    if missing:  # pragma: no cover - guards against a parser added above
+        raise RuntimeError(f"help summaries without a parser: {missing}")
+
+    # '<command> help' shows that command's page — the same text as
+    # 'help <command>'. Without this, 'help' is consumed as the root path and
+    # commands that open an index immediately (bootstrap) fail inside a
+    # folder that does not exist.
+    for i, token in enumerate(argv):
+        if token != "help" or i == 0:
+            continue
+        previous = argv[i - 1]
+        if previous.startswith("-") or previous not in _SUBPARSERS:
+            continue  # e.g. '--db help': 'help' is an option value, not a request
+        print(_command_section(previous))
+        return 0
 
     # No command at all: show the full guide, exactly like 'help'.
     if not argv:
