@@ -1,4 +1,8 @@
-# TODO — Ring-buffer pipeline
+# Ring-buffer pipeline
+
+**Status: shipped in 0.2.21** (branch `perf/ring-buffer-pipeline`, merged to
+`main`). Kept as the design record — the numbers and the reasoning behind the
+stage split.
 
 **Branch:** `perf/ring-buffer-pipeline`
 **Goal:** 20k files in 1-4h instead of ~1 day. Overlap disk I/O, CPU analytics,
@@ -37,8 +41,9 @@ NVMe
 - `Describer.describe_batch(frames: list[PIL.Image]) -> list[(desc, kw)]`
   sends N frames per `generate` call (both the description pass and the
   keywords pass are batched separately).
-- Batch size is a flag (`--describe-batch`, default 6), tuned so the KV cache
-  fits in unified memory.
+- Batch size is a flag (`--describe-batch`). It ships defaulting to **1**, not
+  the 6 originally planned here: unified memory is tight and the safe default
+  has to work on a 16 GB machine. Raise it once you have measured.
 
 ### Stage wiring
 
@@ -63,4 +68,18 @@ NVMe
 - 20k images: wall time drops from ~1 day to 1-4h.
 - GPU utilisation stays high (no idle gaps between batches).
 - NVMe read throughput stays high (ring buffer always full).
-- All 137 existing tests pass; new tests for the ring buffer and VLM batching.
+- All existing tests pass; new tests for the ring buffer and VLM batching.
+
+## Outcome
+
+Shipped; the suite went 137 → 150 tests. Two things the criteria did not cover
+turned up during the work and are worth recording:
+
+- The staged pipeline was wired into `cmd_scan`/`cmd_analyze` but never
+  imported from `.pipeline`, so `run_staged_scan` raised `NameError` on every
+  run. Two tests caught it; keep an eye on new call sites of this shape.
+- `run_scan` keeps its old signature and behaviour — `run_staged_scan` sits
+  beside it, so the staged path can be A/B'd rather than swapped in blind.
+
+The 20k-file target has **not** been measured end to end; the pipeline
+structure is in place, the timing claim is still open.

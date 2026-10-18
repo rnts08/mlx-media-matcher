@@ -58,6 +58,17 @@ for the measurements that justify the design):
 The index lives in `<root>/.media-match.db` (SQLite + FTS5). Read-only
 commands never create it — run `scan` first.
 
+**Scanning is a four-stage pipeline**, not a loop. Raw file bytes are read by a
+small pool of reader threads into a bounded ~1 GB ring buffer; CPU workers pull
+from that buffer to decode, hash and preprocess; one GPU stage turns the
+resulting arrays into CLIP batches; a single writer stores the vectors. Because
+each stage has its own bounded queue, disk latency, CPU decode cost and GPU time
+overlap instead of running in sequence, and back-pressure keeps memory flat no
+matter how big the tree is. `--io-workers` sizes the reader pool. Captions use
+the same idea: `--describe-batch N` sends N frames to the vision model per
+forward pass instead of one, which is the single biggest win when describing a
+large tree (default 1; raise it while watching memory).
+
 Images also record EXIF **capture time, camera and GPS**, so you can search by
 date (`--since`/`--until`) or camera, `stats` reports the captured date range,
 and `duplicates --prefer date` marks the newest capture as the best copy (the
@@ -123,6 +134,8 @@ Ignored paths are skipped by `scan` and dropped by `scan --prune`.
 #    the built-in guide (every command, every flag, examples)
 .venv/bin/media-match help              # all commands + flags + an example each
 .venv/bin/media-match help scan         # one command in full
+.venv/bin/media-match scan help         # the same page — all three forms match
+.venv/bin/media-match scan --help
 
 # 1b. optional: add captions with the vision model (~1 s/image, only for the
 #     best-resolution version of each duplicate group) and, in the same pass,
@@ -186,6 +199,21 @@ Ignored paths are skipped by `scan` and dropped by `scan --prune`.
 .venv/bin/media-match duplicates ~/Movies --video  # re-encodes, across resolution
 .venv/bin/media-match similar ~/Movies --video     # same-subject video groups
 .venv/bin/media-match clean ~/Movies --video       # same review UI as images
+
+# tuning the scan pipeline — the defaults suit most trees
+.venv/bin/media-match scan ~/Pictures --io-workers 4    # disk reader threads
+.venv/bin/media-match scan ~/Pictures --describe --describe-batch 6  # caption 6/forward pass
+
+# 8. first pass over a messy tree: inventory, drop duplicates, clear out
+#    non-media files. Dry-run by default — nothing moves without --yes.
+.venv/bin/media-match bootstrap ~/Downloads                    # inventory only
+.venv/bin/media-match bootstrap ~/Downloads --prune            # trash exact dupes
+.venv/bin/media-match bootstrap ~/Downloads --media-only       # trash non-media files
+.venv/bin/media-match bootstrap ~/Downloads --media-only --fix-extensions
+
+#    move the non-media files to a folder instead of trashing them — they
+#    keep their layout under DIR and existing files are never overwritten
+.venv/bin/media-match bootstrap ~/Downloads --media-only --move-to ~/non-media --yes
 ```
 
 > **Quote paths that contain spaces or shell metacharacters** (`&`, `$`, `;`,
@@ -210,19 +238,19 @@ Group 1 (2 files)
 
 | Command | What it does | Key options |
 |---|---|---|
-| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--describe-workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--prune`, `--batch` |
-| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
-| `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers` |
+| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--prune`, `--batch` |
+| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
+| `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch` |
 | `clear-metadata [root] [ITEM...]` | clear description/keywords/type/tags from the listed items (paths relative to root), or everything with no items. Media files are never touched | `--kind`, `--yes` |
 | `import-metadata [root] FILE` | import description/keywords/type from a JSON or CSV file (as written by `export-metadata`) | `--kind`, `--fields` |
 | `export-metadata [root]` | export editable metadata (kind, path, description, keywords, type) as JSON — round-trips with `import-metadata` | `--kind`, `--out` |
 | `reset [root]` | delete the index database (media files are never touched); the next `scan` rebuilds from scratch | `--yes` |
 | `check [root]` | classify every file as ok / truncated / corrupt; offer to re-encode truncated images (backup kept) and quarantine corrupt ones | `--video`, `--quarantine`, `--yes` |
-| `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index. Dry-run by default; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--fix-extensions`, `--video`, `--yes` |
+| `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index. Dry-run by default; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--move-to DIR` moves the non-media files out instead of trashing them, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--move-to`, `--fix-extensions`, `--video`, `--yes` |
 | `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--json`, `--limit` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--json` |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
-| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
+| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (group only distance-0 matches; faster), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--json` (with `--dry-run`) |
 | `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--json`, `--limit`, `--video` |
 | `export [root]` | dump the index (path, kind, size, capture date, camera, description, keywords, type, tags, cluster, duration) | `--format` (json/csv/md, default json), `--out` |

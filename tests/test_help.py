@@ -1,5 +1,7 @@
 import io
 import contextlib
+import pathlib
+import re
 
 import pytest
 
@@ -72,6 +74,21 @@ def test_every_command_help_page_is_complete():
         assert f"{name} —" in out, name
         assert "example:" in out, f"{name}: no example"
         assert "usage: media-match" in out, name
+
+
+def test_readme_documents_only_flags_that_exist():
+    # The README quotes flags in backticks; a flag that does not exist is a
+    # documentation bug that sends people to a command that cannot work.
+    _commands()
+    real = {
+        option
+        for parser in cli._SUBPARSERS.values()
+        for action in parser._actions
+        for option in action.option_strings
+    }
+    readme = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+    quoted = set(re.findall(r"`(--[a-z0-9-]+)`", readme.read_text()))
+    assert not sorted(quoted - real), f"README documents flags that do not exist: {sorted(quoted - real)}"
 
 
 def test_no_command_is_listed_without_a_parser():
