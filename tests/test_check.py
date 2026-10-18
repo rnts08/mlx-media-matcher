@@ -7,10 +7,11 @@ from PIL import Image
 
 from media_match.check import (
     CORRUPT,
+    NOTABLE,
     OK,
     TRUNCATED,
     check_image,
-    check_tree,
+    diagnose_tree,
     quarantine,
     repair_truncated,
 )
@@ -46,7 +47,7 @@ def test_check_image_corrupt(tmp_path):
     assert check_image(str(p)) == CORRUPT
 
 
-def test_check_tree_categorizes(tmp_path):
+def test_diagnose_tree_categorizes(tmp_path):
     root = tmp_path / "tree"
     _write_image(root / "ok.png")
     truncated = root / "trunc.jpg"
@@ -55,10 +56,26 @@ def test_check_tree_categorizes(tmp_path):
     corrupt = root / "bad.png"
     corrupt.write_bytes(b"not an image")
 
-    result = check_tree(str(root))
-    assert result[OK] == [str(root / "ok.png")]
-    assert result[TRUNCATED] == [str(truncated)]
-    assert result[CORRUPT] == [str(corrupt)]
+    result = diagnose_tree(str(root))
+    assert [p for p, _ in result[OK]] == [str(root / "ok.png")]
+    assert [p for p, _ in result[TRUNCATED]] == [str(truncated)]
+    assert [p for p, _ in result[CORRUPT]] == [str(corrupt)]
+
+
+def test_diagnose_tree_explains_why(tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "ok.png")
+    truncated = root / "trunc.jpg"
+    _write_image(truncated, size=(400, 300))
+    _truncate(truncated, drop=225)
+
+    result = diagnose_tree(str(root))
+    why = dict(result[TRUNCATED])[str(truncated)]
+    # the caller can print something better than a bare status
+    assert "truncated" in why
+    assert "media-match check" in why
+    # a clean file gets no explanation, so nothing pointless is printed
+    assert dict(result[OK])[str(root / "ok.png")] == ""
 
 
 def test_repair_truncated_makes_it_loadable(tmp_path):

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import datetime, timezone
 
 from .db import Database, db_path_for, open_db
@@ -23,7 +24,9 @@ from .pipeline import (
     store_result,
 )
 from .analyze import describe_targets, run_describe_stage
-from .check import CORRUPT, OK, TRUNCATED, check_tree, quarantine, repair_truncated
+from .check import (
+    CORRUPT, NOTABLE, OK, TRUNCATED, diagnose_tree, quarantine, repair_truncated,
+)
 from .bootstrap import (
     consolidated_path, find_exact_duplicates, fixed_extension_path, walk_tree,
 )
@@ -34,6 +37,67 @@ from .video_groups import find_video_duplicate_groups, find_video_similarity_gro
 from .video_search import best_moment, format_timestamp
 
 _mp = lambda w, h: f"{w * h / 1_000_000:.1f}MP"
+
+# Per-category cap on how many affected files to name in one report; the
+# counts in the summary always cover every file.
+_REPORT_LIMIT = 20
+
+# Problems found during one scan/analyze run, grouped by reason so the user
+# sees one line per kind of problem instead of one line per file. Guarded by a
+# lock: the pipeline's worker threads report concurrently.
+_BAD_FILES: dict[str, list[str]] = {}
+_BAD_FILES_LOCK = threading.Lock()
+
+
+def _why(exc: Exception) -> str:
+    """Turn an exception or diagnosis into a sentence worth printing."""
+    from .diagnose import Diagnosis
+
+    if isinstance(exc, Diagnosis):
+        return exc.message
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
+def _diagnose_failure(path: str, exc: Exception) -> str:
+    """Describe why a file could not be indexed, in terms the user can act on."""
+    from .diagnose import OK, diagnose_image
+
+    if os.path.exists(path):
+        found = diagnose_image(path)
+        if found.status != OK:
+            return found.message
+    return _why(exc)
+
+
+def _report_bad_file(path: str, reason: str) -> None:
+    """Name the file and what is wrong with it, instead of leaking a traceback.
+
+    Pillow's own warnings carry a site-packages path and no filename; a
+    truncation or a malformed MPO is something the user can act on with
+    'media-match check', so it has to say which file and why.
+    """
+    with _BAD_FILES_LOCK:
+        _BAD_FILES.setdefault(reason, []).append(path)
+
+
+def _summarize_bad_files(root: str) -> None:
+    with _BAD_FILES_LOCK:
+        if not _BAD_FILES:
+            return
+        found = dict(_BAD_FILES)
+        _BAD_FILES.clear()
+    for reason, paths in found.items():
+        print(f"\n{len(paths)} file(s) could not be indexed: {reason}")
+        for path in paths[:_REPORT_LIMIT]:
+            try:
+                shown = os.path.relpath(path, root)
+            except ValueError:  # pragma: no cover - different drive on Windows
+                shown = path
+            print(f"  {shown}")
+        if len(paths) > _REPORT_LIMIT:
+            print(f"  ... and {len(paths) - _REPORT_LIMIT} more")
+        print(f"  diagnose with: media-match check {root}")
 
 
 def _dur(seconds: float) -> str:
@@ -207,7 +271,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     def on_error(path: str, exc: Exception) -> None:
         nonlocal errors
         errors += 1
-        print(f"  ERROR {path}: {exc}", file=sys.stderr)
+        _report_bad_file(path, exc)
 
     def on_result(result) -> None:
         nonlocal errors
@@ -232,6 +296,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         on_result=on_result, progress=progress, on_error=on_error,
         stats=scan_stats,
     )
+    _summarize_bad_files(root)
     # Accumulate this run's measured cost so `stats` can show it.
     db.record_scan(
         items=scan_stats.items, frames=scan_stats.frames,
@@ -1481,9 +1546,15 @@ def _confirm(prompt: str, *, yes: bool = False) -> bool:
 def cmd_check(args: argparse.Namespace) -> int:
     """Check which media files are loadable, and offer to repair them.
 
-    Truncated images are re-encoded (the original is kept as a backup); corrupt
-    files are moved to a quarantine folder. Both steps ask first in a terminal
-    and can be skipped with --yes (repair) / --quarantine (corrupt).
+    Every file that is not clean is named with the reason it was flagged and
+    what can be done about it:
+
+      * truncated -> re-encoded, the original kept as ``<name>.truncated``
+      * corrupt   -> moved to a quarantine folder (never deleted outright)
+      * notable   -> loads fine (malformed MPO, very large image); reported
+                     for information, no action taken
+
+    The two repairs ask first in a terminal and can be skipped with --yes.
     """
     from .config import load_ignore
 
@@ -1492,44 +1563,71 @@ def cmd_check(args: argparse.Namespace) -> int:
     include_video = args.video
 
     print(f"checking media under {root} ...")
-    result = check_tree(root, include_video=include_video, ignore=ignore)
-    ok, truncated, corrupt = result[OK], result[TRUNCATED], result[CORRUPT]
-    print(f"{len(ok)} ok, {len(truncated)} truncated, {len(corrupt)} corrupt")
+    result = diagnose_tree(root, include_video=include_video, ignore=ignore)
+    ok = result[OK]
+    truncated = result[TRUNCATED]
+    corrupt = result[CORRUPT]
+    notable = result[NOTABLE]
 
-    for path in truncated:
-        print(f"  truncated: {os.path.relpath(path, root)}")
-    for path in corrupt:
-        print(f"  corrupt:   {os.path.relpath(path, root)}")
+    print(f"{len(ok)} ok, {len(truncated)} truncated, {len(corrupt)} corrupt"
+          + (f", {len(notable)} notable" if notable else ""))
+
+    # Name the file and say what is wrong with it, rather than letting a
+    # Pillow warning print its own site-packages path.
+    for label, rows in (("truncated", truncated), ("corrupt", corrupt),
+                        ("notable", notable)):
+        for path, why in rows[:_REPORT_LIMIT]:
+            print(f"  {label}: {os.path.relpath(path, root)}")
+            if why:
+                print(f"      {why}")
+        if len(rows) > _REPORT_LIMIT:
+            print(f"  ... and {len(rows) - _REPORT_LIMIT} more {label} file(s)")
 
     if not truncated and not corrupt:
+        if notable:
+            print("\nnothing to repair — the notable files above all load fine.")
+        else:
+            print("\neverything is loadable; nothing to repair.")
         return 0
 
-    repaired = 0
-    if truncated and _confirm(
-            f"Repair {len(truncated)} truncated image(s)? "
-            f"(re-encodes them; originals kept as *.truncated)",
-            yes=args.yes):
-        for path in truncated:
-            outcome = repair_truncated(path)
-            print(f"  {os.path.relpath(path, root)}: {outcome}")
-            repaired += 1
+    repaired = failed = 0
+    if truncated:
+        print(f"\n{len(truncated)} file(s) can be repaired by re-encoding them "
+              f"(the readable part is kept, the original becomes <name>.truncated).")
+        if _confirm(f"Repair {len(truncated)} truncated image(s)?",
+                    yes=args.yes):
+            for path, _why in truncated:
+                rel = os.path.relpath(path, root)
+                try:
+                    print(f"  {rel}: {repair_truncated(path)}")
+                    repaired += 1
+                except Exception as exc:  # noqa: BLE001 - keep repairing the rest
+                    failed += 1
+                    print(f"  {rel}: FAILED: {exc}")
 
-    if corrupt and _confirm(
-            f"Quarantine {len(corrupt)} corrupt file(s)? "
-            f"(moves them to {os.path.join(root, args.quarantine)})",
-            yes=args.yes):
+    quarantined = 0
+    if corrupt:
         qdir = os.path.join(root, args.quarantine)
-        for path in corrupt:
-            dest = quarantine(path, qdir)
-            print(f"  {os.path.relpath(path, root)} -> {dest}")
+        print(f"\n{len(corrupt)} file(s) are unreadable and can be moved to "
+              f"{qdir} (never deleted outright).")
+        if _confirm(f"Quarantine {len(corrupt)} corrupt file(s)?", yes=args.yes):
+            for path, _why in corrupt:
+                rel = os.path.relpath(path, root)
+                try:
+                    print(f"  {rel} -> {quarantine(path, qdir)}")
+                    quarantined += 1
+                except Exception as exc:  # noqa: BLE001 - keep going
+                    failed += 1
+                    print(f"  {rel}: FAILED: {exc}")
 
-    print(f"done: {len(ok)} ok, {repaired} repaired, "
+    print(f"\ndone: {len(ok)} ok, {repaired} repaired, "
           f"{len(truncated) - repaired} still truncated, "
-          f"{len(corrupt)} corrupt (quarantined)")
-    # after repairs/quarantine the index may be stale; hint at the fix
-    if repaired or corrupt:
+          f"{quarantined}/{len(corrupt)} corrupt quarantined"
+          + (f", {len(notable)} notable (no action needed)" if notable else "")
+          + (f", {failed} failed" if failed else ""))
+    if repaired or quarantined:
         print("run 'media-match scan --prune' to sync the index")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
@@ -1593,7 +1691,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     def on_error(path: str, exc: Exception) -> None:
         nonlocal errors
         errors += 1
-        print(f"  ERROR {path}: {exc}", file=sys.stderr)
+        # Explain it in the file's terms where we can: an unreadable image is
+        # "truncated, check can repair it", not "UnidentifiedImageError".
+        _report_bad_file(path, _diagnose_failure(path, exc))
 
     def on_result(result) -> None:
         nonlocal errors
@@ -1618,6 +1718,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         on_result=on_result, progress=progress, on_error=on_error,
         stats=scan_stats,
     )
+    _summarize_bad_files(root)
     db.record_scan(
         items=scan_stats.items, frames=scan_stats.frames,
         bytes_read=scan_stats.bytes_read, wall=scan_stats.wall,
@@ -2116,7 +2217,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.21"
+_VERSION = "0.2.22"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"

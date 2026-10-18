@@ -216,6 +216,26 @@ Ignored paths are skipped by `scan` and dropped by `scan --prune`.
 .venv/bin/media-match bootstrap ~/Downloads --media-only --move-to ~/non-media --yes
 ```
 
+Damaged files are reported by name, not as a wall of Pillow warnings. `scan`
+groups what it could not index by cause and points at `check`; `check` then
+names each file with the reason and what can be done about it:
+
+```
+$ media-match check ~/Pictures
+2 ok, 1 truncated, 1 corrupt, 1 notable
+  truncated: IMG_0042.jpg
+      truncated file — 640x480 header intact but the pixel data ends early; 'media-match check' can re-encode it
+  corrupt:   2019-07/scan.mov
+      ffmpeg could not read it: moov atom not found
+  notable:   Sunset.mpo
+      malformed MPO container, read as a plain JPEG — the image itself is fine
+```
+
+`truncated` is repaired by re-encoding (the original is kept as
+`<name>.truncated`) and `corrupt` is moved to `.media-match-quarantine` — both
+only with `--yes` or a confirmation. `notable` files are never modified: they
+load correctly, so acting on them would damage good photos.
+
 > **Quote paths that contain spaces or shell metacharacters** (`&`, `$`, `;`,
 > quotes, `…`). The program handles them fine, but an *unquoted* `&` makes the
 > shell split the command in two, so it fails with "no such file or directory"
@@ -245,7 +265,7 @@ Group 1 (2 files)
 | `import-metadata [root] FILE` | import description/keywords/type from a JSON or CSV file (as written by `export-metadata`) | `--kind`, `--fields` |
 | `export-metadata [root]` | export editable metadata (kind, path, description, keywords, type) as JSON — round-trips with `import-metadata` | `--kind`, `--out` |
 | `reset [root]` | delete the index database (media files are never touched); the next `scan` rebuilds from scratch | `--yes` |
-| `check [root]` | classify every file as ok / truncated / corrupt; offer to re-encode truncated images (backup kept) and quarantine corrupt ones | `--video`, `--quarantine`, `--yes` |
+| `check [root]` | name every file that is not clean and say why: truncated (re-encodable), corrupt (quarantinable), or notable (loads fine — a malformed MPO container, a very large image — reported, never touched) | `--video`, `--quarantine`, `--yes` |
 | `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index. Dry-run by default; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--move-to DIR` moves the non-media files out instead of trashing them, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--move-to`, `--fix-extensions`, `--video`, `--yes` |
 | `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--json`, `--limit` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--json` |

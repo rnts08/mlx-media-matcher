@@ -211,32 +211,52 @@ def prune_missing(root: str, db: Database, *, include_video: bool,
     return len(stale_files) + len(stale_videos)
 
 
-def _open_image_tolerant(path: str):
+def load_image_tolerant(source):
     """Open and fully decode an image, tolerating truncated files.
 
-    Returns a loaded PIL.Image (the caller owns it and must ``close()`` it).
-    Raises OSError/ValueError if the file cannot be identified or decoded at
-    all — those are corrupt, not merely truncated.
+    ``source`` is anything ``Image.open`` accepts — a path or a binary stream
+    (the staged pipeline reads bytes into its ring buffer first). Returns a
+    loaded PIL.Image; the caller owns it and must ``close()`` it. Raises
+    OSError/ValueError if the file cannot be identified or decoded at all,
+    which means corrupt rather than merely truncated.
+
+    Pillow's warnings (truncated reads, malformed MPO, decompression bombs) are
+    captured rather than printed: they carry a site-packages path and no
+    filename, which is noise in a scan of thousands of files. ``diagnose.py``
+    turns the same warnings into a sentence the CLI can print per file.
     """
+    import warnings
+
     from PIL import Image, ImageFile
 
+    def _open():
+        previous = ImageFile.LOAD_TRUNCATED_IMAGES
+        try:
+            # The flag is global, but racing the other worker threads is
+            # benign: tolerance only affects files that are already truncated.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                img = Image.open(source)
+                img.load()
+            return img
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = previous
+
     try:
-        img = Image.open(path)
-        img.load()
-        return img
+        return _open()
     except (OSError, IOError, ValueError):
         pass
-    # the file may be truncated; retry with PIL's truncation tolerance. The
-    # flag is global, but the race with other threads is benign: tolerance
-    # only affects files that are already truncated.
-    previous = ImageFile.LOAD_TRUNCATED_IMAGES
+    # the file may be truncated; retry with PIL's truncation tolerance
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     try:
-        img = Image.open(path)
-        img.load()
-        return img
+        return _open()
     finally:
-        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+
+def _open_image_tolerant(path: str):
+    """``load_image_tolerant`` for a path on disk (kept for callers/tests)."""
+    return load_image_tolerant(path)
 
 
 def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
@@ -276,6 +296,11 @@ def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
         phashes=phashes, arrays=arrays, timestamps=timestamps,
         video_meta=meta, signature=min(phashes) if phashes else "",
     )
+
+
+# Sentinel a CPU worker puts on the batch queue when it has finished, so the
+# main loop can tell "nothing left" from "nothing has arrived yet".
+_DONE = object()
 
 
 @dataclass
@@ -325,6 +350,10 @@ class RingBuffer:
             self._not_empty.notify_all()
             self._not_full.notify_all()
 
+    @property
+    def closed(self) -> bool:
+        return self._done
+
     def __len__(self) -> int:
         return self._q.qsize()
 
@@ -359,6 +388,7 @@ def run_staged_scan(
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
+    reader_count = max(1, io_workers)
     emitted = 0
     clear_every = 200
     ring = RingBuffer(max_bytes=ring_bytes)
@@ -366,9 +396,31 @@ def run_staged_scan(
     results_queue: queue.Queue = queue.Queue()
 
     # -- stage 1: reader threads fill the ring buffer from disk
+    #
+    # Only the *last* reader to finish closes the ring. Closing it from each
+    # reader's own finally block was a silent data race: with io_workers > 1
+    # the first thread to finish set _done, so a CPU worker that had not yet
+    # pulled its item saw an empty-but-closed buffer and raised EOFError,
+    # dropping the file without an error. The scan just under-counted.
+    readers_left = reader_count
+    readers_lock = threading.Lock()
+    # One shared cursor, not one copy of the list per reader: with more than
+    # one reader thread every reader used to walk the whole list, so each file
+    # was read and decoded reader_count times.
+    cursor = iter(jobs)
+    cursor_lock = threading.Lock()
+
+    def next_job():
+        with cursor_lock:
+            return next(cursor, None)
+
     def reader() -> None:
+        nonlocal readers_left
         try:
-            for job in jobs:
+            while True:
+                job = next_job()
+                if job is None:
+                    return
                 try:
                     with open(job.path, "rb") as fh:
                         data = fh.read()
@@ -376,7 +428,11 @@ def run_staged_scan(
                 except OSError:
                     continue
         finally:
-            ring.close()
+            with readers_lock:
+                readers_left -= 1
+                last = readers_left == 0
+            if last:
+                ring.close()
 
     # -- stage 2: CPU workers decode/preprocess from the ring buffer
     def cpu_worker() -> None:
@@ -384,6 +440,10 @@ def run_staged_scan(
             try:
                 path, data = ring.get()
             except EOFError:
+                # Signal that this worker is finished. It goes *after* every
+                # result this worker produced, so the main loop can rely on
+                # FIFO order to know that no result is still in flight.
+                batch_queue.put(_DONE)
                 return
             # reconstruct a ScanJob from the path
             job = next((j for j in jobs if j.path == path), None)
@@ -398,9 +458,10 @@ def run_staged_scan(
                     on_error(job.path, exc)
 
     # -- stage 3: main thread batches and embeds on the GPU
-    readers = [threading.Thread(target=reader) for _ in range(max(1, io_workers))]
-    cpus = ThreadPoolExecutor(max_workers=max(1, workers))
-    cpu_futures = [cpus.submit(cpu_worker) for _ in range(max(1, workers))]
+    readers = [threading.Thread(target=reader) for _ in range(reader_count)]
+    worker_count = max(1, workers)
+    cpus = ThreadPoolExecutor(max_workers=worker_count)
+    cpu_futures = [cpus.submit(cpu_worker) for _ in range(worker_count)]
 
     for t in readers:
         t.start()
@@ -453,31 +514,41 @@ def run_staged_scan(
         if progress is not None:
             progress(emitted, len(jobs), result.job.path)
 
-    # feed batch_queue into the GPU loop
-    active = True
-    while active or pending:
-        # refill batch
-        while len(batch) < batch_size:
-            try:
-                result = batch_queue.get_nowait()
-            except queue.Empty:
-                break
-            owner = next_owner
-            next_owner += 1
-            pending[owner] = result
-            owners[owner] = [None] * len(result.arrays)
-            remaining[owner] = len(result.arrays)
-            for frame, array in enumerate(result.arrays):
-                batch.append((owner, frame, array))
-            if len(batch) >= batch_size:
+    # Feed batch_queue into the GPU loop.
+    #
+    # Termination keys off the CPU workers' _DONE sentinels, not off the reader
+    # threads being finished. A reader finishing says nothing about whether a
+    # worker is still mid-decode, and the old `any(t.is_alive() for t in
+    # readers)` check exited early and silently dropped results in flight. Each
+    # worker queues its sentinel after its last result, so FIFO order means all
+    # worker_done sentinels seen => every result has already arrived.
+    workers_done = 0
+    while True:
+        try:
+            item = batch_queue.get(timeout=0.5)
+        except queue.Empty:
+            if workers_done >= worker_count:
+                break  # every worker is finished and the queue is empty
+            continue
+        if item is _DONE:
+            workers_done += 1
+            # The last worker is done, so nothing more can arrive: embed
+            # whatever partial batch is left over rather than waiting for it
+            # to reach batch_size, which would hang forever on a short tail.
+            if workers_done >= worker_count and batch:
                 flush()
-        if batch:
+            continue
+        owner = next_owner
+        next_owner += 1
+        pending[owner] = item
+        owners[owner] = [None] * len(item.arrays)
+        remaining[owner] = len(item.arrays)
+        for frame, array in enumerate(item.arrays):
+            batch.append((owner, frame, array))
+        if len(batch) >= batch_size:
             flush()
-        if not pending and batch_queue.empty():
-            # check if readers/CPUs are done
-            active = any(t.is_alive() for t in readers) or not ring._q.empty()
-            if not active:
-                break
+    if batch:
+        flush()
 
     cpus.shutdown(wait=True)
     for t in readers:
@@ -495,11 +566,12 @@ def _prepare_bytes(job: ScanJob, data: bytes, *, interval: float,
     """Prepare a job from raw bytes (no disk read)."""
     import io
 
-    from PIL import Image
-
     sha1 = hashlib.sha1(data).hexdigest()
     if job.kind == "image":
-        img = Image.open(io.BytesIO(data))
+        # Tolerate truncation here too: the staged pipeline replaced this with
+        # a raw Image.open(io.BytesIO(...)) and silently dropped every
+        # truncated file, which the sequential path had always indexed.
+        img = load_image_tolerant(io.BytesIO(data))
         with img:
             img.load()
             width, height = img.size

@@ -20,52 +20,35 @@ from __future__ import annotations
 import os
 import shutil
 
+from .diagnose import CORRUPT, NOTABLE, OK, TRUNCATED, diagnose_image
 from .pipeline import IMAGE_EXTENSIONS, iter_media
-
-# what _check_image returns
-OK = "ok"
-TRUNCATED = "truncated"
-CORRUPT = "corrupt"
 
 
 def check_image(path: str) -> str:
-    """Classify one image file: 'ok', 'truncated' or 'corrupt'.
+    """Classify one image file: 'ok', 'truncated', 'corrupt' or 'notable'.
 
     'truncated' means PIL needs ``LOAD_TRUNCATED_IMAGES`` to decode it — the
     file is damaged but the recoverable part is usable. 'corrupt' means PIL
-    cannot identify or decode the file at all.
+    cannot identify or decode the file at all. 'notable' means the file loads
+    fine but Pillow flagged it (a malformed MPO container, an image past its
+    decompression-bomb limit); it is reported, never repaired.
     """
-    from PIL import Image, ImageFile
-
-    try:
-        with Image.open(path) as img:
-            img.load()
-        return OK
-    except (OSError, IOError, ValueError):
-        pass
-    previous = ImageFile.LOAD_TRUNCATED_IMAGES
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-    try:
-        with Image.open(path) as img:
-            img.load()
-        return TRUNCATED
-    except (OSError, IOError, ValueError):
-        return CORRUPT
-    finally:
-        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+    return diagnose_image(path).status
 
 
-def check_tree(root: str, *, include_video: bool = False,
-               ignore: list[str] | None = None) -> dict[str, list[str]]:
+def diagnose_tree(root: str, *, include_video: bool = False,
+                  ignore: list[str] | None = None) -> dict[str, list[tuple[str, str]]]:
     """Classify every image (and, optionally, video) under ``root``.
 
-    Returns ``{"ok": [...], "truncated": [...], "corrupt": [...]}`` with
-    absolute paths, in tree order.
+    Returns ``{"ok": [...], "truncated": [...], ...}`` as
+    ``(absolute_path, explanation)`` pairs, in tree order.
     """
     from .config import is_ignored
 
     ignore = ignore or []
-    out: dict[str, list[str]] = {OK: [], TRUNCATED: [], CORRUPT: []}
+    out: dict[str, list[tuple[str, str]]] = {
+        OK: [], TRUNCATED: [], CORRUPT: [], NOTABLE: [],
+    }
     for kind, path in iter_media(root, include_video, ignore=ignore):
         if kind == "video":
             # videos are probed with ffmpeg during the scan; a file that
@@ -74,11 +57,12 @@ def check_tree(root: str, *, include_video: bool = False,
 
             try:
                 probe(path)
-                out[OK].append(path)
-            except Exception:  # noqa: BLE001 - any probe failure is corrupt
-                out[CORRUPT].append(path)
+                out[OK].append((path, ""))
+            except Exception as exc:  # noqa: BLE001 - any probe failure is corrupt
+                out[CORRUPT].append((path, f"ffprobe cannot read it: {exc}"))
             continue
-        out[check_image(path)].append(path)
+        found = diagnose_image(path)
+        out[found.status].append((path, found.message))
     return out
 
 
@@ -90,29 +74,35 @@ def repair_truncated(path: str, *, backup_suffix: str = ".truncated") -> str:
     """
     import tempfile
 
+    import warnings
+
     from PIL import Image, ImageFile
 
     backup = path + backup_suffix
     if os.path.exists(backup):
         return f"backup exists, skipped: {backup}"
 
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-    try:
-        with Image.open(path) as img:
-            img.load()
-            # re-encode from the decoded pixels; the truncated tail is lost
-            # but the file becomes complete and loadable. Write to a temp
-            # file first so the original is never at risk.
-            fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(path)[1],
-                                       dir=os.path.dirname(path))
-            os.close(fd)
-            try:
-                img.save(tmp)
-            except Exception:
-                os.unlink(tmp)
-                raise
-    finally:
-        ImageFile.LOAD_TRUNCATED_IMAGES = False
+    # Re-encoding is *supposed* to read a truncated file, so the warning it
+    # provokes is expected and would only confuse the user.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        try:
+            with Image.open(path) as img:
+                img.load()
+                # re-encode from the decoded pixels; the truncated tail is lost
+                # but the file becomes complete and loadable. Write to a temp
+                # file first so the original is never at risk.
+                fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(path)[1],
+                                           dir=os.path.dirname(path))
+                os.close(fd)
+                try:
+                    img.save(tmp)
+                except Exception:
+                    os.unlink(tmp)
+                    raise
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = False
     os.replace(path, backup)
     os.replace(tmp, path)
     return f"repaired (backup: {backup})"

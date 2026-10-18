@@ -83,6 +83,60 @@ def test_run_scan_bounded_window_processes_all(tmp_path):
     assert encoder.calls == 4  # ceil(10/3)
 
 
+def test_staged_scan_indexes_every_file_at_every_thread_count(tmp_path):
+    # Three bugs lived here at once, each losing or duplicating files
+    # silently rather than erroring: every reader thread walked the whole job
+    # list (so io_workers>1 indexed everything io_workers times); each reader
+    # closed the ring buffer in its own finally (so the first one to finish
+    # closed it under the others); and the GPU loop stopped on the reader
+    # threads finishing rather than on the CPU workers being done (so results
+    # still being decoded were dropped).
+    from media_match.pipeline import run_staged_scan
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    for i in range(11):
+        _write_image(root / f"{i}.png", color=(i * 20, 10, 10))
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+    assert len(jobs) == 11
+
+    for io_workers in (1, 2, 4):
+        for workers in (1, 3):
+            for batch_size in (1, 4, 16):
+                encoder = FakeEncoder()
+                collected = []
+                n = run_staged_scan(
+                    jobs, encoder, interval=1.0, max_frames=120,
+                    batch_size=batch_size, workers=workers,
+                    io_workers=io_workers, on_result=collected.append,
+                )
+                assert n == 11, f"io={io_workers} cpu={workers} b={batch_size}"
+                assert len(collected) == 11, f"io={io_workers} cpu={workers}"
+                # no file processed twice
+                paths = [r.job.path for r in collected]
+                assert len(set(paths)) == 11, f"duplicated work: io={io_workers}"
+
+
+def test_staged_scan_reports_errors_per_file(tmp_path):
+    from media_match.pipeline import run_staged_scan
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    _write_image(root / "good.png")
+    (root / "bad.png").write_bytes(b"not an image")
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+
+    errors = []
+    n = run_staged_scan(
+        jobs, FakeEncoder(), interval=1.0, max_frames=120, batch_size=2,
+        workers=2, io_workers=2, on_error=lambda p, e: errors.append(p),
+    )
+    assert n == 1  # the good one still indexed
+    assert errors == [str(root / "bad.png")]
+
+
 def test_run_scan_failed_batch_keeps_frame_alignment(tmp_path):
     root = tmp_path / "tree"
     root.mkdir()
