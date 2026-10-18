@@ -17,6 +17,9 @@ from .groups import find_duplicate_groups, find_similarity_groups
 from .pipeline import ScanStats, build_jobs, prune_missing, run_scan, store_result
 from .analyze import describe_targets, run_describe_stage
 from .check import CORRUPT, OK, TRUNCATED, check_tree, quarantine, repair_truncated
+from .bootstrap import (
+    consolidated_path, find_exact_duplicates, fixed_extension_path, walk_tree,
+)
 from .tags import facet_of, refine
 from .vision import DEFAULT_MODEL
 from .clip import DEFAULT_CLIP_MODEL
@@ -1289,6 +1292,162 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """First pass over a tree: walk it, record filename/type/size in the index.
+
+    Dry-run by default — builds the database but touches no files. Add
+    --prune to trash exact duplicates (keeping the newest), --media-only to
+    prune non-media files and consolidate extensions, and --fix-extensions
+    (with --media-only) to add/update missing extensions.
+    """
+    from .config import load_ignore
+
+    root = os.path.abspath(args.root)
+    ignore = load_ignore(root)
+
+    # Walk the whole tree (not just media) so --media-only can see the rest.
+    rows = walk_tree(root, include_video=args.video, ignore=ignore)
+    db = Database(db_path_for(root, args.db))
+    db.replace_bootstrap(rows)
+
+    counts: dict[str, int] = {}
+    for _path, _size, _mtime, _ext, kind in rows:
+        counts[kind] = counts.get(kind, 0) + 1
+    n_img = counts.get("image", 0)
+    n_vid = counts.get("video", 0)
+    n_aud = counts.get("audio", 0)
+    n_other = counts.get("other", 0)
+    print(f"indexed {len(rows)} file(s): {n_img} image(s), {n_vid} video(s), "
+          f"{n_aud} audio, {n_other} other")
+    if n_other:
+        print(f"({n_other} non-media file(s) — use --media-only to prune them)")
+
+    # --prune: find exact duplicates, keep newest, trash the rest
+    pruned = 0
+    trashed_paths: set[str] = set()
+    if args.prune:
+        groups = find_exact_duplicates(rows)
+        to_trash = [rows[i][0] for g in groups for i in g[1:]]
+        if to_trash:
+            print(f"\n{len(groups)} duplicate group(s): "
+                  f"{len(to_trash)} file(s) to trash (keeping the newest of each)")
+            for g in groups:
+                keep = rows[g[0]]
+                print(f"  keep {os.path.relpath(keep[0], root)}")
+                for i in g[1:]:
+                    print(f"    trash {os.path.relpath(rows[i][0], root)}")
+            if args.yes or _confirm(f"Trash {len(to_trash)} duplicate file(s)?"):
+                from .cleanup import trash_files
+
+                class _Rec:
+                    def __init__(self, p):
+                        self.path = p
+
+                trashed, failed = trash_files([_Rec(p) for p in to_trash])
+                pruned = len(trashed)
+                trashed_paths = {r.path for r in trashed}
+                for f in failed:
+                    print(f"  FAILED {f.path}")
+                print(f"trashed {pruned} duplicate file(s)")
+        else:
+            print("\nno exact duplicates found")
+
+    # --media-only: fix extensions first, then consolidate, then prune non-media.
+    # Fixing must come first: an extensionless JPEG is classified "other" until
+    # its extension is added, so pruning first would delete it.
+    renamed = 0
+    if args.media_only:
+        from .bootstrap import canonical_extension
+
+        def _needs_fix(r):
+            ext = os.path.splitext(r[0])[1]
+            return not ext or canonical_extension(ext) is None
+
+        fixes = []
+        if args.fix_extensions:
+            fixes = [(r[0], fixed_extension_path(r[0])) for r in rows
+                     if _needs_fix(r) and fixed_extension_path(r[0])
+                     and r[0] not in trashed_paths]
+        consolidations = [(r[0], consolidated_path(r[0])) for r in rows
+                          if r[4] != "other" and consolidated_path(r[0])
+                          and r[0] not in trashed_paths]
+
+        # after fixing, recompute what is non-media (fixes may promote files)
+        fixed_paths = {old: new for old, new in fixes}
+        non_media = [r[0] for r in rows
+                     if r[4] == "other" and r[0] not in fixed_paths]
+
+        if fixes:
+            print(f"\n{len(fixes)} file(s) to fix missing extensions:")
+            for old, new in fixes[:20]:
+                print(f"  {os.path.relpath(old, root)} -> {os.path.basename(new)}")
+            if len(fixes) > 20:
+                print(f"  ... and {len(fixes) - 20} more")
+        if consolidations:
+            print(f"\n{len(consolidations)} file(s) to consolidate extensions:")
+            for old, new in consolidations[:20]:
+                print(f"  {os.path.relpath(old, root)} -> {os.path.basename(new)}")
+            if len(consolidations) > 20:
+                print(f"  ... and {len(consolidations) - 20} more")
+        if non_media:
+            print(f"\n{len(non_media)} non-media file(s) to prune:")
+            for p in non_media[:20]:
+                print(f"  {os.path.relpath(p, root)}")
+            if len(non_media) > 20:
+                print(f"  ... and {len(non_media) - 20} more")
+
+        total_ops = len(non_media) + len(consolidations) + len(fixes)
+        if total_ops and (args.yes or _confirm(
+                f"Apply {total_ops} file operation(s) "
+                f"({len(fixes)} fix, {len(consolidations)} consolidate, "
+                f"{len(non_media)} prune)?")):
+            from .cleanup import trash_files
+
+            class _Rec:
+                def __init__(self, p):
+                    self.path = p
+
+            # 1. fix missing extensions first (may promote files out of "other")
+            for old, new in fixes:
+                try:
+                    os.rename(old, new)
+                    renamed += 1
+                except OSError as exc:
+                    print(f"  FAILED {old}: {exc}")
+            # 2. consolidate extensions to canonical form
+            for old, new in consolidations:
+                try:
+                    os.rename(old, new)
+                    renamed += 1
+                except OSError as exc:
+                    print(f"  FAILED {old}: {exc}")
+            # 3. prune non-media files (after fixes, so promoted files survive)
+            if non_media:
+                trashed, failed = trash_files([_Rec(p) for p in non_media])
+                for f in failed:
+                    print(f"  FAILED {f.path}")
+                print(f"pruned {len(trashed)} non-media file(s)")
+            print(f"renamed {renamed} file(s)")
+            # refresh the index so paths match the new filenames
+            rows = walk_tree(root, include_video=args.video, ignore=ignore)
+            db.replace_bootstrap(rows)
+            print("index refreshed")
+
+    db.close()
+    return 0
+
+
+def _confirm(prompt: str, *, yes: bool = False) -> bool:
+    """Ask for confirmation; --yes or non-interactive means no."""
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        print(prompt, "(not a terminal — skipping)")
+        return False
+    answer = input(prompt + " [y/N] ")
+    return answer.strip().lower() in ("y", "yes")
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Check which media files are loadable, and offer to repair them.
 
@@ -1315,19 +1474,11 @@ def cmd_check(args: argparse.Namespace) -> int:
     if not truncated and not corrupt:
         return 0
 
-    def _confirm(prompt: str) -> bool:
-        if args.yes:
-            return True
-        if not sys.stdin.isatty():
-            print(prompt, "(not a terminal — skipping)")
-            return False
-        answer = input(prompt + " [y/N] ")
-        return answer.strip().lower() in ("y", "yes")
-
     repaired = 0
     if truncated and _confirm(
             f"Repair {len(truncated)} truncated image(s)? "
-            f"(re-encodes them; originals kept as *.truncated)"):
+            f"(re-encodes them; originals kept as *.truncated)",
+            yes=args.yes):
         for path in truncated:
             outcome = repair_truncated(path)
             print(f"  {os.path.relpath(path, root)}: {outcome}")
@@ -1335,7 +1486,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if corrupt and _confirm(
             f"Quarantine {len(corrupt)} corrupt file(s)? "
-            f"(moves them to {os.path.join(root, args.quarantine)})"):
+            f"(moves them to {os.path.join(root, args.quarantine)})",
+            yes=args.yes):
         qdir = os.path.join(root, args.quarantine)
         for path in corrupt:
             dest = quarantine(path, qdir)
@@ -1896,6 +2048,7 @@ _COMMAND_SUMMARIES = {
     "clear-metadata": "clear description, keywords, type and tags",
     "reset": "delete the index database (media files are never touched)",
     "check": "check which media files are loadable, and offer to repair them",
+    "bootstrap": "first pass: walk the tree, record filename/type/size in the index",
     "stats": "show index statistics (media, compute, formats)",
     "about": "show what this program does, its license and project links",
     "version": "print version, license and author",
@@ -1923,6 +2076,7 @@ _EXAMPLES = {
     "clear-metadata": "media-match clear-metadata ~/Pictures --yes",
     "reset": "media-match reset ~/Pictures --yes",
     "check": "media-match check ~/Pictures",
+    "bootstrap": "media-match bootstrap ~/Pictures --video",
     "stats": "media-match stats ~/Pictures",
     "about": "media-match about",
     "version": "media-match version",
@@ -2645,6 +2799,34 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("--yes", action="store_true",
                          help="repair/quarantine without asking")
     p_check.set_defaults(func=cmd_check)
+
+    p_bootstrap = sub.add_parser(
+        "bootstrap",
+        help="first pass: walk the tree, record filename/type/size in the index",
+        description=(
+            "Walk the whole tree and record every file's name, type and size in "
+            "the index — no decoding or hashing, so it is fast. Dry-run by "
+            "default: builds the database but touches no files. Add --prune to "
+            "trash exact duplicates (keeping the newest), --media-only to prune "
+            "non-media files and consolidate extensions, and --fix-extensions "
+            "(with --media-only) to add/update missing extensions. Works for "
+            "images and videos."
+        ),
+    )
+    _add_common(p_bootstrap)
+    p_bootstrap.add_argument("--prune", action="store_true",
+                             help="trash exact duplicates, keeping the newest version")
+    p_bootstrap.add_argument("--media-only", action="store_true",
+                             help="prune non-media files and consolidate extensions "
+                                  "to canonical form (.jpeg -> .jpg, etc.)")
+    p_bootstrap.add_argument("--fix-extensions", action="store_true",
+                             help="with --media-only: detect and add/update missing "
+                                  "extensions (e.g. IMG_1234 -> IMG_1234.jpg)")
+    p_bootstrap.add_argument("--video", action="store_true",
+                             help="include videos (probed with ffprobe)")
+    p_bootstrap.add_argument("--yes", action="store_true",
+                             help="execute file operations without asking")
+    p_bootstrap.set_defaults(func=cmd_bootstrap)
 
     p_export = sub.add_parser(
         "export",

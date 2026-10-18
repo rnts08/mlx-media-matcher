@@ -107,6 +107,17 @@ CREATE TABLE IF NOT EXISTS trash_log (
     trashed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_trash_batch ON trash_log(batch);
+
+-- Lightweight first-pass index: path/size/mtime/ext/kind only, no hashes or
+-- embeddings. Populated by `bootstrap`; `scan` later fills in the full rows.
+CREATE TABLE IF NOT EXISTS bootstrap (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    size INTEGER NOT NULL,
+    mtime REAL NOT NULL,
+    ext TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'other'
+);
 """
 
 
@@ -1109,6 +1120,28 @@ class Database:
 
     def close(self) -> None:
         self.conn.close()
+
+    # -- bootstrap (lightweight first pass) ----------------------------------
+
+    def replace_bootstrap(self, rows: list[tuple[str, int, float, str, str]]) -> None:
+        """Replace the whole bootstrap index with ``(path, size, mtime, ext, kind)``."""
+        self.conn.execute("DELETE FROM bootstrap")
+        self.conn.executemany(
+            "INSERT INTO bootstrap(path, size, mtime, ext, kind) VALUES(?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def all_bootstrap(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM bootstrap ORDER BY path"
+        ).fetchall()
+
+    def bootstrap_counts(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM bootstrap GROUP BY kind"
+        ).fetchall()
+        return {r["kind"]: r["n"] for r in rows}
 
 
 def db_path_for(root: str, override: str | None = None) -> str:

@@ -13,7 +13,7 @@ naturally against the work that produced it.
 
 ## 0.2.x — video support
 
-- **0.2.20** feat: `analyze` — one integrated pass (scan + describe + refine + classify) over images and videos with a GPU-fed pipeline; `describe` command; `clear-metadata`/`import-metadata`/`export-metadata` round-trip; `reset` command; `check` command (classify ok/truncated/corrupt, interactive repair); fix `--describe` without `--model` failing every caption with `Path(None)`; scan tolerates truncated images; periodic MLX cache release on long runs
+- **0.2.20** feat: `analyze` — one integrated pass (scan + describe + refine + classify) over images and videos with a GPU-fed pipeline; `describe` command; `clear-metadata`/`import-metadata`/`export-metadata` round-trip; `reset` command; `check` command (classify ok/truncated/corrupt, interactive repair); `bootstrap` command (dry-run first pass; `--prune`/`--media-only`/`--fix-extensions`); extension consolidation rolled into `bootstrap --media-only`; fix `--describe` without `--model` failing every caption with `Path(None)`; scan tolerates truncated images; periodic MLX cache release on long runs
 - **0.2.18** feat: `~/.config/media-match/config.toml` defaults and `.media-matchignore` globs
 - **0.2.17** feat: `--json` output for `search`, `tags`, `stats`, `similar` and `clean --dry-run`
 - **0.2.16** feat: `export` the index to JSON, CSV or Markdown

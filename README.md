@@ -218,6 +218,7 @@ Group 1 (2 files)
 | `export-metadata [root]` | export editable metadata (kind, path, description, keywords, type) as JSON — round-trips with `import-metadata` | `--kind`, `--out` |
 | `reset [root]` | delete the index database (media files are never touched); the next `scan` rebuilds from scratch | `--yes` |
 | `check [root]` | classify every file as ok / truncated / corrupt; offer to re-encode truncated images (backup kept) and quarantine corrupt ones | `--video`, `--quarantine`, `--yes` |
+| `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index. Dry-run by default; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--fix-extensions`, `--video`, `--yes` |
 | `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--json`, `--limit` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--json` |
 | `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
