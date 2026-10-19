@@ -364,7 +364,7 @@ duplicates, cleaning them up, and undoing that
 
 | Command | What it does | Key options |
 |---|---|---|
-| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (group only distance-0 matches; faster), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
+| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (distance-0 matches only; ignores `--threshold`), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--json` (with `--dry-run`) |
 | `restore [root]` | list what `clean` moved to the system Trash and move it back on confirmation (best-effort: the OS Trash may have renamed a colliding name) | `--batch`, `--limit`, `--dry-run`, `--yes` |
 
@@ -414,6 +414,11 @@ version. Each video is reduced to ~1 keyframe per second (capped for long
 clips), embedded with CLIP for search and matched by keyframe pHash for
 grouping. See `docs/video-spike.md` for the sampling and matching design and
 the scan-pipeline measurements.
+
+Videos need `ffmpeg` and `ffprobe` on `PATH`. A video the pipeline cannot read
+is reported with ffmpeg's own reason ("moov atom not found", and so on), not
+with an image error — check `media-match check --video` on the same folder to
+separate broken files from a missing tool.
 
 ## Goal
 

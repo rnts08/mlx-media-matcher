@@ -2268,7 +2268,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.26"
+_VERSION = "0.2.27"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -2991,7 +2991,7 @@ def main(argv: list[str] | None = None) -> int:
                             "(default: 8, or config 'threshold')")
     p_dup.add_argument("--exact-phash", action="store_true",
                        help="group files that share the exact same phash "
-                            "(Hamming distance = 0; faster than general threshold)")
+                            "(Hamming distance = 0; ignores --threshold)")
     p_dup.add_argument("--frame-threshold", type=int, default=12,
                        help="max keyframe pHash hamming distance for videos (default: 12)")
     p_dup.add_argument("--ratio", type=float, default=0.6,
