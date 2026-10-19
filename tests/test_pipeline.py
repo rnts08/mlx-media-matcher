@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -232,6 +234,50 @@ def test_run_scan_failed_batch_keeps_frame_alignment(tmp_path):
     assert embedded == 2
     # positional alignment is preserved for every result
     assert all(len(r.vectors) == 1 for r in collected)
+
+
+@requires_ffmpeg
+def test_staged_scan_indexes_a_video(tmp_path, make_video):
+    """A video must survive the staged pipeline, not just the old run_scan.
+
+    This is the test whose absence let a whole video library fail silently:
+    _prepare_bytes lost its `from PIL import Image` when the image branch
+    moved to load_image_tolerant, so every video raised NameError on
+    Image.fromarray. run_scan still worked, its test still passed, and the
+    staged path -- the one every scan actually uses -- indexed nothing.
+    """
+    from media_match.pipeline import ScanJob, run_staged_scan
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    src = make_video("clip.mp4", seconds=3.0)
+    (root / "clip.mp4").write_bytes(open(src, "rb").read())
+
+    job = ScanJob(kind="video", path=str(root / "clip.mp4"),
+                  size=os.path.getsize(str(root / "clip.mp4")),
+                  mtime=os.path.getmtime(str(root / "clip.mp4")))
+    data = open(job.path, "rb").read()
+
+    # The unit under test: decoding frames from bytes must not NameError.
+    from media_match.pipeline import _prepare_bytes
+
+    result = _prepare_bytes(job, data, interval=1.0, max_frames=120)
+    assert result.arrays, "no frames extracted"
+    assert result.width > 0 and result.height > 0
+    assert result.video_meta is not None and result.video_meta.duration > 0
+
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=True, reanalyze=True)
+    collected = []
+    errors = []
+    assert run_staged_scan(jobs, FakeEncoder(), interval=1.0, max_frames=120,
+                           batch_size=4, workers=2, on_result=collected.append,
+                           on_error=lambda p, e: errors.append((p, e))) == 1
+    assert errors == [], f"video failed: {errors}"
+    for r in collected:
+        store_result(db, r)
+    assert db.count_videos() == 1
+    assert len(db.video_embeddings()[db.all_videos()[0].id]) >= 3
 
 
 @requires_ffmpeg

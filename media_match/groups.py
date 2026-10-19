@@ -56,6 +56,49 @@ def _taken_key(r: FileRecord) -> tuple[str, float]:
     return (getattr(r, "captured_at", "") or "", getattr(r, "mtime", 0.0))
 
 
+def _pick_best(records: list[FileRecord], members: list[int],
+               prefer: str) -> int:
+    """Index of the 'best' copy in a duplicate group."""
+    if prefer == "date":
+        return max(members, key=lambda i: (
+            _taken_key(records[i]), _megapixels(records[i]), records[i].size
+        ))
+    return max(members, key=lambda i: (
+        _megapixels(records[i]), records[i].size
+    ))
+
+
+def _finish_groups(records: list[FileRecord], groups: list[DuplicateGroup]) \
+        -> list[DuplicateGroup]:
+    """Order each group's rejects largest-first, then order the groups."""
+    for group in groups:
+        # t[0] is the record. Sorting on a leaked loop variable instead made
+        # every group order by whichever index happened to be last.
+        group.others.sort(key=lambda t: -_megapixels(t[0]))
+    groups.sort(key=lambda g: -g.size)
+    return groups
+
+
+def _groups_from_exact_phash(records: list[FileRecord],
+                             prefer: str) -> list[DuplicateGroup]:
+    """Group by identical pHash only — the fast path behind --exact-phash.
+
+    Deliberately does *not* fall through to the Hamming pass: doing both
+    reported the same files twice, once from each strategy.
+    """
+    by_phash: dict[str, list[int]] = {}
+    for i, r in enumerate(records):
+        by_phash.setdefault(r.phash, []).append(i)
+    groups: list[DuplicateGroup] = []
+    for members in by_phash.values():
+        if len(members) < 2:
+            continue
+        best_idx = _pick_best(records, members, prefer)
+        others = [(records[i], 0) for i in members if i != best_idx]
+        groups.append(DuplicateGroup(best=records[best_idx], others=others))
+    return _finish_groups(records, groups)
+
+
 def find_duplicate_groups(
     records: list[FileRecord], threshold: int = 8, prefer: str = "resolution",
     exact_phash: bool = False
@@ -63,6 +106,8 @@ def find_duplicate_groups(
     n = len(records)
     if n == 0:
         return []
+    if exact_phash:
+        return _groups_from_exact_phash(records, prefer)
     uf = _UnionFind(n)
 
     # byte-identical files
@@ -73,32 +118,10 @@ def find_duplicate_groups(
         else:
             by_sha1[r.sha1] = i
 
-    if exact_phash:
-        # fast path: group files with identical perceptual hash (Hamming distance = 0)
-        phash_groups: dict[str, list[int]] = {}
-        for i, r in enumerate(records):
-            ph_key = r.phash  # already hex string from hashing
-            phash_groups.setdefault(ph_key, []).append(i)
-        # Only keep groups with 2+ files that share the exact same phash
-        for ph_key, members in phash_groups.items():
-            if len(members) >= 2:
-                best_idx = members[0]
-                others = [
-                    (records[i], 0)  # Hamming distance 0 since phash is identical
-                    for i in members
-                    if i != best_idx
-                ]
-                others.sort(key=lambda t: -_megapixels(records[i]))
-                groups.append(DuplicateGroup(best=records[best_idx], others=others))
-        # Fall through to the normal Hamming-distance-based grouping for all other files
-        hashes = [r.phash for r in records]
-        for i, j, _dist in hamming_pairs(hashes, threshold):
-            uf.union(i, j)
-    else:
-        # visually near-identical files (resolution independent)
-        hashes = [r.phash for r in records]
-        for i, j, _dist in hamming_pairs(hashes, threshold):
-            uf.union(i, j)
+    # visually near-identical files (resolution independent)
+    hashes = [r.phash for r in records]
+    for i, j, _dist in hamming_pairs(hashes, threshold):
+        uf.union(i, j)
 
     clusters: dict[int, list[int]] = {}
     for i in range(n):
@@ -108,25 +131,16 @@ def find_duplicate_groups(
     for members in clusters.values():
         if len(members) < 2:
             continue
-        if prefer == "date":
-            best_idx = max(members, key=lambda i: (
-                _taken_key(records[i]), _megapixels(records[i]), records[i].size
-            ))
-        else:
-            best_idx = max(members, key=lambda i: (
-                _megapixels(records[i]), records[i].size
-            ))
+        best_idx = _pick_best(records, members, prefer)
         best_hash = hex_to_hash(records[best_idx].phash)
         others = [
             (records[i], (hex_to_hash(records[i].phash) ^ best_hash).bit_count())
             for i in members
             if i != best_idx
         ]
-        others.sort(key=lambda t: -_megapixels(t[0]))
         groups.append(DuplicateGroup(best=records[best_idx], others=others))
 
-    groups.sort(key=lambda g: -g.size)
-    return groups
+    return _finish_groups(records, groups)
 
 
 @dataclass

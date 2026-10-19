@@ -629,6 +629,11 @@ def _prepare_bytes(job: ScanJob, data: bytes, *, interval: float,
     # video: write bytes to a temp file for ffmpeg
     import tempfile
 
+    # This branch needs PIL in its own scope: the image branch above goes
+    # through load_image_tolerant and no longer imports it. Dropping this
+    # import made every video fail with NameError on Image.fromarray.
+    from PIL import Image
+
     with tempfile.NamedTemporaryFile(suffix=os.path.splitext(job.path)[1],
                                      delete=False) as tmp:
         tmp.write(data)

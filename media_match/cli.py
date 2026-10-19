@@ -60,9 +60,18 @@ def _why(exc: Exception) -> str:
 
 
 def _diagnose_failure(path: str, exc: Exception) -> str:
-    """Describe why a file could not be indexed, in terms the user can act on."""
-    from .diagnose import OK, diagnose_image
+    """Describe why a file could not be indexed, in terms the user can act on.
 
+    Only images go through the image diagnosis. Handing an .mp4 to Pillow
+    reports "Pillow cannot identify or decode this file" — true, and useless:
+    it hides the real reason, which is usually an ffmpeg probe failure or a
+    bug such as a missing import.
+    """
+    from .diagnose import OK, diagnose_image
+    from .pipeline import VIDEO_EXTENSIONS
+
+    if os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS:
+        return f"ffmpeg could not read it: {_why(exc)}"
     if os.path.exists(path):
         found = diagnose_image(path)
         if found.status != OK:
@@ -2259,7 +2268,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.25"
+_VERSION = "0.2.26"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
