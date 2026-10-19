@@ -26,7 +26,7 @@ def test_about_leads_with_blurb_and_license(capsys):
 def test_help_has_no_program_blurb(capsys):
     assert cli.main(["help"]) == 0
     out = capsys.readouterr().out
-    assert "commands:" in out
+    assert "grouped by what they are for" in out
     assert "Local photo-library analyzer" not in out
     assert "group duplicates across resolutions" not in out
 

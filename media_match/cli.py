@@ -2259,7 +2259,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.24"
+_VERSION = "0.2.25"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -2351,17 +2351,52 @@ def _command_section(name: str) -> str:
     return "\n".join(lines)
 
 
+# The guide groups commands by what you are trying to do, in the order you
+# would do them, rather than alphabetically. An alphabetical list answers
+# "what is this called?"; a grouped one answers "what do I want?", which is
+# the question someone actually has. Every command appears in exactly one
+# group — verified in main().
+#
+# Each entry is (heading, one-line purpose, commands in reading order).
+_COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("get oriented",
+     "what this is, what is installed, what the index holds",
+     ("help", "about", "info", "version", "stats")),
+    ("build the index",
+     "first pass over a folder: inventory it, index it, confirm it loads",
+     ("bootstrap", "scan", "check")),
+    ("go deeper",
+     "captions, tags, types and people — what makes search work well",
+     ("analyze", "embed", "describe", "refine", "people")),
+    ("find things",
+     "search and browse what is indexed",
+     ("search", "tags", "similar")),
+    ("quality and file management",
+     "duplicates, cleaning them up, and undoing that",
+     ("duplicates", "clean", "restore")),
+    ("metadata",
+     "captions, keywords and types as data you can edit and move around",
+     ("export-metadata", "import-metadata", "clear-metadata")),
+    ("index maintenance",
+     "the index database itself, not your media files",
+     ("export", "reset")),
+)
+
+
 def _print_full_help() -> None:
     lines = [
         "usage: media-match [--help] <command> [command options] [args...]",
         "",
-        "commands:",
+        "commands, grouped by what they are for:",
+        "",
     ]
     width = max(len(c) for c in _COMMAND_SUMMARIES)
-    for name in sorted(_COMMAND_SUMMARIES):
-        lines.append(f"  {name:<{width}}  {_COMMAND_SUMMARIES[name]}")
+    for heading, purpose, names in _COMMAND_GROUPS:
+        lines.append(f"{heading}: {purpose}")
+        for name in names:
+            lines.append(f"  {name:<{width}}  {_COMMAND_SUMMARIES[name]}")
+        lines.append("")
     lines += [
-        "",
         "Every command accepts --db to override the index location and takes a",
         "root argument (default: the current directory).",
         "",
@@ -3325,6 +3360,20 @@ def main(argv: list[str] | None = None) -> int:
     missing = sorted(set(_COMMAND_SUMMARIES) - set(_SUBPARSERS))
     if missing:  # pragma: no cover - guards against a parser added above
         raise RuntimeError(f"help summaries without a parser: {missing}")
+
+    # Every command must appear in exactly one guide group: missing means the
+    # guide hides it, duplicated means it is listed twice under different
+    # headings — which is how 'check' and 'export' came out ambiguous before.
+    grouped = [n for _h, _p, names in _COMMAND_GROUPS for n in names]
+    unknown = sorted(set(grouped) - set(_COMMAND_SUMMARIES))
+    if unknown:
+        raise RuntimeError(f"guide groups name unknown commands: {unknown}")
+    ungrouped = sorted(set(_COMMAND_SUMMARIES) - set(grouped))
+    if ungrouped:
+        raise RuntimeError(f"commands missing from the guide groups: {ungrouped}")
+    duplicated = sorted({n for n in grouped if grouped.count(n) > 1})
+    if duplicated:
+        raise RuntimeError(f"commands listed in more than one guide group: {duplicated}")
 
     # '<command> help' shows that command's page — the same text as
     # 'help <command>'. Without this, 'help' is consumed as the root path and

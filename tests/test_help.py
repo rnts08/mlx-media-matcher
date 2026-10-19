@@ -27,9 +27,21 @@ def _commands():
 def test_help_prints_full_guide(capsys):
     assert cli.main(["help"]) == 0
     out = capsys.readouterr().out
-    assert "commands:" in out
+    assert "grouped by what they are for" in out
     for name in ("scan", "search", "duplicates", "clean", "refine", "people"):
         assert name in out
+
+
+def test_help_groups_commands_by_workflow_not_alphabetically(capsys):
+    # An alphabetical list answers "what is this called?"; the point of the
+    # grouping is to answer "what do I want?", so the order must not be sorted.
+    assert cli.main(["help"]) == 0
+    out = capsys.readouterr().out
+    positions = [out.index(f"  {n} ") for n in
+                 ("help", "about", "info", "version", "stats")]
+    assert positions == sorted(positions), "first group is not in reading order"
+    # a command whose name sorts early must not appear first
+    assert out.index("  scan ") > out.index("  help ")
 
 
 def test_help_shows_one_command(capsys):
@@ -110,6 +122,59 @@ def test_flag_lines_have_no_ragged_spacing():
         for flags, text in cli._flag_lines(cli._SUBPARSERS[name]):
             assert text == text.strip(), f"{name} {flags}: {text!r}"
             assert "  (" not in text or "   (" not in text, f"{name} {flags}"
+
+
+def test_every_command_appears_in_exactly_one_guide_group():
+    grouped = [n for _h, _p, names in cli._COMMAND_GROUPS for n in names]
+    assert sorted(grouped) == sorted(cli._COMMAND_SUMMARIES)
+    # 'check' and 'export' each appeared under two headings in the first
+    # draft of the grouping, which left it ambiguous where to look for them.
+    assert len(grouped) == len(set(grouped)), "a command is listed twice"
+    assert not set(grouped) - set(cli._COMMAND_SUMMARIES)
+
+
+def test_main_refuses_to_start_with_a_misgrouped_command(monkeypatch):
+    # The grouping is data next to the parsers, so it can silently drift. Make
+    # a mistake fail loudly at startup rather than hide a command.
+    monkeypatch.setitem(cli._COMMAND_SUMMARIES, "phantom-command", "not real")
+    try:
+        with pytest.raises(RuntimeError, match="phantom-command"):
+            cli.main(["help"])
+    finally:
+        cli._COMMAND_SUMMARIES.pop("phantom-command")
+
+
+def test_main_refuses_to_start_with_a_duplicated_command():
+    saved = cli._COMMAND_GROUPS
+    groups = list(saved)
+    groups.append(("duplicated on purpose", "", ("scan",)))
+    cli._COMMAND_GROUPS = tuple(groups)
+    try:
+        with pytest.raises(RuntimeError, match="more than one guide group"):
+            cli.main(["help"])
+    finally:
+        cli._COMMAND_GROUPS = saved
+
+
+def test_readme_commands_table_is_grouped_like_the_cli():
+    # The README and `media-match help` must agree on the grouping, or one of
+    # them is showing people a map of a tool the other one does not have.
+    readme = (pathlib.Path(__file__).resolve().parent.parent
+              / "README.md").read_text()
+    section = readme[readme.index("## Commands"):
+                     readme.index("All commands take `--db`")]
+
+    readme_groups = [line[4:].lower() for line in section.splitlines()
+                     if line.startswith("### ")]
+    # The README uses markdown Title Case for its headings; the guide prints
+    # them inline in lower case. The order and membership must still match.
+    guide_groups = [h.lower() for h, _p, _n in cli._COMMAND_GROUPS]
+    assert readme_groups == guide_groups
+
+    # every command the guide lists has a README row
+    for _h, _p, names in cli._COMMAND_GROUPS:
+        for name in names:
+            assert f"| `{name}" in section, f"{name} has no README row"
 
 
 def test_no_command_is_listed_without_a_parser():
