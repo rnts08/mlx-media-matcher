@@ -1,6 +1,6 @@
 [project]
 name = "mlx-media-match"
-version = "0.2.23"
+version = "0.2.24"
 description = "Analyze image folders with a local MLX vision model: find people/objects and group duplicates across resolutions."
 authors = [{ name = "Timh Bergström" }]
 license = { file = "LICENSE" }

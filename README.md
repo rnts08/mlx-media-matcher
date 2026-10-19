@@ -131,6 +131,29 @@ same-looking people group together. It is honest about its limits: CLIP groups
 needs a face-embedding model). `people --label N=Name` names a cluster and
 `search --cluster Name` lists it.
 
+**Watching a scan run.** On a terminal, `scan` and `analyze` draw a live
+two-line status instead of periodic "preparing [n/total]" lines:
+
+```
+indexing     14,208/20,000  [█████████████░░░░░░░░]  71%  186/s  eta 0:50
+now  Photos/IMG_4471.jpg, Photos/IMG_4472.jpg   ring 1.0GB/1.0GB  cpu 38.2s  gpu 11.4s (30%)  read 1.2GB
+```
+
+The counters are there to tell you whether to wait or interrupt:
+
+- **ring** — how full the read buffer is. **Full** means the disk is ahead of
+  the CPU and more `--io-workers` will not help. **Empty** means the readers
+  are the bottleneck and it will.
+- **cpu** — CPU-seconds across all threads. Rising faster than wall time means
+  the workers really are parallel; flat means more threads will not help.
+- **gpu** — time inside embedding calls, as a percentage of wall time. Low
+  GPU share with a full ring is exactly the "GPU is idle" case the ring buffer
+  exists to fix.
+
+`--no-progress` turns it off (implied when stderr is not a terminal, so piped
+output and CI keep one-event-per-line logs). `MEDIA_MATCH_NO_PROGRESS=1` does
+the same from the environment.
+
 ## Configuration
 
 Defaults you usually repeat can live in `~/.config/media-match/config.toml`. An
@@ -289,9 +312,9 @@ Group 1 (2 files)
 
 | Command | What it does | Key options |
 |---|---|---|
-| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--prune`, `--batch` |
-| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch` |
-| `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch` |
+| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--prune`, `--batch`, `--no-progress` |
+| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch`, `--no-progress` |
+| `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch`, `--no-progress` |
 | `clear-metadata [root] [ITEM...]` | clear description/keywords/type/tags from the listed items (paths relative to root), or everything with no items. Media files are never touched | `--kind`, `--yes` |
 | `import-metadata [root] FILE` | import description/keywords/type from a JSON or CSV file (as written by `export-metadata`) | `--kind`, `--fields` |
 | `export-metadata [root]` | export editable metadata (kind, path, description, keywords, type) as JSON — round-trips with `import-metadata` | `--kind`, `--out` |

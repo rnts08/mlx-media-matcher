@@ -91,6 +91,27 @@ def test_readme_documents_only_flags_that_exist():
     assert not sorted(quoted - real), f"README documents flags that do not exist: {sorted(quoted - real)}"
 
 
+def test_every_flag_explains_itself():
+    # A flag whose help is empty renders as "--limit LIMIT (default: 40)",
+    # which tells you nothing about what the flag does.
+    _commands()
+    for name in _commands():
+        for action in cli._SUBPARSERS[name]._actions:
+            if not action.option_strings or action.dest == "help":
+                continue
+            assert (action.help or "").strip(), \
+                f"{name} {action.option_strings[0]} has no help text"
+
+
+def test_flag_lines_have_no_ragged_spacing():
+    # "batch size " + "  (default: 16)" renders with a three-space gap.
+    _commands()
+    for name in _commands():
+        for flags, text in cli._flag_lines(cli._SUBPARSERS[name]):
+            assert text == text.strip(), f"{name} {flags}: {text!r}"
+            assert "  (" not in text or "   (" not in text, f"{name} {flags}"
+
+
 def test_no_command_is_listed_without_a_parser():
     # main() rebuilds the registry on every run, so asserting on the dict
     # after the fact proves nothing. Instead plant a summary with no parser

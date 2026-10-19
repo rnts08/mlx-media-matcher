@@ -219,6 +219,64 @@ def _require_ffmpeg() -> bool:
 # -- commands ----------------------------------------------------------------
 
 
+def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
+                            batch_size, workers, on_result, on_error, stats,
+                            label: str = "indexing"):
+    """Run the scan, drawing live progress on a terminal and plain lines otherwise.
+
+    The bar needs a TTY to redraw in place. Without one (a pipe, CI, a test)
+    it stays off entirely and the old periodic "preparing [n/total]" lines are
+    printed instead, so logs keep their one-event-per-line shape.
+    """
+    from .progress import ProgressBar
+
+    total_jobs = len(jobs)
+    bar = ProgressBar(label, root, total_jobs,
+                      enabled=_progress_enabled(args)).start()
+
+    def progress(done: int, total: int, _path: str) -> None:
+        if bar.enabled or total <= 20:
+            return  # the bar is drawing, or the run is too short to bother
+        step = max(1, total // 20)
+        if done % step == 0 or done == total:
+            print(f"  {label} [{done}/{total}]", file=sys.stderr)
+
+    try:
+        return run_staged_scan(
+            jobs, encoder, interval=interval, max_frames=max_frames,
+            batch_size=batch_size, workers=workers,
+            io_workers=getattr(args, "io_workers", None) or 2,
+            on_result=on_result, progress=progress, on_error=on_error,
+            stats=stats, telemetry=bar,
+        )
+    finally:
+        # Always tear the bar down: an exception mid-scan must not leave the
+        # cursor sitting in the middle of a rewritten line.
+        bar.stop()
+
+
+def _progress_enabled(args) -> bool:
+    """Progress bar unless --no-progress, or stderr is not a terminal.
+
+    stderr is the test, not stdout: the bar is drawn there alongside the other
+    progress lines, while stdout keeps carrying only command output.
+    """
+    if getattr(args, "no_progress", False):
+        return False
+    if os.environ.get("MEDIA_MATCH_NO_PROGRESS"):
+        return False
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError):  # pragma: no cover - detached stderr
+        return False
+
+
+def _add_progress_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--no-progress", action="store_true",
+                   help="no live progress bar (implied when stderr is not a "
+                        "terminal)")
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     _register_heif()
 
@@ -281,19 +339,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
             errors += 1
             print(f"  ERROR storing {result.job.path}: {exc}", file=sys.stderr)
 
-    total_jobs = len(jobs)
-    step = max(1, total_jobs // 20)
-
-    def progress(done: int, total: int, _path: str) -> None:
-        if total > 20 and (done % step == 0 or done == total):
-            print(f"  preparing [{done}/{total}]", file=sys.stderr)
-
     scan_stats = ScanStats()
-    analyzed = run_staged_scan(
-        jobs, encoder, interval=interval, max_frames=max_frames,
-        batch_size=batch, workers=workers,
-        io_workers=getattr(args, "io_workers", None) or 2,
-        on_result=on_result, progress=progress, on_error=on_error,
+    analyzed = _run_scan_with_progress(
+        jobs, encoder, args, root,
+        interval=interval, max_frames=max_frames, batch_size=batch,
+        workers=workers, on_result=on_result, on_error=on_error,
         stats=scan_stats,
     )
     _summarize_bad_files(root)
@@ -1703,20 +1753,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             errors += 1
             print(f"  ERROR storing {result.job.path}: {exc}", file=sys.stderr)
 
-    total_jobs = len(jobs)
-    step = max(1, total_jobs // 20)
-
-    def progress(done: int, n_total: int, _path: str) -> None:
-        if n_total > 20 and (done % step == 0 or done == n_total):
-            print(f"  analyzing [{done}/{n_total}]", file=sys.stderr)
-
     scan_stats = ScanStats()
-    analyzed = run_staged_scan(
-        jobs, encoder, interval=interval, max_frames=max_frames,
-        batch_size=batch, workers=workers,
-        io_workers=getattr(args, "io_workers", None) or 2,
-        on_result=on_result, progress=progress, on_error=on_error,
-        stats=scan_stats,
+    analyzed = _run_scan_with_progress(
+        jobs, encoder, args, root,
+        interval=interval, max_frames=max_frames, batch_size=batch,
+        workers=workers, on_result=on_result, on_error=on_error,
+        stats=scan_stats, label="analyzing",
     )
     _summarize_bad_files(root)
     db.record_scan(
@@ -2217,7 +2259,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.23"
+_VERSION = "0.2.24"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -2254,9 +2296,15 @@ def _flag_lines(parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
             else:
                 metavar = action.dest.upper()
             flags = f"{flags} {metavar}"
-        text = action.help or ""
+        # Strip first: a help string written as "batch size " would otherwise
+        # render as "batch size   (default: 16)" with a ragged gap.
+        text = (action.help or "").strip()
         default = action.default
         if default not in (None, False, argparse.SUPPRESS) and "default" not in text.lower():
+            if not text:
+                # A flag with no help reads as a bare "(default: 16)", which
+                # tells you nothing about what the flag does.
+                text = "no description given"
             text += f"  (default: {default})"
         out.append((flags, text))
     return out
@@ -2703,6 +2751,7 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--prune", action="store_true",
                         help="also drop index rows for files moved or deleted "
                              "since the last scan (keeps the index in sync)")
+    _add_progress_flag(p_scan)
     p_scan.set_defaults(func=cmd_scan)
 
     p_analyze = sub.add_parser(
@@ -2764,6 +2813,7 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze.add_argument("--prune", action="store_true",
                            help="also drop index rows for files moved or deleted "
                                 "since the last scan (keeps the index in sync)")
+    _add_progress_flag(p_analyze)
     p_analyze.set_defaults(func=cmd_analyze)
 
     p_describe = sub.add_parser(
@@ -2789,6 +2839,7 @@ def main(argv: list[str] | None = None) -> int:
                             metavar="N",
                             help="CPU threads prefetching frames "
                                  "(default: 3)")
+    _add_progress_flag(p_describe)
     p_describe.set_defaults(func=cmd_describe)
 
     p_search = sub.add_parser(
@@ -2830,7 +2881,8 @@ def main(argv: list[str] | None = None) -> int:
                           help="only photos whose camera make/model matches TEXT")
     p_search.add_argument("--json", action="store_true",
                           help="machine-readable output")
-    p_search.add_argument("--limit", type=int, default=50)
+    p_search.add_argument("--limit", type=int, default=50,
+                          help="max results to show")
     p_search.set_defaults(func=cmd_search)
 
     p_embed = sub.add_parser(
@@ -3024,7 +3076,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="show image type counts (selfie/scene/object/...)")
     p_tags.add_argument("--raw", action="store_true",
                         help="show the original keywords instead of refined tags")
-    p_tags.add_argument("--limit", type=int, default=40)
+    p_tags.add_argument("--limit", type=int, default=40,
+                        help="max tags/facets to list")
     p_tags.add_argument("--json", action="store_true", help="machine-readable output")
     p_tags.set_defaults(func=cmd_tags)
     p_clear = sub.add_parser(

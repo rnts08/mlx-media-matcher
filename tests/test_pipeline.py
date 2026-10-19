@@ -137,6 +137,80 @@ def test_staged_scan_reports_errors_per_file(tmp_path):
     assert errors == [str(root / "bad.png")]
 
 
+def test_staged_scan_reports_bytes_read_in_stats(tmp_path):
+    # run_scan has always accounted bytes here; run_staged_scan did not, so
+    # 'stats' showed "0.0B read" for every scan since the staged pipeline
+    # shipped.
+    from media_match.pipeline import ScanStats, run_staged_scan
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    for i in range(3):
+        _write_image(root / f"{i}.png", color=(i * 30, 10, 10))
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+
+    stats = ScanStats()
+    run_staged_scan(jobs, FakeEncoder(), interval=1.0, max_frames=120,
+                    batch_size=2, workers=2, stats=stats)
+    assert stats.items == 3
+    assert stats.frames == 3
+    assert stats.bytes_read == sum(j.size for j in jobs) > 0
+
+
+def test_staged_scan_feeds_the_progress_telemetry(tmp_path):
+    import io
+
+    from media_match.pipeline import run_staged_scan
+    from media_match.progress import ProgressBar
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    for i in range(4):
+        _write_image(root / f"{i}.png", color=(i * 40, 5, 5))
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+
+    telemetry = ProgressBar("indexing", str(root), len(jobs),
+                            stream=io.StringIO())
+    run_staged_scan(jobs, FakeEncoder(), interval=1.0, max_frames=120,
+                    batch_size=2, workers=2, telemetry=telemetry)
+
+    state = telemetry.state
+    assert state.total == len(jobs)
+    assert state.done == 4, "the bar must count every completed file"
+    assert state.errors == 0
+    assert state.bytes_read == sum(j.size for j in jobs)
+    assert state.gpu_seconds > 0, "embedding time must be recorded"
+    assert state.cpu_seconds > 0
+    # nothing may still be "in flight" once the pipeline has returned
+    assert state.decoding == []
+    assert state.reading == []
+
+
+def test_telemetry_is_optional(tmp_path):
+    from media_match.pipeline import run_staged_scan
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    _write_image(root / "a.png")
+    db = Database(str(tmp_path / "t.db"))
+    jobs, *_ = build_jobs(str(root), db, include_video=False, reanalyze=False)
+    assert run_staged_scan(jobs, FakeEncoder(), interval=1.0, max_frames=120,
+                           batch_size=2, workers=1) == 1
+
+
+def test_ring_buffer_reports_its_fill_level():
+    from media_match.pipeline import RingBuffer
+
+    ring = RingBuffer(max_bytes=1000)
+    assert ring.fill() == (0, 1000)
+    ring.put(("a", b"x" * 400))
+    assert ring.fill() == (400, 1000)
+    ring.get()
+    assert ring.fill() == (0, 1000)
+
+
 def test_run_scan_failed_batch_keeps_frame_alignment(tmp_path):
     root = tmp_path / "tree"
     root.mkdir()

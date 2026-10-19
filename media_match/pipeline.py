@@ -357,6 +357,16 @@ class RingBuffer:
     def __len__(self) -> int:
         return self._q.qsize()
 
+    def fill(self) -> tuple[int, int]:
+        """(bytes currently buffered, capacity) — for the progress display.
+
+        Read under the lock so the renderer never sees a half-updated pair.
+        A full buffer means the readers are ahead of the CPU workers and disk
+        throughput is not the bottleneck; an empty one means they are not.
+        """
+        with self._lock:
+            return self._bytes, self.max_bytes
+
 
 def run_staged_scan(
     jobs: list[ScanJob],
@@ -372,6 +382,7 @@ def run_staged_scan(
     progress=None,
     on_error=None,
     stats: ScanStats | None = None,
+    telemetry=None,
 ) -> int:
     """Four-stage pipeline: Read → Preprocess → Embed → Store.
 
@@ -421,12 +432,19 @@ def run_staged_scan(
                 job = next_job()
                 if job is None:
                     return
+                if telemetry is not None:
+                    telemetry.note_reading(job.path)
                 try:
                     with open(job.path, "rb") as fh:
                         data = fh.read()
                     ring.put((job.path, data))
+                    if telemetry is not None:
+                        telemetry.note_read(len(data))
                 except OSError:
                     continue
+                finally:
+                    if telemetry is not None:
+                        telemetry.note_finished(job.path)
         finally:
             with readers_lock:
                 readers_left -= 1
@@ -450,12 +468,20 @@ def run_staged_scan(
             if job is None:
                 continue
             try:
+                if telemetry is not None:
+                    telemetry.note_decoding(path)
+                    telemetry.note_cpu(time.process_time() - t_cpu)
                 result = _prepare_bytes(job, data, interval=interval,
                                         max_frames=max_frames)
                 batch_queue.put(result)
             except Exception as exc:  # noqa: BLE001
                 if on_error:
                     on_error(job.path, exc)
+                if telemetry is not None:
+                    telemetry.note_error()
+            finally:
+                if telemetry is not None:
+                    telemetry.note_finished(path)
 
     # -- stage 3: main thread batches and embeds on the GPU
     readers = [threading.Thread(target=reader) for _ in range(reader_count)]
@@ -490,6 +516,8 @@ def run_staged_scan(
                 on_error("<batch>", exc)
         if stats is not None:
             stats.gpu += time.perf_counter() - t_gpu
+        if telemetry is not None:
+            telemetry.note_gpu(time.perf_counter() - t_gpu)
         completed: list[int] = []
         for k, (owner, frame, _) in enumerate(batch):
             if vectors is not None:
@@ -507,10 +535,18 @@ def run_staged_scan(
         result.vectors = owners.pop(owner)
         remaining.pop(owner, None)
         emitted += 1
+        if stats is not None:
+            # run_scan has always accounted bytes here; the staged pipeline did
+            # not, so 'stats' reported 0B read for every scan since it shipped.
+            stats.frames += len(result.arrays)
+            stats.bytes_read += result.job.size
         if emitted % clear_every == 0:
             _clear_mlx_cache()
         if on_result is not None:
             on_result(result)
+        if telemetry is not None:
+            telemetry.note_completed()
+            telemetry.note_cpu(time.process_time() - t_cpu)
         if progress is not None:
             progress(emitted, len(jobs), result.job.path)
 
@@ -525,6 +561,12 @@ def run_staged_scan(
     workers_done = 0
     while True:
         try:
+            if telemetry is not None:
+                # Sample the ring here rather than from a worker: this is the
+                # one place that is never blocked, so the fill level we show
+                # is current instead of a stale snapshot.
+                used, cap = ring.fill()
+                telemetry.set_ring(used, cap)
             item = batch_queue.get(timeout=0.5)
         except queue.Empty:
             if workers_done >= worker_count:
