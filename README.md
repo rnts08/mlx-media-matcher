@@ -234,6 +234,20 @@ Ignored paths are skipped by `scan` and dropped by `scan --prune`.
 .venv/bin/media-match clean ~/Pictures --dry-run  # preview the plan
 .venv/bin/media-match clean ~/Pictures --yes      # accept all suggestions
 
+# 5b. same-named folders: merge 2019/christmas, 2020/Christmas, 2021/CHRISTMAS
+#     into one copy. The shallowest copy is suggested as the destination;
+#     each same-named file is decided with r/R=replace, n/N=rename,
+#     s/S=skip, c=compare (size, EXIF, video facts), q=quit. Nothing moves
+#     until the final confirmation; quitting offers to keep the folders
+#     already finished. --collapse instead gathers whole folders into
+#     <root>/<Name>_collapsed/ as <Name>_1, <Name>_2, ... without merging files.
+.venv/bin/media-match folders ~/Pictures --list
+.venv/bin/media-match folders ~/Pictures --name christmas
+.venv/bin/media-match folders ~/Pictures --dry-run --rename
+.venv/bin/media-match folders ~/Pictures --collapse
+.venv/bin/media-match folders ~/Pictures --rename --yes   # keep both copies
+.venv/bin/media-match folders ~/Pictures --replace --yes  # mv -f
+
 # extras
 .venv/bin/media-match tags ~/Pictures    # keyword counts from captions
 .venv/bin/media-match stats ~/Pictures   # index, models, coverage
@@ -365,11 +379,12 @@ search and browse what is indexed
 
 ### Quality and file management
 
-duplicates, cleaning them up, and undoing that
+duplicates, folder consolidation, cleaning them up, and undoing that
 
 | Command | What it does | Key options |
 |---|---|---|
 | `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (distance-0 matches only; ignores `--threshold`), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
+| `folders [root]` | find folders with the same name regardless of case and merge their files into a chosen destination, deciding each same-name conflict (replace / rename / skip, with `all` variants and EXIF compare); or gather whole folders with `--collapse`. Filesystem-only: reads and writes no index | `--name` (foldername filter), `--list`, `--collapse`, `--replace` / `--rename`, `--yes`, `--dry-run`, `--json` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--json` (with `--dry-run`) |
 | `restore [root]` | list what `clean` moved to the system Trash and move it back on confirmation (best-effort: the OS Trash may have renamed a colliding name) | `--batch`, `--limit`, `--dry-run`, `--yes` |
 

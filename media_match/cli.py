@@ -1130,6 +1130,312 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _folders_json_members(group, root):
+    from .folders import folder_stats
+
+    members = []
+    for member in group.members:
+        files, size = folder_stats(member)
+        members.append({
+            "path": os.path.relpath(member, root),
+            "files": files,
+            "bytes": size,
+        })
+    return members
+
+
+def _folders_list(groups, root, args) -> int:
+    from .cleanup import human_size
+    from .folders import folder_stats
+
+    if args.json:
+        print(json.dumps([
+            {
+                "name": group.name,
+                "suggested": os.path.relpath(group.suggested, root),
+                "members": _folders_json_members(group, root),
+            }
+            for group in groups
+        ], indent=2))
+        return 0
+
+    for index, group in enumerate(groups, 1):
+        destination = group.suggested
+        print(f"Group {index}/{len(groups)} — {group.name} "
+              f"({group.size} folders)")
+        for member in group.members:
+            files, size = folder_stats(member)
+            mark = "[dest*]" if member == destination else "       "
+            print(f"  {mark} {os.path.relpath(member, root)}  "
+                  f"({files} files, {human_size(size)})")
+        print("  * suggested destination (shortest path)")
+        print()
+    redundant = sum(group.size - 1 for group in groups)
+    print(f"{len(groups)} group(s), "
+          f"{sum(group.size for group in groups)} folders — "
+          f"{redundant} redundant folder(s)")
+    return 0
+
+
+def _folders_dry_group(source, moves, root, out=print) -> None:
+    labels = {"move": "moved", "replace": "replaced", "rename": "renamed"}
+    counts = {"move": 0, "replace": 0, "rename": 0, "skip": 0, "ask": 0}
+    for move in moves:
+        counts[move.action] = counts.get(move.action, 0) + 1
+    summary = ", ".join(f"{n} {action}" for action, n in counts.items() if n)
+    out(f"  {os.path.relpath(source, root)}: {summary or 'nothing to move'}")
+    for move in moves:
+        rel_from = os.path.relpath(move.source, root)
+        rel_to = os.path.relpath(move.destination, root)
+        if move.action in labels:
+            out(f"    {labels[move.action]} {rel_from} -> {rel_to}")
+        elif move.action == "ask":
+            out(f"    conflict {rel_from} (would ask)")
+        else:
+            out(f"    skip {rel_from} ({move.reason})")
+
+
+def _folders_merge(groups, root, args) -> int:
+    from .cleanup import confirm
+    from .folders import (
+        QuitReview,
+        ReviewState,
+        apply_moves,
+        choose_destination,
+        is_inside,
+        is_nested,
+        make_resolver,
+        plan_folder,
+        prune_empty_ancestors,
+        prune_empty_dirs,
+    )
+
+    policy = ("replace" if args.replace else
+              "rename" if args.rename else None)
+    if args.yes and policy is None:
+        # "Yes to everything" must not guess between overwrite and duplicate.
+        # Skipping is the only answer that cannot lose a file.
+        policy = "skip"
+    state = ReviewState(policy=policy)
+    resolve = make_resolver(root=root, state=state)
+
+    completed: list[tuple[str, list]] = []
+    open_source: str | None = None
+    quit_review = False
+    # Destinations claimed by moves that are planned but not applied yet, so
+    # two sources with the same filename do not both aim at the same path.
+    reserved: set[str] = set()
+    out = (lambda _text: None) if args.json else print
+    dry_payload: list[dict] = []
+
+    try:
+        for index, group in enumerate(groups, 1):
+            open_source = None
+            dry_entry: dict | None = None
+            if args.dry_run:
+                destination = group.suggested
+                out(f"\nGroup {index}/{len(groups)} — {group.name} "
+                    f"({group.size} folders), keep "
+                    f"{os.path.relpath(destination, root)}")
+                dry_entry = {
+                    "name": group.name,
+                    "destination": os.path.relpath(destination, root),
+                    "sources": [],
+                }
+                dry_payload.append(dry_entry)
+            elif args.yes:
+                destination = group.suggested
+                print(f"\nGroup {index}/{len(groups)} — {group.name} "
+                      f"({group.size} folders): keeping "
+                      f"{os.path.relpath(destination, root)}")
+            else:
+                destination = choose_destination(group, index, len(groups))
+
+            for source in group.members:
+                if source == destination:
+                    continue
+                if is_nested(source, destination):
+                    out(f"  skipped {os.path.relpath(source, root)}: "
+                        f"nested with the destination")
+                    if dry_entry is not None:
+                        dry_entry["sources"].append({
+                            "source": os.path.relpath(source, root),
+                            "moves": [],
+                            "skipped": "nested with the destination",
+                        })
+                    continue
+                if any(is_inside(source, other) for other in group.members
+                       if other != source):
+                    out(f"  skipped {os.path.relpath(source, root)}: inside "
+                        f"another member; it moves with that folder")
+                    if dry_entry is not None:
+                        dry_entry["sources"].append({
+                            "source": os.path.relpath(source, root),
+                            "moves": [],
+                            "skipped": "inside another member",
+                        })
+                    continue
+                open_source = source
+                plan_policy = "ask" if (args.dry_run and state.policy is None) \
+                    else state.policy
+                moves = plan_folder(
+                    source, destination, policy=plan_policy,
+                    resolve=None if args.dry_run else resolve,
+                    reserved=reserved,
+                )
+                open_source = None
+                if args.dry_run:
+                    _folders_dry_group(source, moves, root, out=out)
+                    dry_entry["sources"].append({
+                        "source": os.path.relpath(source, root),
+                        "moves": [
+                            {
+                                "from": os.path.relpath(move.source, root),
+                                "to": os.path.relpath(move.destination, root),
+                                "action": move.action,
+                            }
+                            for move in moves
+                        ],
+                    })
+                else:
+                    completed.append((source, moves))
+    except QuitReview:
+        quit_review = True
+
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(dry_payload, indent=2))
+        else:
+            print("\nDry run: nothing was moved.")
+        return 0
+
+    def actionable(folder_moves):
+        return [m for m in folder_moves
+                if m.action in ("move", "replace", "rename")]
+
+    planned = sum(len(actionable(moves)) for _source, moves in completed)
+    skipped = sum(1 for _source, moves in completed
+                  for m in moves if m.action == "skip")
+
+    if not completed:
+        print("\nNothing was moved.")
+        return 0
+
+    if quit_review:
+        if not args.yes:
+            if open_source is not None:
+                question = ("Execute everything decided so far, excluding the "
+                            f"current folder ({os.path.relpath(open_source, root)})"
+                            "? [y/N] ")
+            else:
+                question = "Execute everything decided so far? [y/N] "
+            if not confirm(question):
+                print("Nothing was moved.")
+                return 0
+    else:
+        print(f"\n{planned} file(s) to move in {len(completed)} source "
+              f"folder(s), {skipped} to skip.")
+        if not args.yes and not confirm("Apply these moves? [y/N] "):
+            print("Nothing was moved.")
+            return 0
+
+    moved = replaced = renamed = failed = 0
+    for source, moves in completed:
+        result = apply_moves(moves, root=root)
+        moved += len(result.moved)
+        replaced += len(result.replaced)
+        renamed += len(result.renamed)
+        failed += len(result.failed)
+        prune_empty_dirs(source)
+        if not os.path.exists(source):
+            prune_empty_ancestors(source, root)
+
+    print(f"\n{len(completed)} source folder(s): {moved} file(s) moved "
+          f"({replaced} replaced, {renamed} renamed), {skipped} skipped, "
+          f"{failed} failed.")
+    if moved:
+        print("The media index is now stale; run "
+              f"'media-match scan --prune {root}' to refresh it.")
+    return 0 if failed == 0 else 1
+
+
+def _folders_collapse(groups, root, args) -> int:
+    from .folders import collapse_group, collapsed_dir
+
+    out = (lambda _text: None) if args.json else print
+    payload = []
+    failed = 0
+    for index, group in enumerate(groups, 1):
+        out(f"\nGroup {index}/{len(groups)} — {group.name} "
+            f"({group.size} folders)")
+        out(f"  keep {os.path.relpath(group.suggested, root)}; gather into "
+            f"{os.path.relpath(collapsed_dir(group), root)}/")
+        destination, collapsed, moved, failures = collapse_group(
+            group, out=out, dry_run=args.dry_run)
+        failed += len(failures)
+        payload.append({
+            "name": group.name,
+            "destination": os.path.relpath(destination, root),
+            "collapsed": os.path.relpath(collapsed, root),
+            "moved": [
+                {"from": os.path.relpath(src, root),
+                 "to": os.path.relpath(dst, root)}
+                for src, dst in moved
+            ],
+            "failed": [{"path": os.path.relpath(src, root), "reason": reason}
+                       for src, reason in failures],
+        })
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    elif args.dry_run:
+        print("\nDry run: nothing was moved.")
+    else:
+        total = sum(len(entry["moved"]) for entry in payload)
+        print(f"\n{total} folder(s) gathered into "
+              f"{len(groups)} collapsed folder(s), {failed} failed.")
+    return 0 if failed == 0 else 1
+
+
+def cmd_folders(args: argparse.Namespace) -> int:
+    """Find same-named folders and merge or collapse the duplicates."""
+    from .config import load_ignore
+    from .folders import find_folder_groups
+
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        print(f"Not a folder: {root}")
+        return 2
+    if args.list and args.collapse:
+        print("Choose one: --list shows the groups, --collapse acts on them.")
+        return 2
+    if args.collapse and (args.replace or args.rename):
+        print("--collapse works on whole folders and never touches files; "
+              "drop --replace/--rename.")
+        return 2
+    if args.json and not (args.list or args.collapse or args.dry_run):
+        print("--json needs --list, --collapse or --dry-run.")
+        return 2
+
+    groups = find_folder_groups(root, name=args.name,
+                               ignore=load_ignore(root))
+    if not groups:
+        if args.json:
+            print("[]")
+        elif args.name:
+            print(f"No repeated folder names containing {args.name!r} "
+                  f"under {root}.")
+        else:
+            print(f"No same-named folders found under {root}.")
+        return 0
+
+    if args.list:
+        return _folders_list(groups, root, args)
+    if args.collapse:
+        return _folders_collapse(groups, root, args)
+    return _folders_merge(groups, root, args)
+
+
 def cmd_restore(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
@@ -2234,6 +2540,7 @@ _COMMAND_SUMMARIES = {
     "similar": "group the tree by CLIP similarity, or find neighbors of one file",
     "duplicates": "group duplicates; best resolution wins",
     "clean": "review duplicate groups and move rejected copies to the Trash",
+    "folders": "find same-named folders; merge or gather the duplicates",
     "restore": "move files back from the system Trash (undo 'clean')",
     "refine": "rewrite keywords into canonical tags/facets; type photos",
     "people": "cluster person photos by similarity and name the clusters",
@@ -2262,6 +2569,7 @@ _EXAMPLES = {
     "similar": "media-match similar ~/Pictures --threshold 0.9",
     "duplicates": "media-match duplicates ~/Pictures",
     "clean": "media-match clean ~/Pictures --dry-run",
+    "folders": "media-match folders ~/Pictures --list",
     "restore": "media-match restore ~/Pictures --yes",
     "refine": "media-match refine ~/Pictures --classify",
     "people": "media-match people ~/Pictures --label 1=Alice",
@@ -2281,7 +2589,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.28"
+_VERSION = "0.3.0"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -2394,8 +2702,8 @@ _COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
      "search and browse what is indexed",
      ("search", "tags", "similar")),
     ("quality and file management",
-     "duplicates, cleaning them up, and undoing that",
-     ("duplicates", "clean", "restore")),
+     "duplicates, folder consolidation, cleaning them up, and undoing that",
+     ("duplicates", "folders", "clean", "restore")),
     ("metadata",
      "captions, keywords and types as data you can edit and move around",
      ("export-metadata", "import-metadata", "clear-metadata")),
@@ -3050,6 +3358,57 @@ def main(argv: list[str] | None = None) -> int:
                           help="with --dry-run: machine-readable list of files to trash")
     p_clean.set_defaults(func=cmd_clean)
 
+    p_folders = sub.add_parser(
+        "folders",
+        help="find same-named folders and merge or gather the duplicates",
+        description=(
+            "Find folders that share a name regardless of case — "
+            "2019/christmas, 2020/Christmas, 2021/CHRISTMAS — and work on "
+            "them at the folder level. The default is an interactive review "
+            "like 'clean': pick the destination (the shallowest is "
+            "suggested), then decide each filename conflict with "
+            "r/R=replace, n/N=rename, s/S=skip, c=compare (size, EXIF, "
+            "video facts) and q=quit. Decisions are buffered; nothing moves "
+            "until the final confirmation, and quitting offers to execute "
+            "the folders already finished. --collapse instead moves every "
+            "non-destination folder into <root>/<Name>_collapsed as "
+            "<Name>_1, <Name>_2, ... without touching the files inside. "
+            "This is a filesystem command: it reads and writes no index, so "
+            "run 'scan --prune' afterwards to refresh one."
+        ),
+    )
+    _add_common(p_folders)
+    p_folders.add_argument(
+        "--name", metavar="NAME",
+        help="only consider folder names containing NAME (case-insensitive)")
+    p_folders.add_argument(
+        "--list", action="store_true",
+        help="list every group found and exit; change nothing")
+    p_folders.add_argument(
+        "--collapse", action="store_true",
+        help="gather non-destination folders into <root>/<Name>_collapsed "
+             "as <Name>_1, <Name>_2, ... instead of merging their files")
+    policy = p_folders.add_mutually_exclusive_group()
+    policy.add_argument(
+        "--replace", action="store_true",
+        help="at every filename conflict, the incoming file overwrites the "
+             "destination file")
+    policy.add_argument(
+        "--rename", action="store_true",
+        help="at every filename conflict, keep both: the incoming file gets "
+             "a numbered name (photo_1.jpg)")
+    p_folders.add_argument(
+        "--yes", action="store_true",
+        help="use the suggested destination and ask nothing; without "
+             "--replace/--rename, conflicting files are skipped")
+    p_folders.add_argument(
+        "--dry-run", action="store_true",
+        help="print the plan and exit without moving anything or asking")
+    p_folders.add_argument(
+        "--json", action="store_true",
+        help="with --list, --collapse or --dry-run: machine-readable output")
+    p_folders.set_defaults(func=cmd_folders)
+
     p_restore = sub.add_parser(
         "restore",
         help="move files back from the system Trash (undo 'clean')",
@@ -3366,7 +3725,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, parser_obj in (
         ("analyze", p_analyze), ("scan", p_scan), ("describe", p_describe),
         ("search", p_search), ("embed", p_embed), ("similar", p_sim),
-        ("duplicates", p_dup), ("clean", p_clean), ("restore", p_restore),
+        ("duplicates", p_dup), ("folders", p_folders),
+        ("clean", p_clean), ("restore", p_restore),
         ("refine", p_refine), ("people", p_people), ("tags", p_tags),
         ("clear-metadata", p_clear), ("import-metadata", p_import),
         ("export-metadata", p_export_meta), ("reset", p_reset),
