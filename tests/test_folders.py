@@ -19,6 +19,7 @@ from media_match.folders import (
     compare_files,
     find_folder_groups,
     folder_stats,
+    iter_entries,
     make_resolver,
     numbered_path,
     plan_folder,
@@ -590,12 +591,24 @@ def test_cli_quit_mid_folder_excludes_it(tmp_path, monkeypatch, capsys):
     assert (root / "c" / "CHRISTMAS" / "keep.txt").read_text() == "src2"
 
 
-def test_cli_eof_leaves_everything_alone(tmp_path, monkeypatch):
+def test_cli_eof_aborts_and_leaves_everything_alone(tmp_path, monkeypatch,
+                                                     capsys):
     root = _christmas_tree(tmp_path)
     monkeypatch.setattr("sys.stdin", io.StringIO("1\n"))
-    assert _run(["folders", str(root)]) == 0
+    assert _run(["folders", str(root)]) == 1
+    assert "Aborted; nothing was changed." in capsys.readouterr().out
     assert (root / "b" / "Christmas" / "keep.txt").read_text() == "src1"
     assert not (root / "a" / "christmas" / "keep_1.txt").exists()
+
+
+def test_cli_q_with_nothing_decided_is_a_clean_exit(tmp_path, monkeypatch,
+                                                     capsys):
+    root = _christmas_tree(tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO("1\nq\n"))
+    assert _run(["folders", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "Nothing was moved." in out
+    assert (root / "b" / "Christmas" / "keep.txt").read_text() == "src1"
 
 
 def test_nested_group_member_is_moved_with_its_parent(tmp_path):
@@ -628,3 +641,177 @@ def test_nested_group_member_merges_recursively(tmp_path):
     assert (destination / "top.txt").exists()
     assert (destination / "x" / "inner.txt").exists()
     assert not (root / "b").exists()
+
+
+def test_conflict_prompt_shows_size_and_mtime(tmp_path):
+    source = _write(tmp_path / "src" / "a.txt", "source")
+    destination = _write(tmp_path / "dst" / "a.txt", "destination")
+    lines: list[str] = []
+    assert ask_conflict(str(source), str(destination), root=str(tmp_path),
+                        state=ReviewState(), input_fn=_scripted(["s"]),
+                        out=lines.append) == "skip"
+    text = "\n".join(lines)
+    assert "conflict  a.txt" in text
+    assert text.count("modified") == 2
+    assert "6 B" in text and "11 B" in text
+
+
+def test_compare_reports_missing_ffprobe(tmp_path, monkeypatch):
+    first = _write(tmp_path / "a.mp4", "a")
+    second = _write(tmp_path / "b.mp4", "b")
+    monkeypatch.setattr("media_match.folders.shutil.which",
+                        lambda _name: None)
+    lines: list[str] = []
+    compare_files(str(second), str(first), root=str(tmp_path),
+                  out=lines.append)
+    assert any("ffprobe not on PATH" in line for line in lines)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_unreadable_directory_aborts_discovery(tmp_path, capsys):
+    root = _christmas_tree(tmp_path)
+    locked = root / "locked"
+    _write(locked / "Christmas" / "secret.txt")
+    os.chmod(locked, 0)
+    try:
+        rc = _run(["folders", str(root), "--list"])
+    finally:
+        os.chmod(locked, 0o755)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "could not read" in captured.err
+    assert "Discovery was incomplete; nothing was changed." in captured.err
+    assert "Group 1/" not in captured.out
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_iter_entries_raises_for_an_unreadable_folder(tmp_path):
+    folder = tmp_path / "locked"
+    _write(folder / "inside.txt", "inside")
+    os.chmod(folder, 0)
+    try:
+        with pytest.raises(OSError):
+            list(iter_entries(str(folder)))
+    finally:
+        os.chmod(folder, 0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_unreadable_source_is_left_untouched(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "tree"
+    _write(root / "a" / "x" / "one.txt", "1")
+    _write(root / "b" / "x" / "top.txt", "top")
+    locked = root / "b" / "x" / "locked"
+    _write(locked / "inside.txt", "inside")
+
+    # Discovery happens while the folder is readable; the read failure then
+    # strikes while planning, the case a race or a stale mount produces.
+    groups = find_folder_groups(str(root))
+    monkeypatch.setattr("media_match.folders.find_folder_groups",
+                        lambda *_a, **_k: groups)
+    os.chmod(locked, 0)
+    try:
+        rc = _run(["folders", str(root), "--yes"])
+    finally:
+        os.chmod(locked, 0o755)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAILED b/x" in out
+    assert "could not be read" in out
+    assert (root / "b" / "x" / "top.txt").exists()
+    assert not (root / "a" / "x" / "top.txt").exists()
+
+
+def test_json_dry_run_keeps_stdout_parseable_when_a_source_fails(
+        tmp_path, capsys, monkeypatch):
+    root = tmp_path / "tree"
+    _write(root / "a" / "x" / "one.txt", "1")
+    _write(root / "b" / "x" / "top.txt", "top")
+    real = plan_folder
+
+    def failing(source, destination, **kwargs):
+        if source.endswith(os.path.join("b", "x")):
+            raise OSError(13, "Permission denied", source)
+        return real(source, destination, **kwargs)
+
+    monkeypatch.setattr("media_match.folders.plan_folder", failing)
+    rc = _run(["folders", str(root), "--dry-run", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    payload = json.loads(captured.out)  # stdout is still only JSON
+    assert payload[0]["sources"][0]["skipped"].startswith("could not read")
+    assert "FAILED" in captured.err
+
+
+def test_declining_the_confirmation_aborts_with_status_1(tmp_path, monkeypatch,
+                                                        capsys):
+    root = tmp_path / "tree"
+    _write(root / "a" / "x" / "one.txt", "1")
+    _write(root / "b" / "X" / "two.txt", "2")
+    monkeypatch.setattr("sys.stdin", io.StringIO("1\nn\n"))
+    assert _run(["folders", str(root)]) == 1
+    assert "Aborted; nothing was changed." in capsys.readouterr().out
+    assert (root / "b" / "X" / "two.txt").exists()
+
+
+def test_index_hint_only_when_an_index_exists(tmp_path, capsys):
+    root = _christmas_tree(tmp_path)
+    assert _run(["folders", str(root), "--list"]) == 0
+    assert "media index" not in capsys.readouterr().out
+
+    root = _christmas_tree(tmp_path / "with-index")
+    (root / ".media-match.db").write_text("")
+    assert _run(["folders", str(root), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "media index at" in out and "--prune" in out
+
+
+def test_index_hint_carries_an_explicit_db(tmp_path, capsys):
+    root = _christmas_tree(tmp_path)
+    database = tmp_path / "custom.db"
+    database.write_text("")
+    assert _run(["folders", str(root), "--rename", "--yes",
+                 "--db", str(database)]) == 0
+    out = capsys.readouterr().out
+    assert f"--db {database}" in out
+
+
+def test_collapse_reports_a_gather_folder_that_is_a_file(tmp_path, capsys):
+    root = _christmas_tree(tmp_path)
+    _write(root / "christmas_collapsed", "not a folder")
+    assert _run(["folders", str(root), "--collapse"]) == 1
+    out = capsys.readouterr().out
+    assert "FAILED christmas_collapsed" in out
+    assert "0 folder(s) gathered into 0 collapsed folder(s), 1 failed." in out
+    assert (root / "b" / "Christmas" / "keep.txt").exists()
+
+
+def test_mismatch_is_named_in_a_real_run(tmp_path, capsys):
+    root = tmp_path / "tree"
+    _write(root / "a" / "x" / "thing" / "inside.txt")
+    _write(root / "b" / "x" / "thing", "a file where the destination has one")
+    assert _run(["folders", str(root), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "skipped b/x/thing: file/directory mismatch" in out
+    assert (root / "b" / "x" / "thing").is_file()
+
+
+def test_collapse_prunes_empty_ancestors(tmp_path):
+    root = tmp_path / "tree"
+    _write(root / "a" / "x" / "one.txt")
+    _write(root / "deep" / "2020" / "x" / "two.txt")
+
+    group = find_folder_groups(str(root))[0]
+    _destination, _collapsed, _moved, failed = collapse_group(
+        group, out=lambda _t: None)
+    assert not failed
+    assert not (root / "deep" / "2020").exists()
+    assert not (root / "deep").exists(), "empty ancestors stop at the root"
+
+
+def test_missing_root_is_a_usage_error(tmp_path, capsys):
+    assert _run(["folders", str(tmp_path / "nope")]) == 2
+    assert "No folder at" in capsys.readouterr().out

@@ -35,7 +35,16 @@ Input = Callable[[str], str]
 
 
 class QuitReview(Exception):
-    """The user asked to stop reviewing (q or Escape)."""
+    """The user asked to stop reviewing (q/Escape), or stdin reached EOF.
+
+    ``eof`` distinguishes "the user chose to quit" from "input ended". Both
+    stop the review, but an EOF with nothing decided is an abort (status 1),
+    not a successful "nothing to do" run.
+    """
+
+    def __init__(self, eof: bool = False) -> None:
+        super().__init__("review stopped")
+        self.eof = eof
 
 
 @dataclass(frozen=True)
@@ -85,6 +94,7 @@ def find_folder_groups(
     *,
     name: str | None = None,
     ignore: list[str] | tuple[str, ...] = (),
+    on_error: Callable[[OSError], None] | None = None,
 ) -> list[FolderGroup]:
     """Every repeated folder name under ``root``, grouped case-insensitively.
 
@@ -92,12 +102,21 @@ def find_folder_groups(
     the ``find -iname '*name*'`` filter. Survivors are still grouped by their
     full casefolded name, so ``--name christmas`` never merges
     ``Christmas 2020`` into ``christmas``.
+
+    An unreadable directory is reported through ``on_error`` and skipped. The
+    caller decides whether the partial result is safe to act on; the CLI
+    refuses to merge when discovery was incomplete.
     """
     root = os.path.abspath(root)
     needle = name.casefold() if name else None
     buckets: dict[str, list[str]] = {}
 
-    for dirpath, dirnames, _filenames in os.walk(root, followlinks=False):
+    def walk_error(exc: OSError) -> None:
+        if on_error is not None:
+            on_error(exc)
+
+    for dirpath, dirnames, _filenames in os.walk(root, followlinks=False,
+                                                 onerror=walk_error):
         kept: list[str] = []
         for child in sorted(dirnames):
             if child.startswith("."):
@@ -134,10 +153,10 @@ def iter_entries(top: str):
     stack = [top]
     while stack:
         directory = stack.pop()
-        try:
-            entries = sorted(os.scandir(directory), key=lambda e: e.name)
-        except OSError:
-            continue
+        # Unlike os.walk, do not swallow this: a source that cannot be read
+        # must abort its own plan, not silently merge half of it. The caller
+        # reports the folder and leaves it untouched.
+        entries = sorted(os.scandir(directory), key=lambda e: e.name)
         descend: list[str] = []
         for entry in entries:
             if entry.is_dir(follow_symlinks=False):
@@ -420,7 +439,11 @@ def collapse_group(
     failed: list[tuple[str, str]] = []
     reserved: set[str] = set()
     if not dry_run:
-        os.makedirs(collapsed, exist_ok=True)
+        try:
+            os.makedirs(collapsed, exist_ok=True)
+        except OSError as exc:
+            out(f"  FAILED {_rel(collapsed, root)}: {exc}")
+            return destination, collapsed, moved, [(collapsed, str(exc))]
 
     for member in group.members:
         if member == destination:
@@ -448,7 +471,10 @@ def collapse_group(
             continue
         out(f"  moved {_rel(member, root)} -> {_rel(target, root)}")
         moved.append((member, target))
-        prune_empty_dirs(os.path.dirname(member))
+        parent = os.path.dirname(member)
+        prune_empty_dirs(parent)
+        if not os.path.exists(parent):
+            prune_empty_ancestors(parent, root)
     return destination, collapsed, moved, failed
 
 
@@ -498,7 +524,7 @@ def choose_destination(
                 f"1-{n}, q=quit > "
             ).strip()
         except EOFError:
-            raise QuitReview from None
+            raise QuitReview(eof=True) from None
         if answer == "":
             return destination
         if answer in ("q", "Q") or answer.startswith("\x1b"):
@@ -516,13 +542,31 @@ def _mtime(path: str) -> str:
         return "?"
 
 
-def _compare_facts(path: str) -> list[str]:
-    """Size/mtime plus whatever EXIF or video metadata can be read."""
+def _stat_line(path: str) -> str:
+    """``size, modified when`` for one side of a conflict."""
     try:
         size = os.path.getsize(path)
     except OSError:
-        return ["unreadable"]
-    facts = [f"{human_size(size)}, modified {_mtime(path)}"]
+        return "unreadable"
+    return f"{human_size(size)}, modified {_mtime(path)}"
+
+
+def _short_error(exc: Exception) -> str:
+    """The last stderr line of a failed subprocess, or a short message."""
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        lines = stderr.decode("utf-8", "replace").strip().splitlines()
+        if lines:
+            return lines[-1]
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
+def _compare_facts(path: str) -> list[str]:
+    """Size/mtime plus whatever EXIF or video metadata can be read."""
+    facts = [_stat_line(path)]
+    if facts[0] == "unreadable":
+        return facts
 
     ext = os.path.splitext(path)[1].lower()
     if ext in _IMAGE_EXTS:
@@ -543,13 +587,17 @@ def _compare_facts(path: str) -> list[str]:
         except Exception as exc:  # noqa: BLE001 - compare is best-effort
             facts.append(f"no EXIF ({type(exc).__name__})")
     elif ext in _VIDEO_EXTS:
-        try:
-            from .video import probe
+        if not shutil.which("ffprobe"):
+            facts.append("no video metadata (ffprobe not on PATH)")
+        else:
+            try:
+                from .video import probe
 
-            meta = probe(path)
-            facts.append(f"{meta.width}x{meta.height}, {meta.duration:.1f}s")
-        except Exception as exc:  # noqa: BLE001
-            facts.append(f"no video metadata ({type(exc).__name__})")
+                meta = probe(path)
+                facts.append(f"{meta.width}x{meta.height}, "
+                             f"{meta.duration:.1f}s {meta.codec}".strip())
+            except Exception as exc:  # noqa: BLE001 - compare is best-effort
+                facts.append(f"no video metadata ({_short_error(exc)})")
     return facts
 
 
@@ -583,16 +631,18 @@ def ask_conflict(
     """Ask one conflict; return replace/rename/skip, or raise QuitReview."""
     input_fn = input_fn or input
     while True:
-        out(f"\n  conflict  {_rel(destination, root)}")
-        out(f"    destination  {_rel(destination, root)}")
-        out(f"    source       {_rel(source, root)}")
+        out(f"\n  conflict  {os.path.basename(destination)}")
+        out(f"    destination  {_rel(destination, root)}  "
+            f"({_stat_line(destination)})")
+        out(f"    source       {_rel(source, root)}  "
+            f"({_stat_line(source)})")
         try:
             answer = input_fn(
                 "  [r]eplace [R]eplace all [n]ame [N]ame all [s]kip "
                 "[S]kip all [c]ompare [q]uit > "
             ).strip()
         except EOFError:
-            raise QuitReview from None
+            raise QuitReview(eof=True) from None
 
         if answer in ("q", "Q") or answer.startswith("\x1b"):
             raise QuitReview

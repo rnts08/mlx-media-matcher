@@ -114,24 +114,30 @@ For each group, then each source folder (sorted), merge recursively:
 4. Numbering starts at 1 and skips names already present, so `photo.jpg`,
    `photo_1.jpg`, `photo_2.jpg` can all coexist.
 5. A path where the destination has a **directory** and the source has a file
-   (or the reverse) is reported and skipped; it is a tree-shape disagreement,
-   not a filename conflict, and is never resolved by deleting either side.
-6. After a source folder has been fully reviewed, its empty directories are
-   removed bottom-up. Directories that still contain skipped files remain, so
-   nothing is ever silently lost.
-7. Moves use `os.rename` where possible and fall back to `shutil.move` across
+   (or the reverse) is named and skipped; it is a tree-shape disagreement, not
+   a filename conflict, and is never resolved by deleting either side.
+6. A source folder that cannot be read is reported as `FAILED` and its plan is
+   discarded whole: no file from it moves, it keeps its current name and
+   contents, and the command finishes the other folders with a non-zero exit
+   status.
+7. After a source folder has been fully reviewed, its empty directories are
+   removed bottom-up, and then empty parents up to (never including) the root.
+   Directories that still contain skipped files remain, so nothing is ever
+   silently lost.
+8. Moves use `os.rename` where possible and fall back to `shutil.move` across
    volumes.
-8. Every move is printed as it is applied.
+9. Every move is printed as it is applied.
 
 ### 4. Compare
 
 `c` at a conflict prints, for the destination file and the source file:
 
-- absolute and root-relative path
+- root-relative path
 - size and modification time
 - image EXIF where readable: capture time, camera, GPS
-- for videos, duration/resolution if `ffprobe` is available; otherwise the
-  same file facts
+- for videos, resolution, duration and codec when `ffprobe` is available; when
+  it is not, `no video metadata (ffprobe not on PATH)`, and when it rejects the
+  file, its last error line
 
 It then returns to the same conflict prompt. Compare is read-only and never
 changes a decision by itself.
@@ -142,14 +148,17 @@ All decisions are buffered; nothing moves until the user confirms.
 
 - `q` or `Esc` stops the review.
 - If at least one source folder was fully decided, the prompt is:
-  *"Execute everything decided so far, excluding the current folder? [y/N]"*
+  *"Execute everything decided so far, excluding the current folder
+  (PATH)? [y/N]"*
 - The **current** source folder is excluded because its review is incomplete.
   If `q` arrives when the current folder is already finished (for example at
   the next group's destination prompt), there is no unfinished folder to
   exclude and the wording drops that clause.
-- Answering yes applies the completed plans; no applies nothing.
-- At the natural end of the review, the same confirmation is asked once:
-  *"Apply N move(s) from M folder(s)? [y/N]"*.
+- Answering yes applies the completed plans; answering no leaves everything
+  as it was, prints *"Aborted; nothing was changed."* and exits 1.
+- At the natural end of the review, the plan is summarised and the same
+  confirmation is asked once: *"N file(s) to move in M source folder(s), K to
+  skip."* followed by *"Apply these moves? [y/N]"*.
 - `--yes` skips the confirmation and applies everything.
 
 This mirrors `clean`: review first, execute once, and a failed or abandoned
@@ -173,7 +182,8 @@ the safe interpretation of "yes to everything" is "do everything that is
 unambiguous". `--replace --yes` is the explicit `mv -rf` form.
 
 A non-interactive stdin that reaches EOF is treated as `q`; the confirmation
-question then defaults to *no*, so a broken pipe cannot move files.
+question then defaults to *no*, so a broken pipe cannot move files, and the
+command exits 1.
 
 ### 7. Collapse mode
 
@@ -188,7 +198,8 @@ folders instead of combining their contents.
    already present, so a second run continues the numbering instead of
    overwriting.
 4. The original parent directories of the moved folders are removed if they
-   become empty; the moved folder keeps everything inside it.
+   become empty, climbing to but never past the root; the moved folder keeps
+   everything inside it.
 5. Nothing is merged and no file is renamed individually.
 
 ### 8. List mode
@@ -207,12 +218,17 @@ moves, their sources and any failures.
 - Never follow directory symlinks while discovering or moving.
 - Refuse to act when two members of a group would resolve to the same
   destination path.
-- Skip and report anything that raises `OSError`; finish the rest and return a
-  non-zero exit code if any move failed.
+- Discovery is all-or-nothing: if a directory cannot be read, every error is
+  named and the command refuses to act on the partial map.
+- A source that cannot be read during planning is discarded whole; a move
+  that fails is reported with the OS reason and the rest continue. Either way
+  the exit status is 1.
 - Buffered execution: an interrupted review changes nothing until the user
-  says yes.
-- Moves make any existing index stale. The command says so at the end and
-  points at `media-match scan --prune`.
+  says yes. Declining a confirmation is an abort, not a success.
+- `Ctrl-C` before execution discards the buffered plan; after execution has
+  started it reports that anything not listed above was not moved.
+- Moves make an existing index stale. The command says so at the end, only
+  when an index file actually exists, and includes `--db` when one was given.
 
 ## Output shape
 
@@ -220,9 +236,9 @@ Interactive group header, in the same spirit as `duplicates`:
 
 ```
 Group 1/2 — christmas (3 folders)
-  1. [dest*] 2019/christmas        (12 files, 48.2 MB)
-  2.         2020/Christmas         (8 files, 31.0 MB)
-  3.         2021/CHRISTMAS        (15 files, 60.1 MB)
+  1. [dest*] 2019/christmas  (12 files, 48.2 MB)
+  2.         2020/Christmas  (8 files, 31.0 MB)
+  3.         2021/CHRISTMAS  (15 files, 60.1 MB)
   * suggested destination (shortest path)
 
 destination? [Enter]=2019/christmas, 1-3, q=quit >
@@ -231,18 +247,62 @@ destination? [Enter]=2019/christmas, 1-3, q=quit >
 Conflict:
 
 ```
-  conflict  sub/photo.jpg
-    destination  2019/christmas/sub/photo.jpg  (2.4 MB, 2020-12-24 18:31)
-    source       2021/CHRISTMAS/sub/photo.jpg  (3.1 MB, 2021-01-02 09:12)
+  conflict  photo.jpg
+    destination  2019/christmas/photo.jpg  (2.4 MB, modified 2020-12-24 18:31)
+    source       2021/CHRISTMAS/photo.jpg  (3.1 MB, modified 2021-01-02 09:12)
   [r]eplace [R]eplace all [n]ame [N]ame all [s]kip [S]kip all [c]ompare [q]uit >
 ```
 
-Final summary:
+Final summary (the last line appears only when that index exists):
 
 ```
-2 group(s): 3 folder(s) merged, 1 kept, 27 files moved (12 replaced, 4 renamed),
-2 skipped, 0 failed.
+2 source folder(s): 27 file(s) moved (12 replaced, 4 renamed), 2 skipped, 0 failed.
+The media index at /photos/.media-match.db is now stale; run
+'media-match scan --prune /photos' to refresh it.
 ```
+
+`--collapse`:
+
+```
+Group 1/1 — christmas (3 folders)
+  keep 2019/christmas; gather into christmas_collapsed/
+  moved 2020/Christmas -> christmas_collapsed/christmas_1
+  moved 2021/CHRISTMAS -> christmas_collapsed/christmas_2
+
+2 folder(s) gathered into 1 collapsed folder(s), 0 failed.
+```
+
+## Failure modes and exit status
+
+| Status | When |
+|---|---|
+| `0` | completed; nothing to do; a dry run |
+| `1` | declined a confirmation, or EOF; unreadable discovery or source; any failed move or folder |
+| `2` | bad invocation: no folder at `root`, `--list` with `--collapse`, `--collapse` with a file policy, or `--json` without a reporting mode |
+| `130` | `Ctrl-C` before or during the moves |
+
+- **Discovery is incomplete.** Each unreadable directory is named on stderr,
+  followed by `Discovery was incomplete; nothing was changed.` The command
+  exits 1 without listing, planning or moving anything.
+- **A source cannot be read while planning.** That source's whole plan is
+  discarded (no partial merge), the folder is printed as `FAILED <path>:
+  <reason>` and left untouched, and the remaining folders still proceed. The
+  summary counts it as `N source folder(s) could not be read` and the exit
+  status is 1.
+- **A move fails.** `FAILED <source>: <OS reason>` is printed, the file stays
+  where it is, the rest of the plan continues, and the exit status is 1.
+- **A folder is not a folder.** `--collapse` reports `FAILED
+  <Name>_collapsed: <reason>` when the gather path cannot be created (for
+  example, a file with that name is in the way); nothing inside the members is
+  touched.
+- **The user declines.** `Aborted; nothing was changed.` and status 1.
+- **Quit before anything is decided.** `Nothing was moved.` and status 0:
+  there was no completed folder to abandon.
+- **EOF.** Treated as `q`; the confirmation defaults to no and the exit status
+  is 1.
+- **`Ctrl-C`.** Before execution: `Interrupted; nothing was moved.` During
+  execution: `Interrupted during the moves; anything not listed above was not
+  moved.` Both exit 130.
 
 ## Ticket breakdown
 
@@ -250,12 +310,12 @@ Every ticket is independently testable and lands together in one release.
 
 ### T1 — Discovery and grouping
 
-- `find_folder_groups(root, name=None, ignore=())`
+- `find_folder_groups(root, name=None, ignore=(), on_error=None)`
 - recursive walk, no symlink following, hidden and ignored directories pruned
 - case-insensitive grouping by basename; `--name` substring filter
 - deterministic ordering; groups of one dropped
 - unit tests: case variants, nested duplicates, hidden/ignored, `--name`,
-  symlink not followed, single folder excluded
+  symlink not followed, single folder excluded, unreadable directory reported
 
 ### T2 — Destination suggestion and group rendering
 
@@ -272,7 +332,8 @@ Every ticket is independently testable and lands together in one release.
 - `prune_empty_dirs(source)`
 - conflict classification: file/file, file/dir, dir/file
 - unit tests: every action, numbering, nested layout, empty-dir cleanup,
-  skipped files keeping their folder, failures reported not raised
+  skipped files keeping their folder, failures reported not raised, a
+  read failure discarding that source's whole plan
 
 ### T4 — Interactive review
 
@@ -302,13 +363,15 @@ Every ticket is independently testable and lands together in one release.
 
 - `--replace`, `--rename`, `--yes`, `--dry-run`
 - mutually exclusive policies; `--yes` without a policy skips conflicts
-- dry-run never prompts and never writes
-- unit tests: every combination in §6
+- dry-run never prompts and never writes, and exits 1 if planning failed
+- unit tests: every combination in §6, abort/EOF status, JSON stays parseable
+  when a source fails
 
 ### T8 — Collapse
 
 - `<root>/<Name>_collapsed/` creation, numbered moves, continuation of an
-  existing numbering, destination left in place
+  existing numbering, destination left in place, empty ancestors pruned,
+  uncreatable gather path reported
 - `--dry-run` and `--json` reporting
 - unit tests: two groups, existing collapsed folder, name-case preservation
 
@@ -352,6 +415,12 @@ Every ticket is independently testable and lands together in one release.
    a failed move is reported with a non-zero exit code.
 10. `media-match help folders`, `folders --help` and `help folders` are
     identical, and every flag has help text.
+11. An unreadable directory aborts discovery with status 1 and changes
+    nothing; an unreadable source is left untouched, reported and does not
+    stop the other folders.
+12. Declining a confirmation exits 1; EOF acts as no.
+13. The stale-index hint appears only when an index file exists, and carries
+    the explicit `--db` when one was given.
 
 ## Non-goals
 

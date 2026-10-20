@@ -1144,6 +1144,16 @@ def _folders_json_members(group, root):
     return members
 
 
+def _folders_index_hint(root: str, db_arg: str | None) -> None:
+    """Say the index is stale only when there is an index to be stale."""
+    path = db_path_for(root, db_arg)
+    if not os.path.exists(path):
+        return
+    extra = f" --db {db_arg}" if db_arg else ""
+    print(f"The media index at {path} is now stale; run "
+          f"'media-match scan --prune {root}{extra}' to refresh it.")
+
+
 def _folders_list(groups, root, args) -> int:
     from .cleanup import human_size
     from .folders import folder_stats
@@ -1222,11 +1232,15 @@ def _folders_merge(groups, root, args) -> int:
     completed: list[tuple[str, list]] = []
     open_source: str | None = None
     quit_review = False
+    quit_eof = False
     # Destinations claimed by moves that are planned but not applied yet, so
     # two sources with the same filename do not both aim at the same path.
     reserved: set[str] = set()
     out = (lambda _text: None) if args.json else print
+    report_error = ((lambda text: print(text, file=sys.stderr))
+                    if args.json else print)
     dry_payload: list[dict] = []
+    planning_failed = 0
 
     try:
         for index, group in enumerate(groups, 1):
@@ -1278,12 +1292,36 @@ def _folders_merge(groups, root, args) -> int:
                 open_source = source
                 plan_policy = "ask" if (args.dry_run and state.policy is None) \
                     else state.policy
-                moves = plan_folder(
-                    source, destination, policy=plan_policy,
-                    resolve=None if args.dry_run else resolve,
-                    reserved=reserved,
-                )
+                before = set(reserved)
+                try:
+                    moves = plan_folder(
+                        source, destination, policy=plan_policy,
+                        resolve=None if args.dry_run else resolve,
+                        reserved=reserved,
+                    )
+                except OSError as exc:
+                    # A source that cannot be read is left exactly as it is:
+                    # plan_folder's partial list is discarded with the error.
+                    open_source = None
+                    reserved.clear()
+                    reserved.update(before)
+                    planning_failed += 1
+                    report_error(f"  FAILED {os.path.relpath(source, root)}: "
+                                 f"{exc}")
+                    if dry_entry is not None:
+                        dry_entry["sources"].append({
+                            "source": os.path.relpath(source, root),
+                            "moves": [],
+                            "skipped": f"could not read: {exc}",
+                        })
+                    continue
                 open_source = None
+                if not args.dry_run:
+                    for move in moves:
+                        if move.action == "skip" and move.reason == \
+                                "file/directory mismatch":
+                            print(f"  skipped {os.path.relpath(move.source, root)}: "
+                                  f"file/directory mismatch")
                 if args.dry_run:
                     _folders_dry_group(source, moves, root, out=out)
                     dry_entry["sources"].append({
@@ -1299,15 +1337,20 @@ def _folders_merge(groups, root, args) -> int:
                     })
                 else:
                     completed.append((source, moves))
-    except QuitReview:
+    except QuitReview as exc:
         quit_review = True
+        quit_eof = exc.eof
+    except KeyboardInterrupt:
+        stream = sys.stderr if args.json else sys.stdout
+        print("\nInterrupted; nothing was moved.", file=stream)
+        return 130
 
     if args.dry_run:
         if args.json:
             print(json.dumps(dry_payload, indent=2))
         else:
             print("\nDry run: nothing was moved.")
-        return 0
+        return 1 if planning_failed else 0
 
     def actionable(folder_moves):
         return [m for m in folder_moves
@@ -1318,6 +1361,13 @@ def _folders_merge(groups, root, args) -> int:
                   for m in moves if m.action == "skip")
 
     if not completed:
+        if quit_eof:
+            print("\nAborted; nothing was changed.")
+            return 1
+        if planning_failed:
+            print(f"\n{planning_failed} source folder(s) could not be read "
+                  f"and were left untouched.")
+            return 1
         print("\nNothing was moved.")
         return 0
 
@@ -1330,33 +1380,41 @@ def _folders_merge(groups, root, args) -> int:
             else:
                 question = "Execute everything decided so far? [y/N] "
             if not confirm(question):
-                print("Nothing was moved.")
-                return 0
+                print("Aborted; nothing was changed.")
+                return 1
     else:
         print(f"\n{planned} file(s) to move in {len(completed)} source "
               f"folder(s), {skipped} to skip.")
         if not args.yes and not confirm("Apply these moves? [y/N] "):
-            print("Nothing was moved.")
-            return 0
+            print("Aborted; nothing was changed.")
+            return 1
 
     moved = replaced = renamed = failed = 0
-    for source, moves in completed:
-        result = apply_moves(moves, root=root)
-        moved += len(result.moved)
-        replaced += len(result.replaced)
-        renamed += len(result.renamed)
-        failed += len(result.failed)
-        prune_empty_dirs(source)
-        if not os.path.exists(source):
-            prune_empty_ancestors(source, root)
+    try:
+        for source, moves in completed:
+            result = apply_moves(moves, root=root)
+            moved += len(result.moved)
+            replaced += len(result.replaced)
+            renamed += len(result.renamed)
+            failed += len(result.failed)
+            prune_empty_dirs(source)
+            if not os.path.exists(source):
+                prune_empty_ancestors(source, root)
+    except KeyboardInterrupt:
+        stream = sys.stderr if args.json else sys.stdout
+        print("\nInterrupted during the moves; anything not listed above "
+              "was not moved.", file=stream)
+        return 130
 
     print(f"\n{len(completed)} source folder(s): {moved} file(s) moved "
           f"({replaced} replaced, {renamed} renamed), {skipped} skipped, "
           f"{failed} failed.")
+    if planning_failed:
+        print(f"{planning_failed} source folder(s) could not be read and "
+              f"were left untouched.")
     if moved:
-        print("The media index is now stale; run "
-              f"'media-match scan --prune {root}' to refresh it.")
-    return 0 if failed == 0 else 1
+        _folders_index_hint(root, args.db)
+    return 0 if failed == 0 and planning_failed == 0 else 1
 
 
 def _folders_collapse(groups, root, args) -> int:
@@ -1365,26 +1423,33 @@ def _folders_collapse(groups, root, args) -> int:
     out = (lambda _text: None) if args.json else print
     payload = []
     failed = 0
-    for index, group in enumerate(groups, 1):
-        out(f"\nGroup {index}/{len(groups)} — {group.name} "
-            f"({group.size} folders)")
-        out(f"  keep {os.path.relpath(group.suggested, root)}; gather into "
-            f"{os.path.relpath(collapsed_dir(group), root)}/")
-        destination, collapsed, moved, failures = collapse_group(
-            group, out=out, dry_run=args.dry_run)
-        failed += len(failures)
-        payload.append({
-            "name": group.name,
-            "destination": os.path.relpath(destination, root),
-            "collapsed": os.path.relpath(collapsed, root),
-            "moved": [
-                {"from": os.path.relpath(src, root),
-                 "to": os.path.relpath(dst, root)}
-                for src, dst in moved
-            ],
-            "failed": [{"path": os.path.relpath(src, root), "reason": reason}
-                       for src, reason in failures],
-        })
+    try:
+        for index, group in enumerate(groups, 1):
+            out(f"\nGroup {index}/{len(groups)} — {group.name} "
+                f"({group.size} folders)")
+            out(f"  keep {os.path.relpath(group.suggested, root)}; gather "
+                f"into {os.path.relpath(collapsed_dir(group), root)}/")
+            destination, collapsed, moved, failures = collapse_group(
+                group, out=out, dry_run=args.dry_run)
+            failed += len(failures)
+            payload.append({
+                "name": group.name,
+                "destination": os.path.relpath(destination, root),
+                "collapsed": os.path.relpath(collapsed, root),
+                "moved": [
+                    {"from": os.path.relpath(src, root),
+                     "to": os.path.relpath(dst, root)}
+                    for src, dst in moved
+                ],
+                "failed": [{"path": os.path.relpath(src, root),
+                            "reason": reason}
+                           for src, reason in failures],
+            })
+    except KeyboardInterrupt:
+        stream = sys.stderr if args.json else sys.stdout
+        print("\nInterrupted during the moves; anything not listed above "
+              "was not moved.", file=stream)
+        return 130
 
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -1392,8 +1457,11 @@ def _folders_collapse(groups, root, args) -> int:
         print("\nDry run: nothing was moved.")
     else:
         total = sum(len(entry["moved"]) for entry in payload)
+        gathered = sum(1 for entry in payload if entry["moved"])
         print(f"\n{total} folder(s) gathered into "
-              f"{len(groups)} collapsed folder(s), {failed} failed.")
+              f"{gathered} collapsed folder(s), {failed} failed.")
+        if total:
+            _folders_index_hint(root, args.db)
     return 0 if failed == 0 else 1
 
 
@@ -1404,7 +1472,7 @@ def cmd_folders(args: argparse.Namespace) -> int:
 
     root = os.path.abspath(args.root)
     if not os.path.isdir(root):
-        print(f"Not a folder: {root}")
+        print(f"No folder at {root}.")
         return 2
     if args.list and args.collapse:
         print("Choose one: --list shows the groups, --collapse acts on them.")
@@ -1417,8 +1485,22 @@ def cmd_folders(args: argparse.Namespace) -> int:
         print("--json needs --list, --collapse or --dry-run.")
         return 2
 
-    groups = find_folder_groups(root, name=args.name,
-                               ignore=load_ignore(root))
+    read_errors: list[OSError] = []
+    try:
+        groups = find_folder_groups(root, name=args.name,
+                                    ignore=load_ignore(root),
+                                    on_error=read_errors.append)
+    except KeyboardInterrupt:
+        print("\nInterrupted; nothing was changed.", file=sys.stderr)
+        return 130
+    if read_errors:
+        for exc in read_errors:
+            where = exc.filename or root
+            reason = exc.strerror or str(exc)
+            print(f"could not read {where}: {reason}", file=sys.stderr)
+        print("Discovery was incomplete; nothing was changed.",
+              file=sys.stderr)
+        return 1
     if not groups:
         if args.json:
             print("[]")
@@ -1430,7 +1512,11 @@ def cmd_folders(args: argparse.Namespace) -> int:
         return 0
 
     if args.list:
-        return _folders_list(groups, root, args)
+        try:
+            return _folders_list(groups, root, args)
+        except KeyboardInterrupt:
+            print("\nInterrupted; nothing was changed.", file=sys.stderr)
+            return 130
     if args.collapse:
         return _folders_collapse(groups, root, args)
     return _folders_merge(groups, root, args)
@@ -3365,8 +3451,9 @@ def main(argv: list[str] | None = None) -> int:
             "Find folders that share a name regardless of case — "
             "2019/christmas, 2020/Christmas, 2021/CHRISTMAS — and work on "
             "them at the folder level. The default is an interactive review "
-            "like 'clean': pick the destination (the shallowest is "
-            "suggested), then decide each filename conflict with "
+            "in the same spirit as 'clean': pick the destination (the "
+            "shallowest is suggested), then decide each conflict at the same "
+            "relative path with "
             "r/R=replace, n/N=rename, s/S=skip, c=compare (size, EXIF, "
             "video facts) and q=quit. Decisions are buffered; nothing moves "
             "until the final confirmation, and quitting offers to execute "
@@ -3374,7 +3461,9 @@ def main(argv: list[str] | None = None) -> int:
             "non-destination folder into <root>/<Name>_collapsed as "
             "<Name>_1, <Name>_2, ... without touching the files inside. "
             "This is a filesystem command: it reads and writes no index, so "
-            "run 'scan --prune' afterwards to refresh one."
+            "run 'scan --prune' afterwards to refresh one. --db is used only "
+            "to check whether that index file exists when the stale-index "
+            "hint is printed."
         ),
     )
     _add_common(p_folders)

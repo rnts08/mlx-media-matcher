@@ -327,6 +327,52 @@ Group 1 (2 files)
     ~/Pictures/beach_thumb.jpg  (150x100, 0.0MP) hamming=0
 ```
 
+### Folder consolidation
+
+`folders` is the same idea one level up: it finds directories that share a
+name regardless of case — `2019/christmas`, `2020/Christmas`,
+`2021/CHRISTMAS` — and merges their files into the copy closest to the root.
+`--name NAME` narrows discovery to names containing NAME, like
+`find -type d -iname '*NAME*'`; `--list` only reports.
+
+Example `folders --list` output:
+
+```
+Group 1/1 — christmas (3 folders)
+  [dest*] 2019/christmas  (12 files, 48.2 MB)
+          2020/Christmas  (8 files, 31.0 MB)
+          2021/CHRISTMAS  (15 files, 60.1 MB)
+  * suggested destination (shortest path)
+
+1 group(s), 3 folders — 2 redundant folder(s)
+```
+
+During the review, each conflict at the same relative path is one prompt; the
+two sides are shown with their size and modification time, and `c` adds EXIF
+or video facts:
+
+```
+  conflict  photo.jpg
+    destination  2019/christmas/photo.jpg  (2.4 MB, modified 2020-12-24 18:31)
+    source       2021/CHRISTMAS/photo.jpg  (3.1 MB, modified 2021-01-02 09:12)
+  [r]eplace [R]eplace all [n]ame [N]ame all [s]kip [S]kip all [c]ompare [q]uit >
+```
+
+Nothing is moved until the final confirmation; quitting asks whether to apply
+the folders already finished and excludes the open one. `--rename --yes` keeps
+both files, `--replace --yes` is the explicit `mv -f`, and plain `--yes`
+skips conflicts rather than guessing. `--collapse` is the non-destructive
+alternative: keep the destination where it is and gather the other folders
+into `<root>/<Name>_collapsed/` as `<Name>_1`, `<Name>_2`, … without touching
+their contents.
+
+Exit status is `0` when the run completed, `1` when the user declined a
+confirmation, a folder could not be read, or a move failed, `2` for a bad
+invocation, and `130` for `Ctrl-C`. Discovery is all-or-nothing: an unreadable
+directory is named and nothing is changed, so a merge never acts on half a
+tree. A move that fails is reported with its OS reason and the rest continue.
+The stale-index line is printed only when an index actually exists.
+
 ## Commands
 
 Grouped by what they are for, in the order you would reach for them —
