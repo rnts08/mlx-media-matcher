@@ -7,6 +7,7 @@ import calendar
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -302,9 +303,6 @@ def _quick_index(args: argparse.Namespace, root: str, ignore: list[str]) -> int:
     """Stat-only first pass: create basic rows with stable ids."""
     from .pipeline import iter_media
 
-    if not os.path.isdir(root):
-        print(f"No folder at {root}.")
-        return 2
     if args.limit is not None and args.limit < 1:
         print("--limit must be at least 1", file=sys.stderr)
         return 2
@@ -352,6 +350,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     cfg = load_config()
     root = os.path.abspath(args.root)
     ignore = load_ignore(root)
+
+    if not _require_root(root):
+        return 2
 
     if args.quick:
         incompatible = [
@@ -1598,8 +1599,7 @@ def cmd_folders(args: argparse.Namespace) -> int:
     from .folders import find_folder_groups
 
     root = os.path.abspath(args.root)
-    if not os.path.isdir(root):
-        print(f"No folder at {root}.")
+    if not _require_root(root):
         return 2
     if args.list and args.collapse:
         print("Choose one: --list shows the groups, --collapse acts on them.")
@@ -2003,6 +2003,8 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         return 2
 
     root = os.path.abspath(args.root)
+    if not _require_root(root):
+        return 2
     ignore = load_ignore(root)
 
     # Moving files into a folder inside the tree we are about to walk would
@@ -2180,6 +2182,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     from .config import load_ignore
 
     root = os.path.abspath(args.root)
+    if not _require_root(root):
+        return 2
     ignore = load_ignore(root)
     include_video = args.video
 
@@ -2265,6 +2269,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     cfg = load_config()
     root = os.path.abspath(args.root)
     ignore = load_ignore(root)
+
+    if not _require_root(root):
+        return 2
 
     # An explicit flag wins, then the config file, then the built-in default.
     # Resolved once here and passed down — the raw flag can be None and must
@@ -2862,7 +2869,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.0"
+_VERSION = "0.4.1"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -3106,6 +3113,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
     from .bench import TIE_THRESHOLD, run_benchmark
 
     root = os.path.abspath(args.root) if getattr(args, "root", None) else None
+    if root and not _require_root(root):
+        return 2
     count = getattr(args, "files", None) or 32
     repeat = getattr(args, "repeat", None) or 1
 
@@ -3260,6 +3269,43 @@ def _add_id_range(parser: argparse.ArgumentParser) -> None:
         metavar="N",
         help="only indexed rows with id <= N (inclusive)",
     )
+
+
+def _require_root(root: str) -> bool:
+    """False for a misspelled or non-directory root, with the shared message.
+
+    Commands that create or walk the tree must call this before touching the
+    filesystem, or SQLite answers a typo like `scan hekp` with a traceback
+    from "unable to open database file".
+    """
+    if os.path.isdir(root):
+        return True
+    print(f"No folder at {root}.")
+    return False
+
+
+def _run_command(args: argparse.Namespace) -> int:
+    """Dispatch one command, turning expected OS/user errors into messages.
+
+    A stack trace is for bugs; a mistyped path or a bad `--db` location is a
+    normal input error and gets one line on stderr instead. Programming
+    errors (anything else) still escape loudly.
+    """
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except sqlite3.DatabaseError as exc:
+        target = getattr(args, "db", None)
+        where = f" at {target}" if target else ""
+        print(f"cannot open the index database{where}: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        detail = f"{reason}: {exc.filename}" if exc.filename else reason
+        print(detail, file=sys.stderr)
+        return 1
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -4113,7 +4159,7 @@ def main(argv: list[str] | None = None) -> int:
         print("--start-id must be <= --stop-id", file=sys.stderr)
         return 2
 
-    return args.func(args)
+    return _run_command(args)
 
 
 if __name__ == "__main__":
