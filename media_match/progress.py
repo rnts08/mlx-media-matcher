@@ -4,7 +4,6 @@ A scan of 20k files is minutes of unexplained silence. The old output printed
 ``preparing [4000/20000]`` twenty times, which answers "is it alive" but not
 "is it fast" or "is it stuck" — and it never said which files were in flight,
 so a single pathological image looked exactly like slow-but-progressing work.
-
 This draws one live status instead, showing the things that actually tell you
 whether to wait or to interrupt:
 
@@ -27,6 +26,11 @@ The three numbers to actually read:
 Rendering happens on its own thread at a fixed rate. The pipeline only ever
 mutates a small state object under a lock, so instrumentation costs
 microseconds and never sits in front of a decode.
+
+The describe stage reuses the same bar and the same counters. Its buffer is the
+prefetch window rather than a byte ring — ``window 6/8`` frames decoded ahead of
+the caption model — so "full" means the GPU is the bottleneck and "empty" means
+it is starving.
 
 Everything degrades quietly: no TTY (pipes, CI, tests) means nothing is drawn
 at all and the caller falls back to its own periodic lines.
@@ -62,9 +66,13 @@ class PipelineState:
     reading: list[str] = field(default_factory=list)
     #: paths currently being decoded/hashed/preprocessed (bounded)
     decoding: list[str] = field(default_factory=list)
-    #: (used bytes, capacity) of the read ring
+    #: (used, capacity) of the pipeline's buffer: the read ring during a scan,
+    #: the prefetch window during describe. Bytes for the ring, a plain count
+    #: for the window, so the unit is carried by ring_bytes.
     ring_used: int = 0
     ring_cap: int = 0
+    ring_label: str = "ring"
+    ring_bytes: bool = True
     cpu_seconds: float = 0.0
     gpu_seconds: float = 0.0
     bytes_read: int = 0
@@ -139,7 +147,10 @@ def render(state: PipelineState, root: str, label: str, *,
     if width >= 60:
         head += f" [{bar(fraction, 20)}] {fraction * 100:3.0f}%"
     if rate > 0:
-        head += f"  {rate:,.0f}/s"
+        # Scans run at hundreds per second, describing at about one. Whole
+        # numbers turned a working describe stage into "0/s" for its entire
+        # run, which reads as stuck rather than slow.
+        head += f"  {rate:,.1f}/s" if rate < 10 else f"  {rate:,.0f}/s"
     if eta and total:
         head += f"  eta {eta}"
 
@@ -155,7 +166,11 @@ def render(state: PipelineState, root: str, label: str, *,
     if state.ring_cap:
         used, cap = state.ring_used, state.ring_cap
         share = used / cap if cap else 0.0
-        ring = f"ring {human_bytes(used)}/{human_bytes(cap)} {share * 100:3.0f}%"
+        if state.ring_bytes:
+            shown = f"{human_bytes(used)}/{human_bytes(cap)}"
+        else:
+            shown = f"{used}/{cap}"
+        ring = f"{state.ring_label} {shown} {share * 100:3.0f}%"
 
     # GPU time is wall time spent inside forward passes, so it cannot exceed
     # the elapsed window. Clamp anyway: the first frame is drawn microseconds
@@ -235,6 +250,19 @@ class ProgressBar:
         with self._lock:
             self.state.ring_used = used
             self.state.ring_cap = cap
+
+    def set_window(self, used: int, cap: int, label: str = "window") -> None:
+        """Report a buffer measured in items rather than bytes.
+
+        The describe stage's analogue of the read ring is its prefetch window:
+        how many frames the CPU has decoded ahead of the VLM. Full means the
+        GPU is the bottleneck, empty means it is starving.
+        """
+        with self._lock:
+            self.state.ring_used = used
+            self.state.ring_cap = cap
+            self.state.ring_label = label
+            self.state.ring_bytes = False
 
     def note_read(self, nbytes: int) -> None:
         with self._lock:

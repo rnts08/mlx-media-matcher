@@ -92,6 +92,15 @@ def test_render_shows_progress_rate_and_eta():
     assert "eta" in head
 
 
+def test_slow_rates_keep_a_decimal():
+    """Describing runs at ~1/s; rounding that to "0/s" looks like a stall."""
+    state = _state(done=2, total=10)
+    state.started = time.perf_counter() - 10  # 0.2 items/s
+    head = render(state, "/root", "describing", width=100).split("\n")[0]
+    assert "0.2/s" in head, head
+    assert "0/s" not in head
+
+
 def test_render_does_not_show_an_absurd_rate_on_the_first_frame():
     # elapsed is microseconds on frame one; without a floor this printed
     # "648,493/s" and a GPU utilisation of 739,281,703%.
@@ -139,6 +148,26 @@ def test_render_omits_the_ring_until_it_is_known():
     # "ring 0B/0B 0%" would be noise.
     text = render(_state(done=1), "/root", "indexing", width=100)
     assert "ring" not in text
+
+
+def test_render_shows_a_window_measured_in_items():
+    """Describe's prefetch window is a count of frames, not bytes."""
+    state = _state(done=2, ring_used=3, ring_cap=8)
+    state.ring_label = "window"
+    state.ring_bytes = False
+    text = render(state, "/root", "describing", width=120)
+    assert "window 3/8" in text and "38%" in text
+    assert "B/" not in text, "a frame count must not be rendered as bytes"
+
+
+def test_set_window_switches_the_buffer_to_items():
+    bar = ProgressBar("describing", "/root", total=4, stream=io.StringIO(),
+                      enabled=True)
+    bar.set_ring(1024, 2048)
+    bar.set_window(5, 8)
+    assert bar.state.ring_label == "window"
+    assert bar.state.ring_bytes is False
+    assert (bar.state.ring_used, bar.state.ring_cap) == (5, 8)
 
 
 def test_render_reports_gpu_percentage_and_errors():

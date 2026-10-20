@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import os
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
@@ -137,6 +138,7 @@ def run_describe_stage(
     on_result=None,
     on_error=None,
     progress=None,
+    telemetry=None,
 ) -> int:
     """Caption every job, keeping the GPU fed with prefetched frames.
 
@@ -149,6 +151,11 @@ def run_describe_stage(
     call per image. Batch mode requires the describer to expose
     ``describe_batch``; otherwise it falls back to one-at-a-time.
 
+    ``telemetry``, when given, receives the same live counters the scan bar
+    draws: the prefetch window as a buffer depth, CPU and GPU seconds, the
+    filenames being decoded, and errors. Describing is the slowest stage, so
+    it is the one where an idle GPU or an empty window is most worth seeing.
+
     Every 100 items the MLX cache is returned to the OS, so a 100k-item
     library cannot grow the process into a jetsam target.
     """
@@ -158,6 +165,17 @@ def run_describe_stage(
     emitted = 0
     clear_every = 100
     use_batch = batch_size > 1 and hasattr(describer, "describe_batch")
+    t_cpu = time.process_time()
+
+    def note_cpu() -> None:
+        if telemetry is not None:
+            telemetry.note_cpu(time.process_time() - t_cpu)
+
+    def report_error(path: str, exc: Exception) -> None:
+        if telemetry is not None:
+            telemetry.note_error()
+        if on_error is not None:
+            on_error(path, exc)
 
     def store(job: DescribeJob, description: str, keywords: list[str]) -> None:
         joined = ", ".join(keywords)
@@ -165,6 +183,9 @@ def run_describe_stage(
             db.set_description(job.media_id, description, joined)
         else:
             db.set_video_description(job.media_id, description, joined)
+        if telemetry is not None:
+            telemetry.note_completed()
+            note_cpu()
         if on_result is not None:
             on_result(job, description, keywords)
 
@@ -181,26 +202,42 @@ def run_describe_stage(
         pending: set = set()
         job_of: dict[object, DescribeJob] = {}
 
+        def load(job: DescribeJob):
+            """Decode in a worker thread, showing the name while it runs."""
+            if telemetry is not None:
+                telemetry.note_decoding(job.path)
+            try:
+                return load_frame(job)
+            finally:
+                if telemetry is not None:
+                    telemetry.note_finished(job.path)
+
         def fill() -> None:
             while len(pending) < window:
                 try:
                     job = next(iterator)
                 except StopIteration:
-                    return
-                future = pool.submit(load_frame, job)
+                    break
+                future = pool.submit(load, job)
                 job_of[future] = job
                 pending.add(future)
+            if telemetry is not None:
+                telemetry.set_window(len(pending), window)
 
         fill()
         ready: list[tuple[DescribeJob, object]] = []
 
         def drain_ready() -> None:
             """Move completed futures into the ready list."""
+            if not pending:
+                return
             done, pending_set = wait(pending, return_when=FIRST_COMPLETED)
             pending.clear()
             pending.update(pending_set)
             for future in done:
                 ready.append((job_of.pop(future), future))
+            if telemetry is not None:
+                telemetry.set_window(len(pending) + len(ready), window)
 
         drain_ready()
         while ready or pending:
@@ -215,8 +252,7 @@ def run_describe_stage(
                     batch_frames.append(future.result())
                     batch_jobs.append(job)
                 except Exception as exc:  # noqa: BLE001 - keep describing
-                    if on_error is not None:
-                        on_error(job.path, exc)
+                    report_error(job.path, exc)
             if not batch_jobs:
                 if pending:
                     drain_ready()
@@ -224,24 +260,35 @@ def run_describe_stage(
                     continue
                 break
             if use_batch and len(batch_jobs) > 1:
+                batch_start = time.perf_counter()
                 try:
                     results = describer.describe_batch(batch_frames)
-                    store_batch(list(zip(batch_jobs, [r[0] for r in results],
-                                          [r[1] for r in results])))
                 except Exception as exc:  # noqa: BLE001 - fall back to one-by-one
+                    if telemetry is not None:
+                        telemetry.note_gpu(time.perf_counter() - batch_start)
                     for job, frame in zip(batch_jobs, batch_frames):
-                        if on_error is not None:
-                            on_error(job.path, exc)
+                        report_error(job.path, exc)
+                        one_start = time.perf_counter()
                         try:
                             d, k = describer.describe(frame)
                             store(job, d, k)
                             emitted += 1
                         except Exception:  # noqa: BLE001
                             pass
+                        finally:
+                            if telemetry is not None:
+                                telemetry.note_gpu(
+                                    time.perf_counter() - one_start)
                     if emitted % clear_every == 0:
                         _clear_mlx_cache()
+                else:
+                    if telemetry is not None:
+                        telemetry.note_gpu(time.perf_counter() - batch_start)
+                    store_batch(list(zip(batch_jobs, [r[0] for r in results],
+                                         [r[1] for r in results])))
             else:
                 job, frame = batch_jobs[0], batch_frames[0]
+                start = time.perf_counter()
                 try:
                     description, keywords = describer.describe(frame)
                     store(job, description, keywords)
@@ -249,8 +296,10 @@ def run_describe_stage(
                     if emitted % clear_every == 0:
                         _clear_mlx_cache()
                 except Exception as exc:  # noqa: BLE001 - keep describing
-                    if on_error is not None:
-                        on_error(job.path, exc)
+                    report_error(job.path, exc)
+                finally:
+                    if telemetry is not None:
+                        telemetry.note_gpu(time.perf_counter() - start)
             fill()
             drain_ready()
 

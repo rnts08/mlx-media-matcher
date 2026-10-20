@@ -175,3 +175,84 @@ def test_describe_only_queues_undescribed(tmp_path):
 
     plan2 = describe_targets(db, str(root), include_videos=False)
     assert plan2.jobs == [] and plan2.shadowed == 0
+
+
+# -- live telemetry ---------------------------------------------------------
+
+
+def _bar(tmp_path, total):
+    """A bar that is never started: no thread, no drawing, just the state."""
+    import io
+
+    from media_match.progress import ProgressBar
+
+    return ProgressBar("describing", str(tmp_path), total,
+                       stream=io.StringIO(), enabled=True)
+
+
+def _write_noise(path, seed):
+    """Distinct images with distinct pHashes; solid colours collide."""
+    rng = np.random.default_rng(seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)).save(path)
+
+
+def test_stage_reports_progress_telemetry(tmp_path):
+    root = tmp_path / "tree"
+    root.mkdir()
+    for i in range(5):
+        _write_noise(root / f"{i}.png", seed=i)
+    db = Database(str(tmp_path / "t.db"))
+    _index_tree(root, db)
+    plan = describe_targets(db, str(root), include_videos=False)
+    assert len(plan.jobs) == 5
+
+    bar = _bar(tmp_path, len(plan.jobs))
+    n = run_describe_stage(plan.jobs, FakeDescriber(), db, workers=2,
+                           window=4, telemetry=bar)
+
+    assert n == 5 == bar.state.done
+    assert bar.state.errors == 0
+    assert bar.state.decoding == [], "finished names must leave the display"
+    # The prefetch window is reported in items, not bytes.
+    assert bar.state.ring_label == "window"
+    assert bar.state.ring_cap == 4
+    assert bar.state.ring_bytes is False
+    # GPU time is measured around the describe calls, CPU around the stage.
+    assert bar.state.gpu_seconds > 0
+    assert bar.state.cpu_seconds > 0
+
+
+def test_stage_reports_errors_without_counting_them_as_described(tmp_path):
+    root = tmp_path / "tree"
+    root.mkdir()
+    _write_image(root / "a.png", color=(120, 30, 200))
+    _write_image(root / "b.png", color=(200, 30, 120))
+    db = Database(str(tmp_path / "t.db"))
+    _index_tree(root, db)
+    plan = describe_targets(db, str(root), include_videos=False)
+
+    bar = _bar(tmp_path, len(plan.jobs))
+    n = run_describe_stage(plan.jobs, FakeDescriber(fail_on={"64x48"}), db,
+                           workers=1, telemetry=bar)
+
+    assert n == 0
+    assert bar.state.errors == 2
+    assert bar.state.done == 0, "a failed caption is not a completed item"
+
+
+def test_window_is_reported_after_the_stage(tmp_path):
+    """The fill/drain bookkeeping must not leave a stale window behind."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    _write_image(root / "a.png")
+    db = Database(str(tmp_path / "t.db"))
+    _index_tree(root, db)
+    plan = describe_targets(db, str(root), include_videos=False)
+
+    bar = _bar(tmp_path, len(plan.jobs))
+    run_describe_stage(plan.jobs, FakeDescriber(), db, workers=1, window=4,
+                       telemetry=bar)
+    assert bar.state.ring_used == 0
+    # The window is clamped to the job count but never below two.
+    assert bar.state.ring_cap == 2

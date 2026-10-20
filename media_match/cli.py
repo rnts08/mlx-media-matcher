@@ -425,9 +425,19 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
     total = len(plan.jobs)
     done = 0
 
+    from .progress import ProgressBar
+
+    bar = ProgressBar("describing", root, total,
+                      enabled=_progress_enabled(args)).start()
+
     def progress(job) -> None:
         nonlocal done
         done += 1
+        if bar.enabled:
+            # The bar counts completed items itself, from the store call, so
+            # a frame that failed to decode is counted as an error and not as
+            # described.
+            return
         print(f"[{done}/{total}] describing {job.kind} {job.label}",
               file=sys.stderr)
 
@@ -437,8 +447,11 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
             workers=getattr(args, "describe_workers", None) or 3,
             batch_size=getattr(args, "describe_batch", None) or 1,
             on_error=on_error, progress=progress,
+            telemetry=bar,
         )
     finally:
+        # An exception mid-describe must not leave the cursor mid-line.
+        bar.stop()
         describer.unload()
     return described
 
@@ -2268,7 +2281,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.2.27"
+_VERSION = "0.2.28"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"

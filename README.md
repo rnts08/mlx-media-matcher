@@ -131,8 +131,8 @@ same-looking people group together. It is honest about its limits: CLIP groups
 needs a face-embedding model). `people --label N=Name` names a cluster and
 `search --cluster Name` lists it.
 
-**Watching a scan run.** On a terminal, `scan` and `analyze` draw a live
-two-line status instead of periodic "preparing [n/total]" lines:
+**Watching a scan run.** On a terminal, `scan`, `analyze` and `describe` draw a
+live two-line status instead of periodic "preparing [n/total]" lines:
 
 ```
 indexing     14,208/20,000  [█████████████░░░░░░░░]  71%  186/s  eta 0:50
@@ -149,6 +149,11 @@ The counters are there to tell you whether to wait or interrupt:
 - **gpu** — time inside embedding calls, as a percentage of wall time. Low
   GPU share with a full ring is exactly the "GPU is idle" case the ring buffer
   exists to fix.
+
+During `describe` the same bar reads the second line as `window 6/8`: how many
+frames the CPU has decoded ahead of the caption model. A **full** window means
+the GPU is the bottleneck and `--describe-workers` will not help; an **empty**
+one means the captioner is waiting on decodes and it will.
 
 `--no-progress` turns it off (implied when stderr is not a terminal, so piped
 output and CI keep one-event-per-line logs). `MEDIA_MATCH_NO_PROGRESS=1` does
