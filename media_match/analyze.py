@@ -75,7 +75,9 @@ def load_frame(job: DescribeJob):
 
 
 def describe_targets(db: Database, root: str, *, include_videos: bool = True,
-                     missing_ok: bool = False) -> DescribePlan:
+                     missing_ok: bool = False,
+                     start_id: int | None = None,
+                     stop_id: int | None = None) -> DescribePlan:
     """Build the unified describe queue: undescribed images + videos.
 
     The best-resolution version of each duplicate group is queued; its copies
@@ -103,7 +105,7 @@ def describe_targets(db: Database, root: str, *, include_videos: bool = True,
         shadowed += len(pending) - len(picked)
         return picked
 
-    records = db.all_files()
+    records = db.all_files(start_id, stop_id)
     best_of: dict[int, int] = {}
     for group in find_duplicate_groups(records):
         for member in [group.best] + [rec for rec, _ in group.others]:
@@ -112,7 +114,7 @@ def describe_targets(db: Database, root: str, *, include_videos: bool = True,
         jobs.append(DescribeJob("image", r.id, r.path, os.path.relpath(r.path, root)))
 
     if include_videos:
-        vrecords = db.all_videos_with_frames()
+        vrecords = db.all_videos_with_frames(start_id, stop_id)
         vbest: dict[int, int] = {}
         for group in find_video_duplicate_groups(vrecords):
             for member in [group.best] + [rec for rec, _ in group.others]:

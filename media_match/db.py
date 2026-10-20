@@ -141,6 +141,25 @@ _EXIF_COLUMNS = (
 )
 
 
+def _id_clause(
+    start_id: int | None, stop_id: int | None, column: str = "id"
+) -> tuple[str, list[int]]:
+    """SQL predicate for an inclusive id window (empty string when unbounded).
+
+    `files.id` and `videos.id` are independent sequences, so callers apply the
+    same numeric window to each table separately.
+    """
+    clauses: list[str] = []
+    params: list[int] = []
+    if start_id is not None:
+        clauses.append(f"{column} >= ?")
+        params.append(start_id)
+    if stop_id is not None:
+        clauses.append(f"{column} <= ?")
+        params.append(stop_id)
+    return " AND ".join(clauses), params
+
+
 def _add_missing_columns(conn: sqlite3.Connection, table: str, columns) -> None:
     existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
     for name, decl in columns:
@@ -363,8 +382,37 @@ class Database:
             )
         self.conn.commit()
 
-    def all_files(self) -> list[FileRecord]:
-        rows = self.conn.execute("SELECT * FROM files ORDER BY path").fetchall()
+    def add_quick_files(
+        self, rows: list[tuple[str, int, float]], *, limit: int | None = None
+    ) -> int:
+        """Insert basic image rows without reading file contents.
+
+        Existing rows are left exactly as they are (``DO NOTHING``), so a quick
+        pass can never downgrade an analysed row. Returns the number of new
+        rows; when ``limit`` is given, stop after that many *new* rows so a
+        repeated run advances through the tree.
+        """
+        sql = ("INSERT INTO files(path, size, mtime, sha1, width, height, phash) "
+               "VALUES(?, ?, ?, '', 0, 0, '') ON CONFLICT(path) DO NOTHING")
+        if limit is not None and limit <= 0:
+            return 0
+        added = 0
+        for path, size, mtime in rows:
+            if self.conn.execute(sql, (path, size, mtime)).rowcount:
+                added += 1
+                if limit is not None and added >= limit:
+                    break
+        self.conn.commit()
+        return added
+
+    def all_files(self, start_id: int | None = None,
+                  stop_id: int | None = None) -> list[FileRecord]:
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT * FROM files"
+        if where:
+            sql += f" WHERE {where}"
+        sql += " ORDER BY path"
+        rows = self.conn.execute(sql, params).fetchall()
         return [
             FileRecord(
                 id=r["id"], path=r["path"], size=r["size"], mtime=r["mtime"],
@@ -468,13 +516,37 @@ class Database:
             keywords=r["keywords"], raw_keywords=r["raw_keywords"],
         )
 
-    def all_videos(self) -> list[VideoRecord]:
-        rows = self.conn.execute("SELECT * FROM videos ORDER BY path").fetchall()
+    def add_quick_videos(
+        self, rows: list[tuple[str, int, float]], *, limit: int | None = None
+    ) -> int:
+        """Insert basic video rows without probing the files."""
+        sql = ("INSERT INTO videos(path, size, mtime, sha1, width, height) "
+               "VALUES(?, ?, ?, '', 0, 0) ON CONFLICT(path) DO NOTHING")
+        if limit is not None and limit <= 0:
+            return 0
+        added = 0
+        for path, size, mtime in rows:
+            if self.conn.execute(sql, (path, size, mtime)).rowcount:
+                added += 1
+                if limit is not None and added >= limit:
+                    break
+        self.conn.commit()
+        return added
+
+    def all_videos(self, start_id: int | None = None,
+                   stop_id: int | None = None) -> list[VideoRecord]:
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT * FROM videos"
+        if where:
+            sql += f" WHERE {where}"
+        sql += " ORDER BY path"
+        rows = self.conn.execute(sql, params).fetchall()
         return [self._video_record(r) for r in rows]
 
-    def all_videos_with_frames(self) -> list[VideoRecord]:
+    def all_videos_with_frames(self, start_id: int | None = None,
+                               stop_id: int | None = None) -> list[VideoRecord]:
         """VideoRecords with their per-keyframe pHashes attached (for grouping)."""
-        records = {r.id: r for r in self.all_videos()}
+        records = {r.id: r for r in self.all_videos(start_id, stop_id)}
         rows = self.conn.execute(
             "SELECT video_id, phash FROM video_frames ORDER BY video_id, idx"
         ).fetchall()
@@ -484,13 +556,17 @@ class Database:
                 record.phashes.append(r["phash"])
         return list(records.values())
 
-    def video_embeddings(self) -> dict[int, list[tuple[float, bytes]]]:
+    def video_embeddings(self, start_id: int | None = None,
+                         stop_id: int | None = None) -> dict[int, list[tuple[float, bytes]]]:
         """video_id -> [(timestamp, float32 blob), ...] for embedded keyframes."""
         out: dict[int, list[tuple[float, bytes]]] = {}
-        rows = self.conn.execute(
-            "SELECT video_id, t, embedding FROM video_frames "
-            "WHERE embedding IS NOT NULL ORDER BY video_id, idx"
-        ).fetchall()
+        where, params = _id_clause(start_id, stop_id, column="video_id")
+        sql = ("SELECT video_id, t, embedding FROM video_frames "
+               "WHERE embedding IS NOT NULL")
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY video_id, idx"
+        rows = self.conn.execute(sql, params).fetchall()
         for r in rows:
             out.setdefault(r["video_id"], []).append((r["t"], r["embedding"]))
         return out
@@ -558,10 +634,14 @@ class Database:
             )
         self.conn.commit()
 
-    def files_missing_embedding(self) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT id, path FROM files WHERE embedding IS NULL ORDER BY path"
-        ).fetchall()
+    def files_missing_embedding(self, start_id: int | None = None,
+                                stop_id: int | None = None) -> list[sqlite3.Row]:
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT id, path FROM files WHERE embedding IS NULL"
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY path"
+        return self.conn.execute(sql, params).fetchall()
 
     def set_embeddings(self, vectors: list[tuple[int, bytes]]) -> None:
         self.conn.executemany(
@@ -570,11 +650,15 @@ class Database:
         )
         self.conn.commit()
 
-    def all_embeddings(self) -> tuple[list[int], list[bytes]]:
+    def all_embeddings(self, start_id: int | None = None,
+                       stop_id: int | None = None) -> tuple[list[int], list[bytes]]:
         """(file ids, raw float32 embedding blobs) for indexed files that have one."""
-        rows = self.conn.execute(
-            "SELECT id, embedding FROM files WHERE embedding IS NOT NULL ORDER BY id"
-        ).fetchall()
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT id, embedding FROM files WHERE embedding IS NOT NULL"
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY id"
+        rows = self.conn.execute(sql, params).fetchall()
         return [r["id"] for r in rows], [r["embedding"] for r in rows]
 
     def embedding_for_path(self, path: str) -> bytes | None:
@@ -784,15 +868,21 @@ class Database:
 
     # -- tag refinement -----------------------------------------------------
 
-    def rows_for_refinement(self, kind: str) -> list[sqlite3.Row]:
+    def rows_for_refinement(self, kind: str, start_id: int | None = None,
+                            stop_id: int | None = None) -> list[sqlite3.Row]:
         """id + current/raw keywords + description, for (re)building tags."""
         table = "files" if kind == "image" else "videos"
-        return self.conn.execute(
-            f"SELECT id, keywords, raw_keywords, description FROM {table} ORDER BY path"
-        ).fetchall()
+        where, params = _id_clause(start_id, stop_id)
+        sql = f"SELECT id, keywords, raw_keywords, description FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        sql += " ORDER BY path"
+        return self.conn.execute(sql, params).fetchall()
 
     def apply_refinement(
-        self, kind: str, items: list[tuple[int, str, str, str, list[tuple[str, str | None]]]]
+        self, kind: str,
+        items: list[tuple[int, str, str, str, list[tuple[str, str | None]]]],
+        scope_ids: list[int] | None = None,
     ) -> None:
         """Replace refined tags for one media kind.
 
@@ -804,7 +894,16 @@ class Database:
         table = "files" if kind == "image" else "videos"
         fts = "files_fts" if kind == "image" else "videos_fts"
         existing = {r["id"] for r in self.conn.execute(f"SELECT id FROM {table}")}
-        self.conn.execute("DELETE FROM media_tags WHERE kind = ?", (kind,))
+        # Delete only the tags this run is rebuilding. Deleting every tag of
+        # the kind would erase out-of-window items when --start-id/--stop-id
+        # is used (and would wipe everything if items happened to be empty).
+        scoped = list(scope_ids) if scope_ids is not None else [i[0] for i in items]
+        if scoped:
+            marks = ",".join("?" * len(scoped))
+            self.conn.execute(
+                f"DELETE FROM media_tags WHERE kind = ? AND media_id IN ({marks})",
+                (kind, *scoped),
+            )
         tag_rows: list[tuple[str, int, str, str | None]] = []
         for media_id, refined, raw, description, pairs in items:
             if media_id not in existing:
@@ -996,16 +1095,23 @@ class Database:
         )
         self.conn.commit()
 
-    def files_needing_type(self) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT id, path FROM files WHERE embedding IS NOT NULL AND type = '' "
-            "ORDER BY path"
-        ).fetchall()
+    def files_needing_type(self, start_id: int | None = None,
+                           stop_id: int | None = None) -> list[sqlite3.Row]:
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT id, path FROM files WHERE embedding IS NOT NULL AND type = ''"
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY path"
+        return self.conn.execute(sql, params).fetchall()
 
-    def files_with_type(self, name: str) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM files WHERE type = ? ORDER BY path", (name,)
-        ).fetchall()
+    def files_with_type(self, name: str, start_id: int | None = None,
+                        stop_id: int | None = None) -> list[sqlite3.Row]:
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT * FROM files WHERE type = ?"
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY path"
+        return self.conn.execute(sql, (name, *params)).fetchall()
 
     def type_counts(self) -> list[tuple[str, int]]:
         rows = self.conn.execute(
@@ -1055,10 +1161,14 @@ class Database:
         )
         self.conn.commit()
 
-    def files_in_cluster(self, cluster_id: int) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM files WHERE cluster_id = ? ORDER BY path", (cluster_id,)
-        ).fetchall()
+    def files_in_cluster(self, cluster_id: int, start_id: int | None = None,
+                         stop_id: int | None = None) -> list[sqlite3.Row]:
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT * FROM files WHERE cluster_id = ?"
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY path"
+        return self.conn.execute(sql, (cluster_id, *params)).fetchall()
 
     def clusters_for_label(self, label: str) -> list[int]:
         rows = self.conn.execute(

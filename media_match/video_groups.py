@@ -102,6 +102,8 @@ def find_video_duplicate_groups(
     full_compare_limit: int = FULL_COMPARE_LIMIT,
 ) -> list[DuplicateGroup]:
     """Cluster duplicate/re-encode videos by aligned keyframe pHash matching."""
+    # Quick-scan rows carry no SHA1 or keyframes; they are not comparable.
+    records = [r for r in records if r.sha1 and r.phashes]
     n = len(records)
     if n == 0:
         return []

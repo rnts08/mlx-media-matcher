@@ -196,6 +196,14 @@ Ignored paths are skipped by `scan` and dropped by `scan --prune`.
 .venv/bin/media-match scan help         # the same page — all three forms match
 .venv/bin/media-match scan --help
 
+# 1a. huge library? build the index in two steps. The stat-only quick pass
+#     writes one basic row (path/size/mtime, stable id) per media file —
+#     no decoding, no GPU, seconds for 100k files — and a normal scan then
+#     fills the rows in, in id windows if you like
+.venv/bin/media-match scan ~/Pictures --quick
+.venv/bin/media-match scan ~/Pictures --start-id 1 --stop-id 1000
+.venv/bin/media-match scan ~/Pictures --startid 1001 --limit 1000  # next slice
+
 # 1b. optional: add captions with the vision model (~1 s/image, only for the
 #     best-resolution version of each duplicate group) and, in the same pass,
 #     refine the tags and type every photo
@@ -397,7 +405,7 @@ first pass over a folder: inventory it, index it, confirm it loads
 | Command | What it does | Key options |
 |---|---|---|
 | `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index. Dry-run by default; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--move-to DIR` moves the non-media files out instead of trashing them, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--move-to`, `--fix-extensions`, `--video`, `--yes` |
-| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes) | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--batch`, `--no-progress` |
+| `scan [root]` | index new/changed media (hash + pHash + CLIP). Incremental: unchanged files are skipped; `--video` adds videos (keyframes). `--quick` is a stat-only pass that writes basic rows (path/size/mtime) with stable ids, without reading file contents | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--quick`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--batch`, `--no-progress` |
 | `check [root]` | name every file that is not clean and say why: truncated (re-encodable), corrupt (quarantinable), or notable (loads fine — a malformed MPO container, a very large image — reported, never touched) | `--video`, `--quarantine`, `--yes` |
 
 ### Go deeper
@@ -406,10 +414,10 @@ captions, tags, types and people — what makes search work well
 
 | Command | What it does | Key options |
 |---|---|---|
-| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--limit`, `--reanalyze`, `--prune`, `--batch`, `--no-progress` |
-| `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch` |
-| `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch`, `--no-progress` |
-| `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute` |
+| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--prune`, `--batch`, `--no-progress` |
+| `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch`, `--start-id`/`--stop-id` |
+| `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch`, `--start-id`/`--stop-id`, `--no-progress` |
+| `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
 | `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
 
 ### Find things
@@ -418,10 +426,10 @@ search and browse what is indexed
 
 | Command | What it does | Key options |
 |---|---|---|
-| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--json`, `--limit` |
+| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--start-id`/`--stop-id`, `--json`, `--limit` |
 | `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--json`, `--limit`, `--video` |
-| `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--json` |
-| `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video` |
+| `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--start-id`/`--stop-id`, `--json` |
+| `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video`, `--start-id`/`--stop-id` |
 
 ### Quality and file management
 
@@ -429,9 +437,9 @@ duplicates, folder consolidation, cleaning them up, and undoing that
 
 | Command | What it does | Key options |
 |---|---|---|
-| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (distance-0 matches only; ignores `--threshold`), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer` |
+| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (distance-0 matches only; ignores `--threshold`), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer`, `--start-id`/`--stop-id` |
 | `folders [root]` | find folders with the same name regardless of case and merge their files into a chosen destination, deciding each same-name conflict (replace / rename / skip, with `all` variants and EXIF compare); or gather whole folders with `--collapse`. Filesystem-only: reads and writes no index | `--name` (foldername filter), `--list`, `--collapse`, `--replace` / `--rename`, `--yes`, `--dry-run`, `--json` |
-| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--json` (with `--dry-run`) |
+| `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--start-id`/`--stop-id`, `--json` (with `--dry-run`) |
 | `restore [root]` | list what `clean` moved to the system Trash and move it back on confirmation (best-effort: the OS Trash may have renamed a colliding name) | `--batch`, `--limit`, `--dry-run`, `--yes` |
 
 ### Metadata
@@ -440,9 +448,9 @@ captions, keywords and types as data you can edit and move around
 
 | Command | What it does | Key options |
 |---|---|---|
-| `export-metadata [root]` | export editable metadata (kind, path, description, keywords, type) as JSON — round-trips with `import-metadata` | `--kind`, `--out` |
-| `import-metadata [root] FILE` | import description/keywords/type from a JSON or CSV file (as written by `export-metadata`) | `--kind`, `--fields` |
-| `clear-metadata [root] [ITEM...]` | clear description/keywords/type/tags from the listed items (paths relative to root), or everything with no items. Media files are never touched | `--kind`, `--yes` |
+| `export-metadata [root]` | export editable metadata (kind, path, description, keywords, type) as JSON — round-trips with `import-metadata` | `--kind`, `--out`, `--start-id`/`--stop-id` |
+| `import-metadata [root] FILE` | import description/keywords/type from a JSON or CSV file (as written by `export-metadata`) | `--kind`, `--fields`, `--start-id`/`--stop-id` |
+| `clear-metadata [root] [ITEM...]` | clear description/keywords/type/tags from the listed items (paths relative to root), or everything with no items. Media files are never touched | `--kind`, `--yes`, `--start-id`/`--stop-id` |
 
 ### Index maintenance
 
@@ -450,8 +458,28 @@ the index database itself, not your media files
 
 | Command | What it does | Key options |
 |---|---|---|
-| `export [root]` | dump the index (path, kind, size, capture date, camera, description, keywords, type, tags, cluster, duration) | `--format` (json/csv/md, default json), `--out` |
+| `export [root]` | dump the index (path, kind, size, capture date, camera, description, keywords, type, tags, cluster, duration) | `--format` (json/csv/md, default json), `--out`, `--start-id`/`--stop-id` |
 | `reset [root]` | delete the index database (media files are never touched); the next `scan` rebuilds from scratch | `--yes` |
+
+#### ID windows
+
+`--start-id N` / `--stop-id N` (aliases `--startid` / `--stopid`) select an
+inclusive window of index rows on every command that reads media rows: `scan`,
+`analyze`, `describe`, `embed`, `refine`, `search` (including `--type` and
+`--cluster`), `similar`, `duplicates`, `clean`, `export`, `export-metadata`,
+`import-metadata` and `clear-metadata`. Rows outside the window are never
+touched. `files.id` and `videos.id` are independent sequences; the same numeric
+window applies to each table separately. A window selects indexed rows only —
+run `scan --quick` first to give every file an id. `--start-id 1001 --limit
+1000` analyzes the next slice; `--start-id 353 --stop-id 905` is exactly that
+range. `--prune` always reconciles the whole index even when a window is set.
+Commands that do not take a window, and why: `restore` (trash batches, not
+media ids), `bootstrap` (its own re-numbered table), `people` (rebuilds every
+cluster, so a partial run would erase the rest), `tags`/`stats`/`info`
+(whole-index aggregates).
+
+Basic rows from `--quick` carry no hashes, so they never enter duplicate
+grouping or CLIP search until a normal `scan` or `embed` fills them in.
 
 All commands take `--db` to override the index location. `root` defaults to
 the current directory. Supported image formats: JPEG, PNG, WebP, GIF, BMP,

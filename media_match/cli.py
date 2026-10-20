@@ -203,6 +203,18 @@ def _date_filters(args) -> tuple[str, list, str, list]:
     if camera:
         img.append("camera LIKE ?")
         img_p.append(f"%{camera}%")
+    start_id = getattr(args, "start_id", None)
+    stop_id = getattr(args, "stop_id", None)
+    if start_id is not None:
+        img.append("id >= ?")
+        img_p.append(start_id)
+        vid.append("id >= ?")
+        vid_p.append(start_id)
+    if stop_id is not None:
+        img.append("id <= ?")
+        img_p.append(stop_id)
+        vid.append("id <= ?")
+        vid_p.append(stop_id)
     return " AND ".join(img), img_p, " AND ".join(vid), vid_p
 
 
@@ -286,14 +298,79 @@ def _add_progress_flag(p: argparse.ArgumentParser) -> None:
                         "terminal)")
 
 
-def cmd_scan(args: argparse.Namespace) -> int:
-    _register_heif()
+def _quick_index(args: argparse.Namespace, root: str, ignore: list[str]) -> int:
+    """Stat-only first pass: create basic rows with stable ids."""
+    from .pipeline import iter_media
 
+    if not os.path.isdir(root):
+        print(f"No folder at {root}.")
+        return 2
+    if args.limit is not None and args.limit < 1:
+        print("--limit must be at least 1", file=sys.stderr)
+        return 2
+
+    db = Database(db_path_for(root, args.db))
+    db.set_meta("root", root)
+    if args.prune:
+        pruned = prune_missing(root, db, include_video=args.video, ignore=ignore)
+        if pruned:
+            print(f"removed {pruned} stale index row(s) "
+                  f"(moved or deleted since last scan)")
+        else:
+            print("no stale index rows to remove")
+
+    media = iter_media(root, args.video, ignore=ignore)
+    image_rows: list[tuple[str, int, float]] = []
+    video_rows: list[tuple[str, int, float]] = []
+    for kind, path in media:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        target = image_rows if kind == "image" else video_rows
+        target.append((path, stat.st_size, stat.st_mtime))
+
+    added_images = db.add_quick_files(image_rows, limit=args.limit)
+    remaining = None if args.limit is None else max(0, args.limit - added_images)
+    added_videos = 0 if remaining == 0 else db.add_quick_videos(
+        video_rows, limit=remaining)
+    added = added_images + added_videos
+    print(f"{len(media)} media file(s) found; added {added} basic row(s) "
+          f"({added_images} image(s), {added_videos} video(s))")
+    if added:
+        print("Basic rows only: run 'scan' (optionally with "
+              "--start-id/--stop-id) to add hashes, EXIF and CLIP.")
+    else:
+        print("Every discovered file already has an index row; nothing added.")
+    db.close()
+    return 0
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
     from .config import load_config, load_ignore
 
     cfg = load_config()
     root = os.path.abspath(args.root)
     ignore = load_ignore(root)
+
+    if args.quick:
+        incompatible = [
+            name for name, enabled in (
+                ("--describe", args.describe), ("--refine", args.refine),
+                ("--classify", args.classify), ("--reanalyze", args.reanalyze),
+            ) if enabled
+        ]
+        if incompatible:
+            print(f"--quick cannot be combined with "
+                  f"{', '.join(incompatible)}", file=sys.stderr)
+            return 2
+        if args.start_id is not None or args.stop_id is not None:
+            print("--quick creates the rows; run a later scan with "
+                  "--start-id/--stop-id to analyze a window", file=sys.stderr)
+            return 2
+        return _quick_index(args, root, ignore)
+
+    _register_heif()
 
     # An explicit flag wins, then the config file, then the built-in default.
     clip_model = args.clip_model or cfg.get("clip_model") or DEFAULT_CLIP_MODEL
@@ -324,11 +401,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
         else:
             print("no stale index rows to remove")
 
+    if (args.start_id is not None or args.stop_id is not None) and args.prune:
+        print("(--prune checks the whole index; the id window applies to "
+              "analysis only)")
+
     jobs, total, up_to_date = build_jobs(
         root, db, include_video=args.video, reanalyze=args.reanalyze,
         limit=args.limit, ignore=ignore,
+        start_id=args.start_id, stop_id=args.stop_id,
     )
-    print(f"{total} media found, {up_to_date} up to date, {len(jobs)} to analyze")
+    if args.start_id is not None or args.stop_id is not None:
+        print(f"{total} indexed row(s) in the id window, {up_to_date} up to "
+              f"date, {len(jobs)} to analyze (new files are not scanned)")
+    else:
+        print(f"{total} media found, {up_to_date} up to date, "
+              f"{len(jobs)} to analyze")
 
     from .clip import ClipEncoder
 
@@ -371,11 +458,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # Optional keep-tags-fresh step: refine keywords into canonical tags/facets
     # (and, with --classify, type each image) before releasing the CLIP model.
     if args.refine or args.classify:
-        refined = _refine_all(db, quiet=True)
+        refined = _refine_all(
+            db, quiet=True, start_id=args.start_id, stop_id=args.stop_id
+        )
         if refined:
             print(f"refined {refined} item(s)")
     if args.classify:
-        classified = _classify_with(db, encoder, recompute=False)
+        classified = _classify_with(
+            db, encoder, recompute=False,
+            start_id=args.start_id, stop_id=args.stop_id,
+        )
         if classified:
             print(f"classified {classified} image(s)")
 
@@ -407,7 +499,11 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
     raw ``args.model`` here is what used to make every caption fail with
     "Path(None)" when --model was omitted.
     """
-    plan = describe_targets(db, root, include_videos=args.video)
+    plan = describe_targets(
+        db, root, include_videos=args.video,
+        start_id=getattr(args, "start_id", None),
+        stop_id=getattr(args, "stop_id", None),
+    )
     if plan.missing:
         print(f"{plan.missing} undescribed item(s) skipped: no longer on disk "
               f"(stale index; run 'media-match scan --prune' to refresh)")
@@ -485,7 +581,10 @@ def cmd_describe(args: argparse.Namespace) -> int:
 
 
 def _list_by_type(db: Database, args) -> int:
-    rows = db.files_with_type(args.type)
+    rows = db.files_with_type(
+        args.type, getattr(args, "start_id", None),
+        getattr(args, "stop_id", None),
+    )
     if not rows:
         known = ", ".join(name for name, _ in db.type_counts()) or "(none)"
         print(f"No images of type '{args.type}'. Known types: {known}")
@@ -512,7 +611,10 @@ def _list_by_cluster(db: Database, args) -> int:
         return 1
     rows: list = []
     for cid in cluster_ids:
-        rows.extend(db.files_in_cluster(cid))
+        rows.extend(db.files_in_cluster(
+            cid, getattr(args, "start_id", None),
+            getattr(args, "stop_id", None),
+        ))
     for r in rows[: args.limit]:
         when = _when(r["captured_at"])
         print(f"{r['path']}  ({r['width']}x{r['height']}, "
@@ -652,10 +754,11 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_embedding_matrix(db: Database):
+def _load_embedding_matrix(db: Database, start_id: int | None = None,
+                           stop_id: int | None = None):
     import numpy as np
 
-    ids, blobs = db.all_embeddings()
+    ids, blobs = db.all_embeddings(start_id, stop_id)
     if not blobs:
         return ids, None
     return ids, np.stack([np.frombuffer(b, dtype=np.float32) for b in blobs])
@@ -737,12 +840,22 @@ def cmd_embed(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.")
         return 1
 
+    from .db import _id_clause
+
     if args.recompute:
-        rows = db.conn.execute("SELECT id, path FROM files ORDER BY path").fetchall()
+        where, params = _id_clause(args.start_id, args.stop_id)
+        sql = "SELECT id, path FROM files"
+        if where:
+            sql += f" WHERE {where}"
+        sql += " ORDER BY path"
+        rows = db.conn.execute(sql, params).fetchall()
     else:
-        rows = db.files_missing_embedding()
+        rows = db.files_missing_embedding(args.start_id, args.stop_id)
     if not rows:
-        print("All indexed files already have CLIP embeddings.")
+        if args.start_id is not None or args.stop_id is not None:
+            print("No indexed images in that id window need embeddings.")
+        else:
+            print("All indexed files already have CLIP embeddings.")
         db.close()
         return 0
 
@@ -803,13 +916,13 @@ def cmd_similar(args: argparse.Namespace) -> int:
     if args.video:
         return _similar_videos(db, args)
 
-    ids, matrix = _load_embedding_matrix(db)
+    ids, matrix = _load_embedding_matrix(db, args.start_id, args.stop_id)
     if matrix is None:
         print("No CLIP embeddings in the index. Run 'media-match embed' first.")
         db.close()
         return 1
 
-    id_to_record = {r.id: r for r in db.all_files()}
+    id_to_record = {r.id: r for r in db.all_files(args.start_id, args.stop_id)}
 
     if args.image:
         from .clip import ClipEncoder
@@ -882,12 +995,17 @@ def _similar_videos(db: Database, args) -> int:
 
     from .clip import ClipEncoder
 
-    embeddings = db.video_embeddings()
+    embeddings = db.video_embeddings(args.start_id, args.stop_id)
     if not embeddings:
-        print("No CLIP embeddings for videos. Run 'media-match scan --video' first.")
+        if args.start_id is not None or args.stop_id is not None:
+            print("No CLIP embeddings for videos in that id window. Run "
+                  "'media-match scan --video' first.")
+        else:
+            print("No CLIP embeddings for videos. Run "
+                  "'media-match scan --video' first.")
         db.close()
         return 1
-    records = db.all_videos()
+    records = db.all_videos(args.start_id, args.stop_id)
     id_to_record = {r.id: r for r in records}
 
     if args.image:
@@ -962,13 +1080,18 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
 
     if args.video:
         groups = find_video_duplicate_groups(
-            db.all_videos_with_frames(),
+            db.all_videos_with_frames(args.start_id, args.stop_id),
             frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
         )
-    groups = find_duplicate_groups(db.all_files(), threshold=threshold,
-                                   prefer=prefer, exact_phash=args.exact_phash)
+    else:
+        groups = find_duplicate_groups(
+            db.all_files(args.start_id, args.stop_id), threshold=threshold,
+            prefer=prefer, exact_phash=args.exact_phash,
+        )
     if not groups:
-        print("No duplicate groups found.")
+        print("No duplicate groups found in that id window."
+              if args.start_id is not None or args.stop_id is not None
+              else "No duplicate groups found.")
         db.close()
         return 0
 
@@ -1049,13 +1172,17 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     if args.video:
         groups = find_video_duplicate_groups(
-            db.all_videos_with_frames(),
+            db.all_videos_with_frames(args.start_id, args.stop_id),
             frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
         )
     else:
-        groups = find_duplicate_groups(db.all_files(), threshold=args.threshold)
+        groups = find_duplicate_groups(
+            db.all_files(args.start_id, args.stop_id), threshold=args.threshold
+        )
     if not groups:
-        print("No duplicate groups found.")
+        print("No duplicate groups found in that id window."
+              if args.start_id is not None or args.stop_id is not None
+              else "No duplicate groups found.")
         db.close()
         return 0
 
@@ -1626,7 +1753,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     image_clusters = db.cluster_labels("image")
     rows: list[dict] = []
-    for r in db.all_files():
+    for r in db.all_files(args.start_id, args.stop_id):
         tags = ", ".join(t for t, _f in db.tags_for("image", r.id))
         cluster = image_clusters.get(r.cluster_id, "") if r.cluster_id else ""
         rows.append({
@@ -1635,7 +1762,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             "description": r.description, "keywords": r.keywords, "type": r.type,
             "tags": tags, "cluster": cluster, "duration": "",
         })
-    for v in db.all_videos():
+    for v in db.all_videos(args.start_id, args.stop_id):
         tags = ", ".join(t for t, _f in db.tags_for("video", v.id))
         rows.append({
             "kind": "video", "path": v.path, "width": v.width, "height": v.height,
@@ -1665,6 +1792,12 @@ def cmd_clear_metadata(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.")
         return 1
 
+    from .db import _id_clause
+
+    def _outside(media_id: int) -> bool:
+        return ((args.start_id is not None and media_id < args.start_id)
+                or (args.stop_id is not None and media_id > args.stop_id))
+
     targets: dict[str, list[int]] = {}
     if args.items:
         # paths are given as printed by the tool: relative to the root
@@ -1672,13 +1805,20 @@ def cmd_clear_metadata(args: argparse.Namespace) -> int:
                  for p in args.items]
         found, missing = db.media_ids_for_paths(paths, kind=args.kind)
         for kind, _path, media_id in found:
+            if _outside(media_id):
+                print(f"outside id window: {os.path.relpath(_path, root)}")
+                continue
             targets.setdefault(kind, []).append(media_id)
         for path in missing:
             print(f"not in index: {os.path.relpath(path, root)}")
     else:
+        where, params = _id_clause(args.start_id, args.stop_id)
         for kind in ("image", "video") if args.kind is None else (args.kind,):
             table = "files" if kind == "image" else "videos"
-            rows = db.conn.execute(f"SELECT id FROM {table}").fetchall()
+            sql = f"SELECT id FROM {table}"
+            if where:
+                sql += f" WHERE {where}"
+            rows = db.conn.execute(sql, params).fetchall()
             targets[kind] = [r["id"] for r in rows]
 
     total = sum(len(ids) for ids in targets.values())
@@ -1735,8 +1875,13 @@ def cmd_import_metadata(args: argparse.Namespace) -> int:
         db.close()
         return 2
 
+    def _outside(media_id: int) -> bool:
+        return ((args.start_id is not None and media_id < args.start_id)
+                or (args.stop_id is not None and media_id > args.stop_id))
+
     per_kind: dict[str, list[tuple[int, str, str, str]]] = {}
     missing: list[str] = []
+    outside: list[str] = []
     for row in rows:
         rel = (row.get("path") or "").strip()
         if not rel:
@@ -1748,6 +1893,9 @@ def cmd_import_metadata(args: argparse.Namespace) -> int:
             missing.append(rel)
             continue
         _k, _p, media_id = found[0]
+        if _outside(media_id):
+            outside.append(rel)
+            continue
         kind = found[0][0]
         per_kind.setdefault(kind, []).append((
             media_id,
@@ -1761,6 +1909,8 @@ def cmd_import_metadata(args: argparse.Namespace) -> int:
         written += db.set_metadata(kind, items)
     for rel in missing:
         print(f"not in index: {rel}")
+    for rel in outside:
+        print(f"outside id window: {rel}")
     print(f"imported metadata for {written} item(s) from {args.file}")
     db.close()
     return 0 if written else 1
@@ -1779,11 +1929,18 @@ def cmd_export_metadata(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.")
         return 1
 
+    from .db import _id_clause
+
+    where, params = _id_clause(args.start_id, args.stop_id)
     kinds = ("image", "video") if args.kind is None else (args.kind,)
     items: list[dict] = []
     for kind in kinds:
         table = "files" if kind == "image" else "videos"
-        for r in db.conn.execute(f"SELECT * FROM {table} ORDER BY path"):
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        sql += " ORDER BY path"
+        for r in db.conn.execute(sql, params):
             item = {
                 "kind": kind,
                 "path": os.path.relpath(r["path"], root),
@@ -2140,12 +2297,22 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         else:
             print("no stale index rows to remove")
 
+    if (args.start_id is not None or args.stop_id is not None) and args.prune:
+        print("(--prune checks the whole index; the id window applies to "
+              "analysis only)")
+
     # -- pass 1: scan (pHash + EXIF + CLIP) ----------------------------------
     jobs, total, up_to_date = build_jobs(
         root, db, include_video=args.video, reanalyze=args.reanalyze,
         limit=args.limit, ignore=ignore,
+        start_id=args.start_id, stop_id=args.stop_id,
     )
-    print(f"{total} media found, {up_to_date} up to date, {len(jobs)} to analyze")
+    if args.start_id is not None or args.stop_id is not None:
+        print(f"{total} indexed row(s) in the id window, {up_to_date} up to "
+              f"date, {len(jobs)} to analyze (new files are not scanned)")
+    else:
+        print(f"{total} media found, {up_to_date} up to date, "
+              f"{len(jobs)} to analyze")
 
     from .clip import ClipEncoder
 
@@ -2201,14 +2368,19 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     # -- pass 3: refine keywords into canonical tags -------------------------
     refined = 0
     if args.refine or args.classify:
-        refined = _refine_all(db, quiet=True)
+        refined = _refine_all(
+            db, quiet=True, start_id=args.start_id, stop_id=args.stop_id
+        )
         if refined:
             print(f"refined {refined} item(s)")
 
     # -- pass 4: type each image with the already-loaded CLIP encoder --------
     classified = 0
     if args.classify:
-        classified = _classify_with(db, encoder, recompute=False)
+        classified = _classify_with(
+            db, encoder, recompute=False,
+            start_id=args.start_id, stop_id=args.stop_id,
+        )
         if classified:
             print(f"classified {classified} image(s)")
     encoder.unload()
@@ -2235,7 +2407,7 @@ def cmd_refine(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.")
         return 1
 
-    total = _refine_all(db)
+    total = _refine_all(db, start_id=args.start_id, stop_id=args.stop_id)
     if not total:
         print("Nothing to refine. Run 'scan' (and optionally '--describe') first.")
 
@@ -2249,11 +2421,13 @@ def cmd_refine(args: argparse.Namespace) -> int:
     return 0
 
 
-def _refine_all(db: Database, *, quiet: bool = False) -> int:
+def _refine_all(db: Database, *, quiet: bool = False,
+                start_id: int | None = None,
+                stop_id: int | None = None) -> int:
     """Rewrite keywords into canonical tags + facets for images and videos."""
     total = 0
     for kind, label in (("image", "image"), ("video", "video")):
-        rows = db.rows_for_refinement(kind)
+        rows = db.rows_for_refinement(kind, start_id, stop_id)
         items = []
         for r in rows:
             raw = (r["raw_keywords"] or r["keywords"] or "").strip()
@@ -2264,27 +2438,36 @@ def _refine_all(db: Database, *, quiet: bool = False) -> int:
             pairs = [(t, facet_of(t)) for t in tags]
             items.append((r["id"], ", ".join(tags), raw, r["description"] or "", pairs))
         if rows:
-            db.apply_refinement(kind, items)
+            db.apply_refinement(
+                kind, items, scope_ids=[r["id"] for r in rows]
+            )
         total += len(items)
         if not quiet:
             print(f"  refined {len(items)} {label}(s)")
     return total
 
 
-def _classify_with(db: Database, encoder, *, recompute: bool = False) -> int:
+def _classify_with(db: Database, encoder, *, recompute: bool = False,
+                   start_id: int | None = None,
+                   stop_id: int | None = None) -> int:
     """Type every untyped image (or all images) using an already-loaded encoder."""
     import numpy as np
 
+    from .db import _id_clause
+
     if recompute:
-        rows = db.conn.execute(
-            "SELECT id, path FROM files WHERE embedding IS NOT NULL ORDER BY path"
-        ).fetchall()
+        where, params = _id_clause(start_id, stop_id)
+        sql = "SELECT id, path FROM files WHERE embedding IS NOT NULL"
+        if where:
+            sql += f" AND {where}"
+        sql += " ORDER BY path"
+        rows = db.conn.execute(sql, params).fetchall()
     else:
-        rows = db.files_needing_type()
+        rows = db.files_needing_type(start_id, stop_id)
     if not rows:
         return 0
 
-    ids, blobs = db.all_embeddings()
+    ids, blobs = db.all_embeddings(start_id, stop_id)
     vec_by_id = {i: np.frombuffer(b, dtype=np.float32) for i, b in zip(ids, blobs)}
     targets = [(r["id"], vec_by_id[r["id"]]) for r in rows if r["id"] in vec_by_id]
     if not targets:
@@ -2306,7 +2489,11 @@ def _classify_images(db: Database, args) -> None:
 
     encoder = ClipEncoder(model_id=args.clip_model)
     try:
-        classified = _classify_with(db, encoder, recompute=args.recompute)
+        classified = _classify_with(
+            db, encoder, recompute=args.recompute,
+            start_id=getattr(args, "start_id", None),
+            stop_id=getattr(args, "stop_id", None),
+        )
     finally:
         encoder.unload()
     if classified:
@@ -2675,7 +2862,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.3.0"
+_VERSION = "0.4.0"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -3050,6 +3237,31 @@ def cmd_info(args: argparse.Namespace) -> int:
 # -- parser ------------------------------------------------------------------
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return value
+
+
+def _add_id_range(parser: argparse.ArgumentParser) -> None:
+    """Inclusive media-id window (applied to files and videos separately)."""
+    parser.add_argument(
+        "--start-id", "--startid", dest="start_id", type=_positive_int,
+        metavar="N",
+        help="only indexed rows with id >= N (images and videos have "
+             "separate id sequences)",
+    )
+    parser.add_argument(
+        "--stop-id", "--stopid", dest="stop_id", type=_positive_int,
+        metavar="N",
+        help="only indexed rows with id <= N (inclusive)",
+    )
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("root", nargs="?", default=".",
                    help="media tree to work on (default: current directory)")
@@ -3159,7 +3371,10 @@ def main(argv: list[str] | None = None) -> int:
             "embedding. Files already in the index are skipped, so re-running is "
             "cheap. Add --describe to caption them, --refine/--classify to tidy "
             "the keywords, --video to include videos, and --prune to drop index "
-            "rows for files that have since been moved or deleted."
+            "rows for files that have since been moved or deleted. --quick only "
+            "stats files and writes basic rows (path/size/mtime) with stable "
+            "ids — no reading, no GPU; analyze the rows afterwards with "
+            "--start-id/--stop-id windows."
         ),
     )
     _add_common(p_scan)
@@ -3196,7 +3411,14 @@ def main(argv: list[str] | None = None) -> int:
                              "(default: 1.0, or config 'interval')")
     p_scan.add_argument("--max-frames", type=int, default=None,
                         help="cap on keyframes per video (default: 120, or config 'max_frames')")
-    p_scan.add_argument("--limit", type=int, help="only scan first N media items")
+    p_scan.add_argument("--quick", action="store_true",
+                        help="only stat files and create basic index rows "
+                             "(path/size/mtime); no hashes, EXIF, pHash or CLIP")
+    _add_id_range(p_scan)
+    p_scan.add_argument("--limit", type=int,
+                        help="only scan first N media items (with --quick, "
+                             "insert at most N new rows; with --start-id, cap "
+                             "the selected window)")
     p_scan.add_argument("--reanalyze", action="store_true",
                         help="re-analyze files even if unchanged")
     p_scan.add_argument("--prune", action="store_true",
@@ -3215,7 +3437,8 @@ def main(argv: list[str] | None = None) -> int:
             "GPU busy by overlapping CPU decoding with GPU embedding batches, "
             "and the describe stage overlaps CPU frame extraction with GPU "
             "caption generation. Flags map 1:1 onto 'scan'; add --describe, "
-            "--refine and/or --classify for the later passes."
+            "--refine and/or --classify for the later passes. With "
+            "--start-id/--stop-id every stage is limited to that id window."
         ),
     )
     _add_common(p_analyze)
@@ -3258,7 +3481,10 @@ def main(argv: list[str] | None = None) -> int:
                                 "(default: 1.0, or config 'interval')")
     p_analyze.add_argument("--max-frames", type=int, default=None,
                            help="cap on keyframes per video (default: 120, or config 'max_frames')")
-    p_analyze.add_argument("--limit", type=int, help="only analyze first N media items")
+    _add_id_range(p_analyze)
+    p_analyze.add_argument("--limit", type=int,
+                           help="only analyze first N media items (with "
+                                "--start-id, cap the selected window)")
     p_analyze.add_argument("--reanalyze", action="store_true",
                            help="re-analyze files even if unchanged")
     p_analyze.add_argument("--prune", action="store_true",
@@ -3281,6 +3507,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_describe)
+    _add_id_range(p_describe)
     p_describe.add_argument("--model", default=None,
                             help="MLX vision model "
                                  f"(default: {DEFAULT_MODEL}, or config 'model')")
@@ -3305,6 +3532,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_search)
+    _add_id_range(p_search)
     p_search.add_argument("query", nargs="*", metavar="QUERY",
                           help="free-text search terms (ANDed together)")
     p_search.add_argument("--person", help="terms describing a person, e.g. 'woman red jacket'")
@@ -3347,6 +3575,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_embed)
+    _add_id_range(p_embed)
     p_embed.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
                          help=f"CLIP model (default: {DEFAULT_CLIP_MODEL})")
     p_embed.add_argument("--batch", type=int, default=16, help="batch size")
@@ -3367,6 +3596,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_sim)
+    _add_id_range(p_sim)
     p_sim.add_argument("--video", action="store_true",
                        help="group videos instead of images")
     p_sim.add_argument("--image",
@@ -3391,6 +3621,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_dup)
+    _add_id_range(p_dup)
     p_dup.add_argument("--video", action="store_true",
                        help="group duplicate/re-encode videos by keyframe pHash")
     p_dup.add_argument("--threshold", type=int, default=None,
@@ -3428,6 +3659,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_clean)
+    _add_id_range(p_clean)
     p_clean.add_argument("--video", action="store_true",
                          help="review duplicate videos instead of images")
     p_clean.add_argument("--threshold", type=int, default=8,
@@ -3532,6 +3764,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_refine)
+    _add_id_range(p_refine)
     p_refine.add_argument("--classify", action="store_true",
                           help="also label each image's type with zero-shot CLIP")
     p_refine.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
@@ -3598,6 +3831,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_clear)
+    _add_id_range(p_clear)
     p_clear.add_argument("items", nargs="*", metavar="ITEM",
                          help="paths to clear metadata for (relative to root)")
     p_clear.add_argument("--kind", choices=("image", "video"), default=None,
@@ -3618,6 +3852,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_import)
+    _add_id_range(p_import)
     p_import.add_argument("file", help="path to the import file (JSON or CSV)")
     p_import.add_argument("--kind", choices=("image", "video"), default=None,
                           help="assume this kind when a row has none "
@@ -3639,6 +3874,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_export_meta)
+    _add_id_range(p_export_meta)
     p_export_meta.add_argument("--kind", choices=("image", "video"), default=None,
                                help="restrict to one kind (default: both)")
     p_export_meta.add_argument("--out", help="write to this file instead of stdout")
@@ -3724,6 +3960,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     _add_common(p_export)
+    _add_id_range(p_export)
     p_export.add_argument("--format", choices=("json", "csv", "md"), default="json",
                           help="output format (default: json)")
     p_export.add_argument("--out", help="write to this file instead of stdout")
@@ -3869,6 +4106,12 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "command", None) is None:
         _print_full_help()
         return 0
+
+    start = getattr(args, "start_id", None)
+    stop = getattr(args, "stop_id", None)
+    if start is not None and stop is not None and start > stop:
+        print("--start-id must be <= --stop-id", file=sys.stderr)
+        return 2
 
     return args.func(args)
 

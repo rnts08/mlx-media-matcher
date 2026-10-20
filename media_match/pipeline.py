@@ -126,6 +126,24 @@ def iter_media(root: str, include_video: bool, *,
     return paths
 
 
+def _job_from_row(kind: str, row, stat) -> ScanJob:
+    """Build a job from an indexed row, preserving editable text only when the
+    row is a quick row (no hash yet): a changed analysed row must be re-derived
+    from scratch, exactly as before."""
+    analysed = bool(row.sha1)
+    unchanged = (analysed and row.size == stat.st_size
+                 and abs(row.mtime - stat.st_mtime) < 1e-6)
+    keep_text = (not analysed) or unchanged
+    return ScanJob(
+        kind=kind,
+        path=row.path,
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        prev_description=row.description if keep_text else "",
+        prev_keywords=row.keywords if keep_text else "",
+    )
+
+
 def build_jobs(
     root: str,
     db: Database,
@@ -134,21 +152,56 @@ def build_jobs(
     reanalyze: bool,
     limit: int | None = None,
     ignore: list[str] | None = None,
+    start_id: int | None = None,
+    stop_id: int | None = None,
 ) -> tuple[list[ScanJob], int, int]:
-    """Return (jobs, total, up_to_date) after applying the mtime/size check."""
+    """Return (jobs, total, up_to_date) after applying the mtime/size check.
+
+    With ``start_id``/``stop_id`` the candidates are existing index rows (in id
+    order) rather than a filesystem walk: a window selects indexed rows only,
+    and new files are not considered. ``limit`` then caps the selected window.
+    Rows whose SHA1 is empty are quick-scan rows and are always queued, even
+    when size/mtime still match.
+    """
+    jobs: list[ScanJob] = []
+    up_to_date = 0
+
+    if start_id is not None or stop_id is not None:
+        image_rows = db.all_files(start_id, stop_id)
+        image_rows.sort(key=lambda r: r.id)
+        video_rows = db.all_videos(start_id, stop_id) if include_video else []
+        video_rows.sort(key=lambda r: r.id)
+        candidates = ([("image", r) for r in image_rows]
+                      + [("video", r) for r in video_rows])
+        if limit:
+            candidates = candidates[:limit]
+        total = len(candidates)
+        for kind, row in candidates:
+            try:
+                stat = os.stat(row.path)
+            except OSError:
+                continue
+            analysed = bool(row.sha1)
+            unchanged = (analysed and row.size == stat.st_size
+                         and abs(row.mtime - stat.st_mtime) < 1e-6)
+            if unchanged and not reanalyze:
+                up_to_date += 1
+                continue
+            jobs.append(_job_from_row(kind, row, stat))
+        return jobs, total, up_to_date
+
     media = iter_media(root, include_video, ignore=ignore)
     if limit:
         media = media[:limit]
-    jobs: list[ScanJob] = []
-    up_to_date = 0
     for kind, path in media:
         try:
             stat = os.stat(path)
         except OSError:
             continue
         existing = db.get_file(path) if kind == "image" else db.get_video(path)
+        analysed = existing is not None and bool(existing["sha1"])
         unchanged = (
-            existing is not None
+            analysed
             and existing["size"] == stat.st_size
             and abs(existing["mtime"] - stat.st_mtime) < 1e-6
         )
@@ -161,8 +214,14 @@ def build_jobs(
                 path=path,
                 size=stat.st_size,
                 mtime=stat.st_mtime,
-                prev_description=existing["description"] if unchanged else "",
-                prev_keywords=existing["keywords"] if unchanged else "",
+                prev_description=(
+                    existing["description"] if existing is not None
+                    and (not analysed or unchanged) else ""
+                ),
+                prev_keywords=(
+                    existing["keywords"] if existing is not None
+                    and (not analysed or unchanged) else ""
+                ),
             )
         )
     return jobs, len(media), up_to_date

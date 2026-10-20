@@ -88,6 +88,8 @@ def _groups_from_exact_phash(records: list[FileRecord],
     """
     by_phash: dict[str, list[int]] = {}
     for i, r in enumerate(records):
+        if not r.sha1 or not r.phash:
+            continue  # quick-scan row: not analysed yet
         by_phash.setdefault(r.phash, []).append(i)
     groups: list[DuplicateGroup] = []
     for members in by_phash.values():
@@ -103,6 +105,10 @@ def find_duplicate_groups(
     records: list[FileRecord], threshold: int = 8, prefer: str = "resolution",
     exact_phash: bool = False
 ) -> list[DuplicateGroup]:
+    # Basic rows from `scan --quick` have no SHA1/pHash. Grouping them would
+    # make every quick row look byte-identical (and `clean` could delete
+    # files), so unanalysed rows never enter duplicate detection.
+    records = [r for r in records if r.sha1 and r.phash]
     n = len(records)
     if n == 0:
         return []
