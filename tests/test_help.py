@@ -196,3 +196,25 @@ def test_command_help_flag_does_not_open_an_index(tmp_path):
     root.mkdir()
     assert _run(["info", "--help", str(root)])[1].startswith("info —")
     assert _run(["info", str(root)])[0] == 0
+
+
+def test_analyze_help_says_the_extra_passes_are_opt_in(capsys):
+    """The summary used to promise scan+describe+refine+classify by default.
+
+    Plain `analyze` only indexes; a run that was expected to caption and tag
+    finished with "described 0, refined 0, classified 0" and looked broken.
+    """
+    assert cli.main(["help", "analyze"]) == 0
+    out = capsys.readouterr().out
+    assert "optional" in out.lower()
+    assert "Without those flags" in out
+    assert "same work as 'scan'" in out
+    assert "one integrated pass: scan, describe, refine and classify" not in out
+
+
+def test_search_help_matches_its_clip_default(capsys):
+    assert cli.main(["help", "search"]) == 0
+    out = capsys.readouterr().out
+    assert "by default" in out
+    assert "--fts switches" in out
+    assert "With words, results come from the captions" not in out

@@ -427,12 +427,12 @@ first pass over a folder: inventory it, index it, confirm it loads
 
 ### Go deeper
 
-captions, tags, types and people — what makes search work well
+embeddings, captions, tags, types and people — what makes search work well
 
 | Command | What it does | Key options |
 |---|---|---|
-| `analyze [root]` | one integrated pass over images **and** videos: index (hash + pHash + CLIP), VLM captions, tag refinement, image typing. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--prune`, `--batch`, `--no-progress` |
-| `embed [root]` | (re)compute CLIP embeddings only | `--recompute`, `--clip-model`, `--batch`, `--start-id`/`--stop-id` |
+| `analyze [root]` | index new/changed images and videos (hash + pHash + CLIP); `--describe`, `--refine` and `--classify` add captions, canonical tags and image types in the same run. Without those flags it does the indexing work of `scan`. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--prune`, `--batch`, `--no-progress` |
+| `embed [root]` | fill in missing CLIP embeddings for indexed images; `--recompute` re-embeds all of them (e.g. after changing `--clip-model`). Videos are embedded by `scan --video` | `--recompute`, `--clip-model`, `--batch`, `--start-id`/`--stop-id` |
 | `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch`, `--start-id`/`--stop-id`, `--no-progress` |
 | `refine [root]` | rewrite keywords into canonical tags + facets; `--classify` also types each image with zero-shot CLIP | `--classify`, `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
 | `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |

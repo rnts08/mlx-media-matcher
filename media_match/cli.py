@@ -2904,11 +2904,11 @@ _SUBPARSERS: dict[str, argparse.ArgumentParser] = {}
 
 # One-line summary for the top-level command listing and the `help` command.
 _COMMAND_SUMMARIES = {
-    "analyze": "one integrated pass: scan, describe, refine and classify",
+    "analyze": "scan, plus optional captions, tags and types in one pass",
     "scan": "index new/changed media (hash + pHash + CLIP)",
-    "describe": "caption indexed media that has no description yet",
+    "describe": "caption indexed media that has no caption yet",
     "search": "find media by person/object/text (CLIP by default)",
-    "embed": "compute CLIP embeddings for indexed images",
+    "embed": "fill in missing CLIP embeddings for indexed images",
     "similar": "group the tree by CLIP similarity, or find neighbors of one file",
     "duplicates": "group duplicates; best resolution wins",
     "clean": "review duplicate groups and move rejected copies to the Trash",
@@ -2961,7 +2961,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.3"
+_VERSION = "0.4.4"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -3068,7 +3068,7 @@ _COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
      "first pass over a folder: inventory it, index it, confirm it loads",
      ("bootstrap", "scan", "check")),
     ("go deeper",
-     "captions, tags, types and people — what makes search work well",
+     "embeddings, captions, tags, types and people — what makes search work well",
      ("analyze", "embed", "describe", "refine", "people")),
     ("find things",
      "search and browse what is indexed",
@@ -3580,16 +3580,17 @@ def main(argv: list[str] | None = None) -> int:
 
     p_analyze = sub.add_parser(
         "analyze",
-        help="one integrated pass: scan, describe, refine and classify",
+        help="scan, plus optional captions, tags and types in one pass",
         description=(
-            "Run every analysis pass over a media tree in one go — indexing "
-            "(hash + pHash + CLIP), VLM captions, tag refinement and image "
-            "typing — for images and videos alike. The scan pipeline keeps the "
-            "GPU busy by overlapping CPU decoding with GPU embedding batches, "
-            "and the describe stage overlaps CPU frame extraction with GPU "
-            "caption generation. Flags map 1:1 onto 'scan'; add --describe, "
-            "--refine and/or --classify for the later passes. With "
-            "--start-id/--stop-id every stage is limited to that id window."
+            "Index new or changed media and, when asked, run the later passes "
+            "in the same command. Indexing (hash + pHash + CLIP) always "
+            "happens; --describe adds VLM captions, --refine rebuilds canonical "
+            "tags/facets, and --classify types images (it implies --refine). "
+            "Without those flags 'analyze' does the same work as 'scan'. The "
+            "scan pipeline keeps the GPU busy by overlapping CPU decoding with "
+            "GPU embedding batches, and the describe stage overlaps CPU frame "
+            "extraction with GPU caption generation. With --start-id/--stop-id "
+            "every stage is limited to that id window."
         ),
     )
     _add_common(p_analyze)
@@ -3675,11 +3676,13 @@ def main(argv: list[str] | None = None) -> int:
         "search",
         help="find media by person/object/text",
         description=(
-            "Search the index. With words, results come from the captions and "
-            "refined tags; with --clip they come from CLIP text-to-image "
-            "similarity instead. Narrow the result set with --since/--until/"
-            "--camera, --person/--object, --type, --cluster, --image-only or "
-            "--video. Add --json for machine-readable output."
+            "Search the index. When embeddings exist, words are matched with "
+            "CLIP text-to-image similarity by default; --fts switches to "
+            "full-text search over captions and refined tags instead. A "
+            "date/camera filter without words lists matching media. Narrow the "
+            "result set with --since/--until/--camera, --person/--object, "
+            "--type, --cluster, --image-only or --video. Add --json for "
+            "machine-readable output."
         ),
     )
     _add_common(p_search)
@@ -3717,12 +3720,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_embed = sub.add_parser(
         "embed",
-        help="compute CLIP embeddings for indexed images",
+        help="fill in missing CLIP embeddings for indexed images",
         description=(
             "Fill in CLIP embeddings for indexed images that do not have one yet "
             "(the usual case after importing an index from elsewhere). With "
             "--recompute, every indexed image is embedded again, which is how "
-            "you switch to a different --clip-model."
+            "you switch to a different --clip-model. Videos are embedded during "
+            "'scan --video'; this command fills image rows only."
         ),
     )
     _add_common(p_embed)
