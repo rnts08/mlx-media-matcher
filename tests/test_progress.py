@@ -226,6 +226,14 @@ def test_enabled_bar_draws_in_place_and_ends_with_a_newline():
     assert "\r" in out                 # rewritten in place, not appended
 
 
+def test_render_names_the_gpu_phase_instead_of_idle():
+    state = PipelineState(total=10, done=3, started=time.perf_counter() - 1.0,
+                          gpu_seconds=0.5, phase="embedding")
+    text = render(state, "/root", "indexing")
+    assert "embedding" in text
+    assert "idle" not in text
+
+
 def test_bar_counts_completions_and_errors():
     bar = ProgressBar("indexing", "/root", 3, stream=io.StringIO())
     bar.note_completed()
@@ -303,3 +311,84 @@ def test_stop_is_idempotent():
     bar = ProgressBar("indexing", "/root", 1, stream=stream).start()
     bar.stop()
     bar.stop()  # a second stop must not double-print or raise
+
+def test_in_flight_reports_decoding_then_reading():
+    bar = ProgressBar("indexing", "/root", 1, stream=io.StringIO())
+    bar.note_reading("/root/a.jpg")
+    assert bar.in_flight() == ["/root/a.jpg"]
+    bar.note_decoding("/root/b.jpg")
+    assert bar.in_flight() == ["/root/b.jpg"]
+    snapshot = bar.in_flight()
+    snapshot.append("/root/c.jpg")
+    assert bar.in_flight() == ["/root/b.jpg"], "callers get a copy"
+
+
+# -- CLI scan: the model-load step and the no-bar heartbeat -----------------------
+
+
+def _fake_encoder(monkeypatch, *, sleep: float = 0.0):
+    np = pytest.importorskip("numpy")
+
+    class FakeEncoder:
+        model_id = "fake/clip-model"
+
+        def __init__(self):
+            self.loaded = False
+
+        def ensure_loaded(self):
+            self.loaded = True
+
+        def embed_images(self, arrays):
+            if sleep:
+                time.sleep(sleep)
+            return np.stack([np.ones(4, dtype=np.float32) for _ in arrays])
+
+        def unload(self):
+            pass
+
+    monkeypatch.setattr("media_match.clip.ClipEncoder",
+                        lambda **kw: FakeEncoder())
+    return FakeEncoder
+
+
+def _scan_tree(tmp_path, count: int = 4):
+    from PIL import Image
+
+    for i in range(count):
+        Image.new("RGB", (8, 8), (i * 20 % 255, 30, 60)).save(
+            tmp_path / f"img{i}.png")
+
+
+def test_scan_announces_the_model_load_before_the_bar(tmp_path, monkeypatch,
+                                                      capsys):
+    from media_match import cli
+
+    _scan_tree(tmp_path)
+    _fake_encoder(monkeypatch)
+
+    assert cli.main(["scan", str(tmp_path), "--no-progress"]) == 0
+    err = capsys.readouterr().err
+    assert "loading fake/clip-model (first run downloads it) ..." in err
+    assert "model ready in" in err
+    assert "indexing 0/4 starting ..." in err
+    # The download pause is named before the scan begins, not in its middle.
+    assert err.index("model ready") < err.index("starting ...")
+
+
+def test_no_bar_heartbeat_says_what_the_scan_is_doing(tmp_path, monkeypatch,
+                                                       capsys):
+    from media_match import cli
+
+    _scan_tree(tmp_path)
+    _fake_encoder(monkeypatch, sleep=0.35)
+    monkeypatch.setattr(cli, "HEARTBEAT_SECONDS", 0.05)
+
+    assert cli.main(["scan", str(tmp_path), "--no-progress"]) == 0
+    err = capsys.readouterr().err
+    # While the first (only) embedding batch is in flight, done stays at 0 and
+    # every file has left the reader/decoder lists; the heartbeat must still
+    # say what is happening rather than go quiet.
+    beats = [line for line in err.splitlines()
+             if line.startswith("  indexing [0/4] ")]
+    assert beats, err
+    assert any("embedding" in line for line in beats), beats

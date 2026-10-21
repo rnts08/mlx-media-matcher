@@ -460,6 +460,7 @@ def run_staged_scan(
 
     reader_count = max(1, io_workers)
     emitted = 0
+    job_by_path = {j.path: j for j in jobs}
     clear_every = 200
     ring = RingBuffer(max_bytes=ring_bytes)
     batch_queue: queue.Queue = queue.Queue(maxsize=batch_size * 2)
@@ -523,7 +524,11 @@ def run_staged_scan(
                 batch_queue.put(_DONE)
                 return
             # reconstruct a ScanJob from the path
-            job = next((j for j in jobs if j.path == path), None)
+            #
+            # A dict, not a linear scan: with 13k jobs the old lookup walked
+            # the whole list for every file, which is quadratic and made large
+            # rescans look stalled before the first result.
+            job = job_by_path.get(path)
             if job is None:
                 continue
             try:
@@ -556,8 +561,6 @@ def run_staged_scan(
     remaining: dict[object, int] = {}
     batch: list[tuple[int, int, np.ndarray]] = []
     next_owner = 0
-    jobs_iter = iter(jobs)
-    job_by_path = {j.path: j for j in jobs}
 
     def flush() -> None:
         nonlocal emitted, batch
@@ -567,12 +570,17 @@ def run_staged_scan(
         vectors = None
         if stats is not None:
             stats.gpu += 0.0  # measured below
+        if telemetry is not None:
+            telemetry.note_phase("embedding")
         t_gpu = time.perf_counter()
         try:
             vectors = encoder.embed_images(arrays)
         except Exception as exc:  # noqa: BLE001
             if on_error:
                 on_error("<batch>", exc)
+        finally:
+            if telemetry is not None:
+                telemetry.note_phase("")
         if stats is not None:
             stats.gpu += time.perf_counter() - t_gpu
         if telemetry is not None:

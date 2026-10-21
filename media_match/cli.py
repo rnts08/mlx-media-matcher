@@ -12,6 +12,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from datetime import datetime, timezone
 
 from .db import Database, db_path_for, open_db
@@ -241,27 +242,80 @@ def _require_ffmpeg() -> bool:
 # -- commands ----------------------------------------------------------------
 
 
+#: Longest a scan with no live bar is allowed to stay silent. Big enough to
+#: avoid log spam, small enough that a single slow video does not look hung.
+HEARTBEAT_SECONDS = 10.0
+
+
+def _load_model(model_holder, what: str = "CLIP model") -> None:
+    """Load model weights before a progress bar starts, and say so.
+
+    Loading is lazy, which used to put the first-run download inside the first
+    GPU batch: its Hugging Face bars then appeared in the middle of the scan,
+    could overwrite the scan bar, and the weight load looked like a hang. One
+    explicit step before the pipeline gives that pause a name and keeps the
+    bar the only thing redrawing.
+    """
+    ensure = getattr(model_holder, "ensure_loaded", None)
+    if not callable(ensure):
+        return  # a stand-in in tests has nothing to load
+    model = getattr(model_holder, "model_id", what)
+    print(f"loading {model} (first run downloads it) ...", file=sys.stderr)
+    started = time.perf_counter()
+    ensure()
+    print(f"  model ready in {time.perf_counter() - started:.1f}s",
+          file=sys.stderr)
+
+
 def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
                             batch_size, workers, on_result, on_error, stats,
                             label: str = "indexing"):
     """Run the scan, drawing live progress on a terminal and plain lines otherwise.
 
     The bar needs a TTY to redraw in place. Without one (a pipe, CI, a test)
-    it stays off entirely and the old periodic "preparing [n/total]" lines are
-    printed instead, so logs keep their one-event-per-line shape.
+    it stays off entirely and periodic "indexing [n/total]" lines are printed
+    instead, so logs keep their one-event-per-line shape. Even then the run
+    speaks at least every ``HEARTBEAT_SECONDS``: a single long video holds up
+    every worker, and the old 5%-of-jobs rule could stay quiet for minutes on
+    a large tree.
     """
-    from .progress import ProgressBar
+    from .progress import ProgressBar, short_name
 
     total_jobs = len(jobs)
+    if jobs:
+        _load_model(encoder)  # announced, and before the bar claims stderr
+
     bar = ProgressBar(label, root, total_jobs,
                       enabled=_progress_enabled(args)).start()
 
-    def progress(done: int, total: int, _path: str) -> None:
-        if bar.enabled or total <= 20:
-            return  # the bar is drawing, or the run is too short to bother
-        step = max(1, total // 20)
-        if done % step == 0 or done == total:
+    progress = None
+    beat_stop = threading.Event()
+    beat_thread = None
+    last_done = [0]
+
+    if not bar.enabled and total_jobs:
+        print(f"  {label} 0/{total_jobs} starting ...", file=sys.stderr)
+
+        def progress(done: int, total: int, _path: str) -> None:
+            last_done[0] = done
+            step = max(1, total // 20)
+            if done % step and done != total:
+                return
             print(f"  {label} [{done}/{total}]", file=sys.stderr)
+
+        def heartbeat() -> None:
+            while not beat_stop.wait(HEARTBEAT_SECONDS):
+                names = bar.in_flight()
+                if names:
+                    detail = short_name(names[0], root)
+                else:
+                    detail = bar.phase() or "waiting for media"
+                print(f"  {label} [{last_done[0]}/{total_jobs}] {detail}",
+                      file=sys.stderr)
+
+        beat_thread = threading.Thread(target=heartbeat, name="scan-heartbeat",
+                                       daemon=True)
+        beat_thread.start()
 
     try:
         return run_staged_scan(
@@ -272,6 +326,9 @@ def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
             stats=stats, telemetry=bar,
         )
     finally:
+        beat_stop.set()
+        if beat_thread is not None:
+            beat_thread.join(timeout=1.0)
         # Always tear the bar down: an exception mid-scan must not leave the
         # cursor sitting in the middle of a rewritten line.
         bar.stop()
@@ -519,6 +576,7 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
     from .vision import Describer
 
     describer = Describer(model_id=model)
+    _load_model(describer, "caption model")
     total = len(plan.jobs)
     done = 0
 
@@ -2879,7 +2937,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.1"
+_VERSION = "0.4.2"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"

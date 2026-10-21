@@ -80,6 +80,8 @@ class PipelineState:
     finished: float = 0.0
     #: set by the pipeline when an item failed
     errors: int = 0
+    #: what the GPU stage is doing when no file is in flight ("embedding")
+    phase: str = ""
 
 
 def human_bytes(n: float) -> str:
@@ -160,7 +162,9 @@ def render(state: PipelineState, root: str, label: str, *,
     if len(names) > MAX_NAMES:
         detail += f"  (+{len(names) - MAX_NAMES} more)"
     if not detail:
-        detail = "idle"
+        # A GPU batch in flight has no reader/decoder to name; saying "idle"
+        # while the GPU is busy reads as a stalled scan.
+        detail = state.phase or "idle"
 
     ring = ""
     if state.ring_cap:
@@ -230,6 +234,19 @@ class ProgressBar:
         with self._lock:
             self.state.decoding.append(path)
             self._trim_locked()
+
+    def in_flight(self) -> list[str]:
+        """Names of the files being read or decoded right now (a copy)."""
+        with self._lock:
+            return list(self.state.decoding or self.state.reading)
+
+    def phase(self) -> str:
+        with self._lock:
+            return self.state.phase
+
+    def note_phase(self, text: str) -> None:
+        with self._lock:
+            self.state.phase = text
 
     def note_finished(self, path: str) -> None:
         with self._lock:

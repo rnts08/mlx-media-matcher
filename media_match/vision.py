@@ -64,6 +64,10 @@ class Describer:
         self._model = None
         self._processor = None
 
+    def ensure_loaded(self) -> None:
+        """Load the weights now, so callers can announce the pause."""
+        self._ensure_loaded()
+
     def _ensure_loaded(self) -> None:
         if self._model is None:
             from mlx_vlm import load

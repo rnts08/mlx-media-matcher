@@ -23,6 +23,16 @@ class ClipEncoder:
         self._model = None
         self._tokenizer = None
 
+    def ensure_loaded(self) -> None:
+        """Load the weights now, so callers can announce the pause.
+
+        The scan calls this before it starts its progress bar: the first-run
+        download otherwise happens inside the first GPU batch, where its
+        progress bars fight the scan's bar and the weight load looks like a
+        hang.
+        """
+        self._ensure_loaded()
+
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return

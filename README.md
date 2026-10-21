@@ -157,7 +157,12 @@ one means the captioner is waiting on decodes and it will.
 
 `--no-progress` turns it off (implied when stderr is not a terminal, so piped
 output and CI keep one-event-per-line logs). `MEDIA_MATCH_NO_PROGRESS=1` does
-the same from the environment.
+the same from the environment. With the bar off, progress lines still appear
+at 5% steps and at least every 10 seconds — naming the file being read or
+decoded, or `embedding` while a GPU batch is in flight — so one slow video
+cannot make a large scan look hung. Model weights load before the bar starts,
+with `loading <model> ...` and `model ready in ...` around the first-run
+download instead of surfacing in the middle of the scan.
 
 ## Configuration
 
