@@ -386,7 +386,14 @@ class RingBuffer:
     def put(self, item: tuple[str, bytes]) -> None:
         data = item[1]
         with self._not_full:
-            while self._bytes + len(data) > self.max_bytes and not self._done:
+            # An item bigger than the whole ring can never satisfy "current +
+            # item <= capacity", so waiting for room deadlocks the only
+            # producer forever (a 1.5GB video against a 1GB buffer did exactly
+            # that on a real library). Let an oversized item through when the
+            # buffer is empty: it becomes the one item in flight, and small
+            # items wait behind it as usual.
+            while (not self._done and self._bytes > 0
+                   and self._bytes + len(data) > self.max_bytes):
                 self._not_full.wait()
             self._q.put(item)
             self._bytes += len(data)
@@ -445,10 +452,15 @@ def run_staged_scan(
 ) -> int:
     """Four-stage pipeline: Read → Preprocess → Embed → Store.
 
-    A ring buffer of raw file bytes (``ring_bytes`` cap) is always backfilled
-    by ``io_workers`` reader threads, so CPU workers never wait on disk. CPU
-    workers decode, pHash and preprocess into numpy arrays; the main thread
-    batches arrays and runs the GPU embedding. Results stream to ``on_result``.
+    Images travel through a ring buffer of raw bytes (``ring_bytes`` cap),
+    backfilled by ``io_workers`` reader threads so CPU workers never wait on
+    disk. Videos are different: the reader passes only the path, and the CPU
+    worker streams the SHA1 and lets ffprobe/ffmpeg decode the original file.
+    Reading every clip into RAM (then writing a temp copy) needed three passes
+    over a multi-GB video and could not work at all for one larger than the
+    ring. CPU workers decode, pHash and preprocess into numpy arrays; the main
+    thread batches arrays and runs the GPU embedding. Results stream to
+    ``on_result``.
 
     Returns the number of results emitted.
     """
@@ -495,11 +507,20 @@ def run_staged_scan(
                 if telemetry is not None:
                     telemetry.note_reading(job.path)
                 try:
-                    with open(job.path, "rb") as fh:
-                        data = fh.read()
-                    ring.put((job.path, data))
-                    if telemetry is not None:
-                        telemetry.note_read(len(data))
+                    if job.kind == "video":
+                        # Videos are decoded by ffmpeg straight from the
+                        # original file in the CPU stage. Reading a multi-GB
+                        # clip into RAM (and then writing a temp copy for
+                        # ffmpeg) exhausted memory and made one 1.5GB file
+                        # stall the whole pipeline. A path token costs nothing
+                        # and keeps the ring's back-pressure for images.
+                        ring.put((job.path, b""))
+                    else:
+                        with open(job.path, "rb") as fh:
+                            data = fh.read()
+                        ring.put((job.path, data))
+                        if telemetry is not None:
+                            telemetry.note_read(len(data))
                 except OSError:
                     continue
                 finally:
@@ -535,8 +556,13 @@ def run_staged_scan(
                 if telemetry is not None:
                     telemetry.note_decoding(path)
                     telemetry.note_cpu(time.process_time() - t_cpu)
-                result = _prepare_bytes(job, data, interval=interval,
+                result = (
+                    _prepare_video(job, interval=interval,
+                                   max_frames=max_frames)
+                    if job.kind == "video"
+                    else _prepare_bytes(job, data, interval=interval,
                                         max_frames=max_frames)
+                )
                 batch_queue.put(result)
             except Exception as exc:  # noqa: BLE001
                 if on_error:
@@ -670,6 +696,51 @@ def run_staged_scan(
     return emitted
 
 
+def _sha1_file(path: str) -> str:
+    """SHA1 of a file, streamed: never hold a whole video in memory."""
+    digest = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _video_result(job: ScanJob, sha1: str, meta, frames) -> ScanResult:
+    """Turn extracted keyframes into a ScanResult (shared by both paths)."""
+    from PIL import Image
+
+    phashes: list[str] = []
+    arrays: list[np.ndarray] = []
+    timestamps: list[float] = []
+    for t, arr in frames:
+        img = Image.fromarray(arr)
+        phashes.append(hash_to_hex(phash(img)))
+        arrays.append(process_image(img))
+        timestamps.append(t)
+    return ScanResult(
+        job=job, sha1=sha1, width=meta.width, height=meta.height,
+        phashes=phashes, arrays=arrays, timestamps=timestamps,
+        video_meta=meta, signature=min(phashes) if phashes else "",
+    )
+
+
+def _prepare_video(job: ScanJob, *, interval: float,
+                   max_frames: int) -> ScanResult:
+    """Prepare a video directly from its path (no in-memory copy).
+
+    ffprobe/ffmpeg read the original file; SHA1 is streamed in chunks. The
+    staged reader used to read the whole clip into the ring and then write a
+    temp copy, which is three passes over a multi-GB file and cannot work for
+    a file larger than the ring.
+    """
+    sha1 = _sha1_file(job.path)
+    meta = probe(job.path)
+    count = sample_count(meta.duration, interval=interval,
+                         max_frames=max_frames)
+    frames = extract_frames(job.path, meta, count=count)
+    return _video_result(job, sha1, meta, frames)
+
+
 def _prepare_bytes(job: ScanJob, data: bytes, *, interval: float,
                    max_frames: int) -> ScanResult:
     """Prepare a job from raw bytes (no disk read)."""
@@ -693,13 +764,9 @@ def _prepare_bytes(job: ScanJob, data: bytes, *, interval: float,
             captured_at=meta["captured_at"], camera=meta["camera"],
             gps_lat=meta["gps_lat"], gps_lon=meta["gps_lon"],
         )
-    # video: write bytes to a temp file for ffmpeg
+    # video from bytes: kept for `about bench` and direct callers, which hold
+    # the bytes already. The scan itself uses the path-based helper above.
     import tempfile
-
-    # This branch needs PIL in its own scope: the image branch above goes
-    # through load_image_tolerant and no longer imports it. Dropping this
-    # import made every video fail with NameError on Image.fromarray.
-    from PIL import Image
 
     with tempfile.NamedTemporaryFile(suffix=os.path.splitext(job.path)[1],
                                      delete=False) as tmp:
@@ -707,23 +774,12 @@ def _prepare_bytes(job: ScanJob, data: bytes, *, interval: float,
         tmp_path = tmp.name
     try:
         meta = probe(tmp_path)
-        count = sample_count(meta.duration, interval=interval, max_frames=max_frames)
+        count = sample_count(meta.duration, interval=interval,
+                             max_frames=max_frames)
         frames = extract_frames(tmp_path, meta, count=count)
     finally:
         os.unlink(tmp_path)
-    phashes: list[str] = []
-    arrays: list[np.ndarray] = []
-    timestamps: list[float] = []
-    for t, arr in frames:
-        img = Image.fromarray(arr)
-        phashes.append(hash_to_hex(phash(img)))
-        arrays.append(process_image(img))
-        timestamps.append(t)
-    return ScanResult(
-        job=job, sha1=sha1, width=meta.width, height=meta.height,
-        phashes=phashes, arrays=arrays, timestamps=timestamps,
-        video_meta=meta, signature=min(phashes) if phashes else "",
-    )
+    return _video_result(job, sha1, meta, frames)
 
 
 def run_scan(

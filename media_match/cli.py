@@ -247,6 +247,26 @@ def _require_ffmpeg() -> bool:
 HEARTBEAT_SECONDS = 10.0
 
 
+def _status(line: str) -> None:
+    """Write one status line, even to a stream that cannot encode the bar.
+
+    The fallback exists for terminals where the live bar's block characters do
+    not survive; writing the same characters there would raise and silence the
+    heartbeat too. A non-UTF-8 stderr gets an ASCII approximation instead.
+    """
+    try:
+        print(line, file=sys.stderr)
+        sys.stderr.flush()
+    except UnicodeEncodeError:
+        try:
+            sys.stderr.write(line.encode("ascii", "replace").decode("ascii") + "\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):  # pragma: no cover - closed stderr
+            pass
+    except (OSError, ValueError):  # pragma: no cover - closed stderr
+        pass
+
+
 def _load_model(model_holder, what: str = "CLIP model") -> None:
     """Load model weights before a progress bar starts, and say so.
 
@@ -260,11 +280,10 @@ def _load_model(model_holder, what: str = "CLIP model") -> None:
     if not callable(ensure):
         return  # a stand-in in tests has nothing to load
     model = getattr(model_holder, "model_id", what)
-    print(f"loading {model} (first run downloads it) ...", file=sys.stderr)
+    _status(f"loading {model} (first run downloads it) ...")
     started = time.perf_counter()
     ensure()
-    print(f"  model ready in {time.perf_counter() - started:.1f}s",
-          file=sys.stderr)
+    _status(f"  model ready in {time.perf_counter() - started:.1f}s")
 
 
 def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
@@ -274,10 +293,12 @@ def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
 
     The bar needs a TTY to redraw in place. Without one (a pipe, CI, a test)
     it stays off entirely and periodic "indexing [n/total]" lines are printed
-    instead, so logs keep their one-event-per-line shape. Even then the run
-    speaks at least every ``HEARTBEAT_SECONDS``: a single long video holds up
-    every worker, and the old 5%-of-jobs rule could stay quiet for minutes on
-    a large tree.
+    instead, so logs keep their one-event-per-line shape. The fallback is also
+    armed when the bar *starts* enabled: a terminal that cannot encode the
+    block characters turns the bar off mid-run, and the heartbeat then takes
+    over instead of leaving hours of silence. Either way the run speaks at
+    least every ``HEARTBEAT_SECONDS`` — a single long video holds up every
+    worker, and the old 5%-of-jobs rule could stay quiet for minutes.
     """
     from .progress import ProgressBar, short_name
 
@@ -288,30 +309,33 @@ def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
     bar = ProgressBar(label, root, total_jobs,
                       enabled=_progress_enabled(args)).start()
 
-    progress = None
     beat_stop = threading.Event()
     beat_thread = None
     last_done = [0]
 
-    if not bar.enabled and total_jobs:
-        print(f"  {label} 0/{total_jobs} starting ...", file=sys.stderr)
+    def progress(done: int, total: int, _path: str) -> None:
+        last_done[0] = done
+        if bar.enabled:
+            return  # the live display is redrawing; do not interleave lines
+        step = max(1, total // 20)
+        if done % step and done != total:
+            return
+        _status(f"  {label} [{done}/{total}]")
 
-        def progress(done: int, total: int, _path: str) -> None:
-            last_done[0] = done
-            step = max(1, total // 20)
-            if done % step and done != total:
-                return
-            print(f"  {label} [{done}/{total}]", file=sys.stderr)
+    if total_jobs:
+        if not bar.enabled:
+            _status(f"  {label} 0/{total_jobs} starting ...")
 
         def heartbeat() -> None:
             while not beat_stop.wait(HEARTBEAT_SECONDS):
+                if bar.enabled:
+                    continue  # the bar is alive and already says this
                 names = bar.in_flight()
                 if names:
                     detail = short_name(names[0], root)
                 else:
                     detail = bar.phase() or "waiting for media"
-                print(f"  {label} [{last_done[0]}/{total_jobs}] {detail}",
-                      file=sys.stderr)
+                _status(f"  {label} [{last_done[0]}/{total_jobs}] {detail}")
 
         beat_thread = threading.Thread(target=heartbeat, name="scan-heartbeat",
                                        daemon=True)
@@ -2937,7 +2961,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.2"
+_VERSION = "0.4.3"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"

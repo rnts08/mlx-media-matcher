@@ -309,3 +309,61 @@ def test_run_scan_mixes_images_and_videos(tmp_path, make_video):
     assert len(db.video_frames(video_rec.id)) == 4
     # every keyframe got an embedding from the shared batch queue
     assert len(db.video_embeddings()[video_rec.id]) == 4
+
+
+def test_ring_buffer_accepts_a_file_larger_than_its_capacity():
+    """A 1.5GB video must not wait forever for a 1GB ring to make room.
+
+    put() used to wait while `buffered + item > capacity`, a condition that can
+    never become false when the item itself is larger than capacity. That
+    deadlocked the only reader, every CPU worker, and the scan.
+    """
+    import threading
+
+    from media_match.pipeline import RingBuffer
+
+    ring = RingBuffer(max_bytes=10)
+    item = ("big.mp4", b"x" * 25)
+    t = threading.Thread(target=ring.put, args=(item,), daemon=True)
+    t.start()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "oversized item deadlocked the reader"
+    assert ring.fill() == (25, 10)
+    assert ring.get() == item
+    assert ring.fill() == (0, 10)
+
+
+def test_prepare_video_reads_the_original_path_and_streams_sha1(tmp_path,
+                                                               monkeypatch):
+    """The staged scan must not copy multi-GB clips through memory."""
+    import hashlib
+
+    from media_match import pipeline
+    from media_match.video import VideoMeta
+
+    data = b"not really a video, but ffmpeg is mocked" * 10
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(data)
+
+    seen = {}
+
+    def fake_probe(where):
+        seen["probe"] = where
+        return VideoMeta(duration=6.0, width=320, height=240, fps=25,
+                         codec="h264", bitrate=1)
+
+    def fake_extract(where, meta, count):
+        seen["extract"] = (where, count)
+        return [(0.0, np.zeros((224, 224, 3), dtype=np.uint8))]
+
+    monkeypatch.setattr(pipeline, "probe", fake_probe)
+    monkeypatch.setattr(pipeline, "extract_frames", fake_extract)
+
+    job = pipeline.ScanJob(kind="video", path=str(path), size=len(data),
+                           mtime=0.0)
+    result = pipeline._prepare_video(job, interval=1.0, max_frames=120)
+
+    assert seen["probe"] == str(path), "ffprobe should read the original file"
+    assert seen["extract"] == (str(path), 6)
+    assert result.sha1 == hashlib.sha1(data).hexdigest()
+    assert len(result.arrays) == 1

@@ -392,3 +392,72 @@ def test_no_bar_heartbeat_says_what_the_scan_is_doing(tmp_path, monkeypatch,
              if line.startswith("  indexing [0/4] ")]
     assert beats, err
     assert any("embedding" in line for line in beats), beats
+
+
+def test_draw_leaves_its_text_on_screen_instead_of_clearing_it():
+    """The old frame ended with clear-to-EOL and erased itself."""
+    stream = _FakeTTY()
+    bar = ProgressBar("indexing", "/root", 10, stream=stream).start()
+    bar.note_decoding("/root/a.jpg")
+    bar.draw()
+    out = stream.getvalue()
+    assert out.endswith("\n")
+    assert not out.endswith("\033[K")
+    assert "a.jpg" in out.splitlines()[-1], repr(out)
+    bar.draw()
+    out = stream.getvalue()
+    # The next frame moves back up over the previous block rather than
+    # appending a new one.
+    assert "\033[2F" in out
+    bar.stop()
+    assert stream.getvalue().endswith("\n")
+
+
+def test_stop_reaps_the_renderer_after_a_failed_draw():
+    class BrokenTTY(_FakeTTY):
+        def write(self, text):
+            raise OSError("terminal went away")
+
+    bar = ProgressBar("indexing", "/root", 1, stream=BrokenTTY(), enabled=True)
+    bar.start()
+    bar.draw()  # the renderer would do this on its first tick
+    assert bar.enabled is False
+    bar.stop()  # must not leave a live thread behind
+    assert bar._thread is None or not bar._thread.is_alive()
+
+
+def test_no_bar_heartbeat_takes_over_when_the_bar_dies(tmp_path, monkeypatch,
+                                                       capsys):
+    """A terminal that cannot draw the bar must still show progress."""
+    from media_match import cli
+    from media_match.progress import ProgressBar as RealBar
+
+    _scan_tree(tmp_path)
+    _fake_encoder(monkeypatch, sleep=0.35)
+    monkeypatch.setattr(cli, "HEARTBEAT_SECONDS", 0.05)
+    monkeypatch.setattr(cli, "_progress_enabled", lambda args: True)
+
+    def broken_draw(self):
+        # Simulate a write/encoding failure: the live display gives up.
+        self.enabled = False
+
+    monkeypatch.setattr(RealBar, "draw", broken_draw)
+
+    assert cli.main(["scan", str(tmp_path), "--no-progress"]) == 0
+    err = capsys.readouterr().err
+    beats = [line for line in err.splitlines()
+             if line.startswith("  indexing [0/4] ")]
+    assert beats, err
+    assert any("embedding" in line for line in beats), beats
+
+
+def test_status_lines_survive_an_ascii_stderr(monkeypatch):
+    from media_match import cli
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+    monkeypatch.setattr(cli.sys, "stderr", stream)
+
+    cli._status("indexing … 1/2")
+    stream.flush()
+    assert b"indexing ? 1/2" in raw.getvalue()

@@ -325,31 +325,40 @@ class ProgressBar:
             state = self.state
         width = _term_width(self._stream)
         text = render(state, self.root, self.label, width=width)
-        # Two lines rewritten in place: carriage return, draw, and clear to
-        # end of line so a shrinking line never leaves debris behind.
-        pad = "\r" + "\033[K"
+        lines = [_fit(line, width) for line in text.split("\n")]
+        # Redraw the whole block in place.
+        #
+        # The previous renderer joined its two lines with a bare \r and ended
+        # every frame with clear-to-end-of-line. That erased the block before
+        # anyone could read it: in a real terminal the scan showed no progress
+        # at all, even though draw() ran ten times a second. Move up to the
+        # first line of the previous block, then erase and rewrite each line,
+        # leaving the cursor just below it for the next frame.
+        chunks: list[str] = []
+        if self._drawn_lines:
+            chunks.append(f"\033[{self._drawn_lines}F")
+        for line in lines:
+            chunks.append("\r\033[2K" + line + "\n")
         try:
-            self._stream.write(pad.join(text.split("\n")) + pad)
+            self._stream.write("".join(chunks))
             self._stream.flush()
-            self._drawn_lines = 2
+            self._drawn_lines = len(lines)
         except (OSError, ValueError):  # pragma: no cover - closed stdout
             self.enabled = False
 
     def stop(self) -> None:
         """Finish, leaving the final state on screen with a newline."""
-        if not self.enabled:
-            return
+        # Stop the renderer even if it disabled itself after a failed write:
+        # otherwise a live thread would keep waking for the rest of the run.
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if not self.enabled:
+            return
         with self._lock:
             self.state.finished = time.perf_counter()
+        # draw() leaves the cursor below the (newline-terminated) block.
         self.draw()
-        try:
-            self._stream.write("\n")
-            self._stream.flush()
-        except (OSError, ValueError):  # pragma: no cover
-            pass
         self.enabled = False
 
     # Context manager so an exception cannot leave the cursor mid-line.
@@ -358,6 +367,17 @@ class ProgressBar:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+def _fit(text: str, width: int) -> str:
+    """Keep one rendered line on one terminal row.
+
+    A wrapped line would break the cursor-up arithmetic on the next frame, so
+    long detail lines are cut to the usable width instead of wrapping.
+    """
+    if width and len(text) > width:
+        return text[: max(0, width - 1)] + "…"
+    return text
 
 
 def _term_width(stream) -> int:
