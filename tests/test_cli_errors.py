@@ -9,6 +9,7 @@ dispatch net (`_run_command`).
 
 import contextlib
 import io
+import sqlite3
 
 import pytest
 from PIL import Image
@@ -48,14 +49,16 @@ MISSPELLED = "definitely-not-here"
 def test_misspelled_root_names_the_folder(argv, tmp_path):
     code, out, err = _main([*argv, str(tmp_path / MISSPELLED)])
     assert code == 2
-    assert f"No folder at {tmp_path / MISSPELLED}." in out
-    assert "Traceback" not in out + err
+    assert f"No folder at {tmp_path / MISSPELLED}." in err
+    assert out == ""  # nothing that --json callers could mistake for data
+    assert "Traceback" not in err
 
 
 def test_scan_root_that_is_a_file(tmp_path):
-    code, out, _err = _main(["scan", str(tmp_path / "a.png")])
+    code, out, err = _main(["scan", str(tmp_path / "a.png")])
     assert code == 2
-    assert "No folder at" in out
+    assert "No folder at" in err
+    assert out == ""
 
 
 def test_bad_db_location(tmp_path):
@@ -72,18 +75,28 @@ def test_db_that_is_not_a_database(tmp_path):
     root = _tree(tmp_path)
     bogus = tmp_path / "bogus.db"
     bogus.write_text("not a database")
-    code, out, err = _main(["duplicates", str(root), "--db", str(bogus)])
+    code, _out, err = _main(["duplicates", str(root), "--db", str(bogus)])
     assert code == 2
     assert "cannot open the index database" in err
     assert "file is not a database" in err
     assert "Traceback" not in err
 
 
+def test_no_index_failure_keeps_json_stdout_empty(tmp_path):
+    """A text failure on stdout would corrupt `--json` output."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    code, out, err = _main(["stats", str(root), "--json"])
+    assert code == 1
+    assert out == ""
+    assert "No index at" in err
+
+
 def test_unwritable_out_file(tmp_path):
     root = _tree(tmp_path)
     assert cli.main(["scan", str(root), "--quick"]) == 0
     bad = tmp_path / "no" / "such" / "dir" / "out.json"
-    code, out, err = _main(["export", str(root), "--out", str(bad)])
+    code, _out, err = _main(["export", str(root), "--out", str(bad)])
     assert code == 1
     assert "No such file or directory" in err
     assert str(bad) in err
@@ -112,6 +125,17 @@ def test_oserror_from_command_becomes_a_message(tmp_path, monkeypatch):
     code, _out, err = _main(["export", str(root)])
     assert code == 1
     assert err == "Permission denied: /locked/x.db\n"
+
+
+def test_database_bug_still_raises(tmp_path, monkeypatch):
+    """A constraint failure is a bug, not bad input; it must stay loud."""
+
+    def buggy(_args):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: files.path")
+
+    monkeypatch.setattr(cli, "cmd_export", buggy)
+    with pytest.raises(sqlite3.IntegrityError):
+        cli.main(["export", str(_tree(tmp_path))])
 
 
 def test_unknown_command_is_argparse_neat(capsys):

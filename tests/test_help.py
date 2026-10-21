@@ -56,7 +56,7 @@ def test_help_shows_one_command(capsys):
 
 def test_help_unknown_command(capsys):
     assert cli.main(["help", "bogus"]) == 1
-    assert "Unknown command" in capsys.readouterr().out
+    assert "Unknown command" in capsys.readouterr().err
 
 
 def test_top_level_help_flag(capsys):

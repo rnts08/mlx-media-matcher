@@ -109,7 +109,9 @@ def test_quick_scan_rejects_analysis_flags_and_window(tmp_path, capsys):
 def test_quick_scan_missing_root(tmp_path, capsys):
     missing = tmp_path / "nope"
     assert cli.main(["scan", str(missing), "--quick"]) == 2
-    assert "No folder" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "No folder" in captured.err
+    assert captured.out == ""
 
 
 # -- build_jobs: quick rows and the id window --------------------------------

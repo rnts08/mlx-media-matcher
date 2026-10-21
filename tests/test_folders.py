@@ -534,13 +534,13 @@ def test_cli_collapse_json(tmp_path, capsys):
 def test_cli_rejects_collapse_with_a_file_policy(tmp_path, capsys):
     root = _christmas_tree(tmp_path)
     assert _run(["folders", str(root), "--collapse", "--replace"]) == 2
-    assert "never touches files" in capsys.readouterr().out
+    assert "never touches files" in capsys.readouterr().err
 
 
 def test_cli_rejects_json_without_a_reporting_mode(tmp_path, capsys):
     root = _christmas_tree(tmp_path)
     assert _run(["folders", str(root), "--json", "--yes"]) == 2
-    assert "--json needs" in capsys.readouterr().out
+    assert "--json needs" in capsys.readouterr().err
 
 
 def test_cli_reports_no_groups(tmp_path, capsys):
@@ -596,7 +596,7 @@ def test_cli_eof_aborts_and_leaves_everything_alone(tmp_path, monkeypatch,
     root = _christmas_tree(tmp_path)
     monkeypatch.setattr("sys.stdin", io.StringIO("1\n"))
     assert _run(["folders", str(root)]) == 1
-    assert "Aborted; nothing was changed." in capsys.readouterr().out
+    assert "Aborted; nothing was changed." in capsys.readouterr().err
     assert (root / "b" / "Christmas" / "keep.txt").read_text() == "src1"
     assert not (root / "a" / "christmas" / "keep_1.txt").exists()
 
@@ -716,10 +716,10 @@ def test_unreadable_source_is_left_untouched(tmp_path, capsys, monkeypatch):
     finally:
         os.chmod(locked, 0o755)
 
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 1
-    assert "FAILED b/x" in out
-    assert "could not be read" in out
+    assert "FAILED b/x" in captured.out
+    assert "could not be read" in captured.err
     assert (root / "b" / "x" / "top.txt").exists()
     assert not (root / "a" / "x" / "top.txt").exists()
 
@@ -753,7 +753,7 @@ def test_declining_the_confirmation_aborts_with_status_1(tmp_path, monkeypatch,
     _write(root / "b" / "X" / "two.txt", "2")
     monkeypatch.setattr("sys.stdin", io.StringIO("1\nn\n"))
     assert _run(["folders", str(root)]) == 1
-    assert "Aborted; nothing was changed." in capsys.readouterr().out
+    assert "Aborted; nothing was changed." in capsys.readouterr().err
     assert (root / "b" / "X" / "two.txt").exists()
 
 
@@ -814,4 +814,6 @@ def test_collapse_prunes_empty_ancestors(tmp_path):
 
 def test_missing_root_is_a_usage_error(tmp_path, capsys):
     assert _run(["folders", str(tmp_path / "nope")]) == 2
-    assert "No folder at" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "No folder at" in captured.err
+    assert captured.out == ""

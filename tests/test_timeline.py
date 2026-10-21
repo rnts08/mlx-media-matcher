@@ -57,7 +57,7 @@ def test_search_camera_filters(tmp_path, capsys):
 def test_search_bad_date_errors(tmp_path, capsys):
     root = _tree(tmp_path)
     assert cli.main(["search", str(root), "--since", "not-a-date"]) == 2
-    assert "expected a date" in capsys.readouterr().out
+    assert "expected a date" in capsys.readouterr().err
 
 
 def test_duplicates_prefer_date_picks_newest(tmp_path, capsys):

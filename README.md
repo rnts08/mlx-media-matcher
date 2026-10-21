@@ -381,6 +381,18 @@ directory is named and nothing is changed, so a merge never acts on half a
 tree. A move that fails is reported with its OS reason and the rest continue.
 The stale-index line is printed only when an index actually exists.
 
+### Errors
+
+A mistake is answered with one line on stderr, never a stack trace: a
+misspelled or non-directory root prints `No folder at <path>.`, a `--db` in a
+folder that does not exist (or a file that is not a database) prints
+`cannot open the index database at <path>: <reason>`, and a failed write such
+as `export --out` into a missing directory prints the OS reason and the path.
+Exit status is `2` for a bad invocation or an index that cannot be opened, `1`
+for a missing index or a failed read/write, and `130` for `Ctrl-C`. Unexpected
+internal errors still print a traceback — those are bugs, and hiding them would
+make them harder to report.
+
 ## Commands
 
 Grouped by what they are for, in the order you would reach for them —

@@ -565,7 +565,7 @@ def cmd_describe(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     errors = 0
@@ -588,7 +588,8 @@ def _list_by_type(db: Database, args) -> int:
     )
     if not rows:
         known = ", ".join(name for name, _ in db.type_counts()) or "(none)"
-        print(f"No images of type '{args.type}'. Known types: {known}")
+        print(f"No images of type '{args.type}'. Known types: {known}",
+              file=sys.stderr)
         db.close()
         return 1
     for r in rows[: args.limit]:
@@ -607,7 +608,7 @@ def _list_by_cluster(db: Database, args) -> int:
     cluster_ids = db.clusters_for_label(args.cluster)
     if not cluster_ids:
         print(f"No person cluster named '{args.cluster}'. "
-              f"Name one with 'people --label N=Name'.")
+              f"Name one with 'people --label N=Name'.", file=sys.stderr)
         db.close()
         return 1
     rows: list = []
@@ -632,7 +633,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
     if args.type:
         return _list_by_type(db, args)
@@ -641,7 +642,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     for name in ("since", "until"):
         value = getattr(args, name, None)
         if value and _parse_day(value, end=(name == "until")) is None:
-            print(f"--{name}: expected a date like YYYY-MM-DD")
+            print(f"--{name}: expected a date like YYYY-MM-DD", file=sys.stderr)
             db.close()
             return 2
 
@@ -655,7 +656,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     terms.extend(args.query)
 
     if args.clip and args.fts:
-        print("use either --clip or --fts, not both")
+        print("use either --clip or --fts, not both", file=sys.stderr)
         db.close()
         return 2
 
@@ -784,7 +785,8 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
         video_embeddings = {v: f for v, f in video_embeddings.items()
                             if v in allowed_videos}
     if (matrix is None or not include_images) and not video_embeddings:
-        print("No CLIP embeddings yet. Run 'media-match scan' first.")
+        print("No CLIP embeddings yet. Run 'media-match scan' first.",
+              file=sys.stderr)
         return None
 
     query = ClipEncoder().embed_texts([query_text])[0]
@@ -838,7 +840,7 @@ def cmd_embed(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     from .db import _id_clause
@@ -911,7 +913,8 @@ def cmd_similar(args: argparse.Namespace) -> int:
     root = os.path.abspath(args.root)
     db = open_db(root, args.db, create=False)
     if db is None:
-        print(f"No index at {db_path_for(root, args.db)} — run 'media-match scan {root}' first.")
+        print(f"No index at {db_path_for(root, args.db)} — run 'media-match scan {root}' first.",
+              file=sys.stderr)
         return 1
 
     if args.video:
@@ -919,7 +922,8 @@ def cmd_similar(args: argparse.Namespace) -> int:
 
     ids, matrix = _load_embedding_matrix(db, args.start_id, args.stop_id)
     if matrix is None:
-        print("No CLIP embeddings in the index. Run 'media-match embed' first.")
+        print("No CLIP embeddings in the index. Run 'media-match embed' first.",
+              file=sys.stderr)
         db.close()
         return 1
 
@@ -1069,7 +1073,7 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     from .config import load_config
@@ -1156,7 +1160,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     from .cleanup import (
@@ -1244,7 +1248,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         print(f"  {os.path.relpath(record.path, root)}")
 
     if not args.yes and not confirm("Move to the system Trash? [y/N] "):
-        print("Aborted; nothing was changed.")
+        print("Aborted; nothing was changed.", file=sys.stderr)
         db.close()
         return 1
 
@@ -1490,11 +1494,11 @@ def _folders_merge(groups, root, args) -> int:
 
     if not completed:
         if quit_eof:
-            print("\nAborted; nothing was changed.")
+            print("\nAborted; nothing was changed.", file=sys.stderr)
             return 1
         if planning_failed:
             print(f"\n{planning_failed} source folder(s) could not be read "
-                  f"and were left untouched.")
+                  f"and were left untouched.", file=sys.stderr)
             return 1
         print("\nNothing was moved.")
         return 0
@@ -1508,13 +1512,13 @@ def _folders_merge(groups, root, args) -> int:
             else:
                 question = "Execute everything decided so far? [y/N] "
             if not confirm(question):
-                print("Aborted; nothing was changed.")
+                print("Aborted; nothing was changed.", file=sys.stderr)
                 return 1
     else:
         print(f"\n{planned} file(s) to move in {len(completed)} source "
               f"folder(s), {skipped} to skip.")
         if not args.yes and not confirm("Apply these moves? [y/N] "):
-            print("Aborted; nothing was changed.")
+            print("Aborted; nothing was changed.", file=sys.stderr)
             return 1
 
     moved = replaced = renamed = failed = 0
@@ -1602,14 +1606,16 @@ def cmd_folders(args: argparse.Namespace) -> int:
     if not _require_root(root):
         return 2
     if args.list and args.collapse:
-        print("Choose one: --list shows the groups, --collapse acts on them.")
+        print("Choose one: --list shows the groups, --collapse acts on them.",
+              file=sys.stderr)
         return 2
     if args.collapse and (args.replace or args.rename):
         print("--collapse works on whole folders and never touches files; "
-              "drop --replace/--rename.")
+              "drop --replace/--rename.", file=sys.stderr)
         return 2
     if args.json and not (args.list or args.collapse or args.dry_run):
-        print("--json needs --list, --collapse or --dry-run.")
+        print("--json needs --list, --collapse or --dry-run.",
+              file=sys.stderr)
         return 2
 
     read_errors: list[OSError] = []
@@ -1654,7 +1660,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     from .cleanup import confirm, human_size, restore_file
@@ -1684,7 +1690,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
     if not args.yes and not confirm(
         f"\nMove {len(rows)} file(s) back from the system Trash? [y/N] "
     ):
-        print("Aborted; nothing was changed.")
+        print("Aborted; nothing was changed.", file=sys.stderr)
         db.close()
         return 1
 
@@ -1748,7 +1754,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     image_clusters = db.cluster_labels("image")
@@ -1789,7 +1795,7 @@ def cmd_clear_metadata(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     from .db import _id_clause
@@ -1830,7 +1836,7 @@ def cmd_clear_metadata(args: argparse.Namespace) -> int:
     if not args.yes and sys.stdin.isatty():
         answer = input(f"Clear metadata for {total} item(s)? [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
-            print("aborted")
+            print("aborted", file=sys.stderr)
             db.close()
             return 1
 
@@ -1847,7 +1853,7 @@ def cmd_import_metadata(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     try:
@@ -1860,18 +1866,19 @@ def cmd_import_metadata(args: argparse.Namespace) -> int:
                 data = json.load(fh)
                 rows = data if isinstance(data, list) else data.get("items", [])
                 if not isinstance(rows, list):
-                    print("import file must be a JSON list (or CSV)")
+                    print("import file must be a JSON list (or CSV)", file=sys.stderr)
                     db.close()
                     return 2
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"cannot read {args.file}: {exc}")
+        print(f"cannot read {args.file}: {exc}", file=sys.stderr)
         db.close()
         return 2
 
     fields = [f.strip().lower() for f in args.fields.split(",") if f.strip()]
     unknown = [f for f in fields if f not in ("description", "keywords", "type")]
     if unknown:
-        print(f"unknown field(s): {', '.join(unknown)} — use description, keywords, type")
+        print(f"unknown field(s): {', '.join(unknown)} — use description, keywords, type",
+              file=sys.stderr)
         db.close()
         return 2
 
@@ -1926,7 +1933,7 @@ def cmd_export_metadata(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     from .db import _id_clause
@@ -1976,7 +1983,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
             f"(media files are NOT touched; 'scan' rebuilds from scratch) [y/N] "
         )
         if answer.strip().lower() not in ("y", "yes"):
-            print("aborted")
+            print("aborted", file=sys.stderr)
             return 1
 
     for suffix in ("", "-wal", "-shm"):
@@ -2411,7 +2418,7 @@ def cmd_refine(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     total = _refine_all(db, start_id=args.start_id, stop_id=args.stop_id)
@@ -2517,7 +2524,7 @@ def cmd_people(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
     kind = "image"
 
@@ -2526,7 +2533,8 @@ def cmd_people(args: argparse.Namespace) -> int:
 
     person_ids = set(db.media_ids_with_facet("person", kind))
     if not person_ids:
-        print("No person tags yet. Run 'scan --describe' then 'refine' first.")
+        print("No person tags yet. Run 'scan --describe' then 'refine' first.",
+              file=sys.stderr)
         db.close()
         return 1
 
@@ -2591,12 +2599,13 @@ def _label_cluster(db: Database, args) -> int:
     num, _, name = args.label.partition("=")
     name = name.strip()
     if not num.isdigit() or not name:
-        print("--label expects N=Name, e.g. --label 3=Alice")
+        print("--label expects N=Name, e.g. --label 3=Alice", file=sys.stderr)
         db.close()
         return 2
     cid = int(num)
     if cid not in {r["id"] for r in db.all_clusters("image")}:
-        print(f"No cluster {cid} yet. Run 'people' first to build clusters.")
+        print(f"No cluster {cid} yet. Run 'people' first to build clusters.",
+              file=sys.stderr)
         db.close()
         return 1
     db.set_cluster_label(cid, name)
@@ -2611,7 +2620,7 @@ def cmd_tags(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
     kind = "video" if args.video else "image"
@@ -2620,7 +2629,8 @@ def cmd_tags(args: argparse.Namespace) -> int:
     if args.types:
         counts = db.type_counts()
         if not counts:
-            print("No image types yet. Run 'refine --classify' first.")
+            print("No image types yet. Run 'refine --classify' first.",
+                  file=sys.stderr)
             db.close()
             return 1
         payload = [{"type": n, "count": c} for n, c in counts]
@@ -2631,7 +2641,7 @@ def cmd_tags(args: argparse.Namespace) -> int:
     elif args.facets:
         grouped = db.facet_tag_counts(kind)
         if not grouped:
-            print("No refined tags yet. Run 'refine' first.")
+            print("No refined tags yet. Run 'refine' first.", file=sys.stderr)
             db.close()
             return 1
         total_by_facet = dict(db.facet_counts(kind))
@@ -2655,7 +2665,7 @@ def cmd_tags(args: argparse.Namespace) -> int:
             counts = db.tag_counts(limit=args.limit, kind=kind)
             heading = "refined tags"
         if not counts:
-            print(f"No {heading} yet. Run 'scan' then 'refine'.")
+            print(f"No {heading} yet. Run 'scan' then 'refine'.", file=sys.stderr)
             db.close()
             return 1
         payload = [{"tag": k, "count": c} for k, c in counts]
@@ -2676,7 +2686,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
-              f"run 'media-match scan {root}' first.")
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
     total = db.count_files()
     described = db.conn.execute(
@@ -3010,6 +3020,10 @@ def _print_full_help() -> None:
         "Every command accepts --db to override the index location and takes a",
         "root argument (default: the current directory).",
         "",
+        "Mistakes get one line on stderr, not a traceback: exit 2 for bad input",
+        "or an index that cannot be opened, 1 for a missing index or a failed",
+        "read/write, 130 for Ctrl-C.",
+        "",
         "Run 'media-match <command> --help' or 'media-match help <command>' for",
         "the full flag list of one command, with defaults and an example.",
         "Run 'media-match help' again to re-read this guide.",
@@ -3020,8 +3034,9 @@ def _print_full_help() -> None:
 def _cmd_help(args: argparse.Namespace) -> int:
     if args.command:
         if args.command not in _SUBPARSERS:
-            print(f"Unknown command: {args.command}")
-            print("Commands: " + ", ".join(sorted(_COMMAND_SUMMARIES)))
+            print(f"Unknown command: {args.command}", file=sys.stderr)
+            print("Commands: " + ", ".join(sorted(_COMMAND_SUMMARIES)),
+                  file=sys.stderr)
             return 1
         print(_command_section(args.command))
         return 0
@@ -3128,7 +3143,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     )
 
     if getattr(report, "note", ""):
-        print(report.note)
+        print(report.note, file=sys.stderr)
         return 1
     print(f"corpus: {report.corpus_items} file(s), "
           f"{_fmt_bytes(report.corpus_bytes)} on disk")
@@ -3149,7 +3164,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     best = report.best
     if best is None:
-        print("\nno configuration completed; nothing to recommend.")
+        print("\nno configuration completed; nothing to recommend.",
+              file=sys.stderr)
         return 1
     pick = report.recommended or best
 
@@ -3280,7 +3296,7 @@ def _require_root(root: str) -> bool:
     """
     if os.path.isdir(root):
         return True
-    print(f"No folder at {root}.")
+    print(f"No folder at {root}.", file=sys.stderr)
     return False
 
 
@@ -3297,6 +3313,13 @@ def _run_command(args: argparse.Namespace) -> int:
         print("\nInterrupted.", file=sys.stderr)
         return 130
     except sqlite3.DatabaseError as exc:
+        # Only the two environment failures belong here: "unable to open
+        # database file" (OperationalError) and "file is not a database"
+        # (plain DatabaseError). A constraint or programming error is a bug
+        # and must keep its traceback so it can be reported as one.
+        if (not isinstance(exc, sqlite3.OperationalError)
+                and type(exc) is not sqlite3.DatabaseError):
+            raise
         target = getattr(args, "db", None)
         where = f" at {target}" if target else ""
         print(f"cannot open the index database{where}: {exc}", file=sys.stderr)

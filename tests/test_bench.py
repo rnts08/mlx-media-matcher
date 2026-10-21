@@ -187,7 +187,7 @@ def test_about_bench_reports_an_empty_tree_instead_of_crashing(capsys, tmp_path)
     empty = tmp_path / "empty"
     empty.mkdir()
     assert cli.main(["about", "bench", str(empty)]) == 1
-    assert "no media found" in capsys.readouterr().out
+    assert "no media found" in capsys.readouterr().err
 
 
 def test_every_candidate_is_a_valid_configuration():
