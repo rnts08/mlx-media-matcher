@@ -156,6 +156,23 @@ def test_main_refuses_to_start_with_a_duplicated_command():
         cli._COMMAND_GROUPS = saved
 
 
+def test_logic_map_covers_every_command():
+    # The map is documentation, so it can drift when a command is added. Every
+    # command the guide can describe must appear in the map by name.
+    _commands()
+    doc = (pathlib.Path(__file__).resolve().parent.parent
+           / "docs" / "CLI-LOGIC-MAP.md").read_text()
+    missing = [name for name in _commands() if f"`{name}`" not in doc]
+    assert not missing, f"CLI logic map is missing: {missing}"
+
+
+def test_readme_links_the_logic_map_and_audio_design():
+    readme = (pathlib.Path(__file__).resolve().parent.parent
+              / "README.md").read_text()
+    assert "docs/CLI-LOGIC-MAP.md" in readme
+    assert "docs/FEATURE-audio.md" in readme
+
+
 def test_readme_commands_table_is_grouped_like_the_cli():
     # The README and `media-match help` must agree on the grouping, or one of
     # them is showing people a map of a tool the other one does not have.

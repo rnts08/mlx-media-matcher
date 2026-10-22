@@ -23,6 +23,10 @@ import shutil
 from .diagnose import CORRUPT, NOTABLE, OK, TRUNCATED, diagnose_image
 from .pipeline import IMAGE_EXTENSIONS, iter_media
 
+# TODO(audio): diagnose_tree() should also probe audio (ffprobe metadata plus a
+# short decode) and report it with the same ok/truncated/corrupt/notable shape.
+# See docs/FEATURE-audio.md and `check --audio`.
+
 
 def check_image(path: str) -> str:
     """Classify one image file: 'ok', 'truncated', 'corrupt' or 'notable'.

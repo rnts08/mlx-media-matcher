@@ -7,6 +7,11 @@ quick inventory and clean up the library before the expensive `scan`.
 With flags it can also prune duplicates and non-media files, consolidate
 extensions to their canonical form, and fix missing extensions. File
 operations are dry-run unless ``--yes`` is given.
+
+Audio is inventoried here (kind ``audio``) so ``--media-only`` never treats
+music as junk, but audio is not scanned yet. TODO(audio): add probing,
+fingerprinting and interpretation in the scan/analyze stages; see
+``docs/FEATURE-audio.md`` and the TODO markers in ``pipeline.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import shutil
 import subprocess
 
 from .config import is_ignored
-from .pipeline import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from .pipeline import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 
 # ---------------------------------------------------------------------------
 # Extension consolidation
@@ -42,13 +47,9 @@ CANONICAL_EXTENSIONS: dict[str, str] = {
     ".mpg": ".mpg", ".mpeg": ".mpg", ".mp2": ".mpg",
     ".mpe": ".mpg", ".mpv": ".mpg",
     ".wmv": ".wmv",
-    # audio
-    ".mp3": ".mp3",
-    ".wav": ".wav",
-    ".flac": ".flac",
-    ".aac": ".aac",
-    ".ogg": ".ogg", ".oga": ".ogg",
-    ".m4a": ".m4a",
+    # audio: canonical spelling is the extension itself (TODO(audio): move all
+    # three kind sets into one media registry; see docs/FEATURE-audio.md)
+    **{ext: (".ogg" if ext == ".oga" else ext) for ext in AUDIO_EXTENSIONS},
 }
 
 # All extensions we consider "media" (image, video, audio).
@@ -67,7 +68,7 @@ def classify_extension(ext: str) -> str:
         return "image"
     if ext in VIDEO_EXTENSIONS:
         return "video"
-    if ext in CANONICAL_EXTENSIONS:
+    if ext in AUDIO_EXTENSIONS:
         return "audio"
     return "other"
 
@@ -151,7 +152,10 @@ def detect_media_type(path: str) -> str | None:
             return mapping[fmt]
     except Exception:  # noqa: BLE001
         pass
-    # videos/audio via ffprobe
+    # videos/audio via ffprobe. TODO(audio): return the actual audio container
+    # where it is known (.m4a/.flac/.wav) instead of always .mp3, and read
+    # music tags here only if it stays cheap; the full tag/fingerprint pass
+    # belongs in scan --audio (docs/FEATURE-audio.md).
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",

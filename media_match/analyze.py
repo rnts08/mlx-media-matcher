@@ -12,6 +12,11 @@ This module mirrors the scan pipeline's shape for the VLM pass:
     mid-frame still out of the video with ffmpeg) into a bounded queue
   * the main thread runs the VLM generation back to back, never waiting on a
     decode that has not already finished
+
+TODO(audio): audio "description" is two different jobs: speech-like tracks need
+a Whisper transcript (and keyword extraction), while music/sound needs CLAP
+acoustic tags plus embedded metadata. Add a branch in load_frame()/describe so
+audio does not go through a video mid-frame still. See docs/FEATURE-audio.md.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ DEFAULT_WINDOW = 8
 class DescribeJob:
     """One media item waiting for a VLM caption."""
 
-    kind: str  # "image" | "video"
+    kind: str  # "image" | "video" (TODO(audio): add "audio")
     media_id: int
     path: str  # absolute, for ffmpeg / PIL / error reports
     label: str  # relative to root, for progress lines

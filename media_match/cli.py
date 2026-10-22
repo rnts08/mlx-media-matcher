@@ -40,6 +40,13 @@ from .video_search import best_moment, format_timestamp
 
 _mp = lambda w, h: f"{w * h / 1_000_000:.1f}MP"
 
+# TODO(audio): keep audio as a kind flag (`--audio`) on the existing lifecycle
+# commands rather than adding a parallel `music` command family. When the scan
+# stage lands, add it to scan/analyze/describe/embed/classify/refine/search/
+# tags/similar/duplicates/clean/check and to export/export-metadata; bootstrap
+# already inventories audio. See docs/CLI-LOGIC-MAP.md and
+# docs/FEATURE-audio.md.
+
 # Per-category cap on how many affected files to name in one report; the
 # counts in the summary always cover every file.
 _REPORT_LIMIT = 20
@@ -2817,8 +2824,9 @@ def cmd_classify(args: argparse.Namespace) -> int:
     """Type indexed images with zero-shot CLIP.
 
     Classification needs CLIP embeddings but not captions. It is the standalone
-    counterpart to ``analyze``/``refine --classify``: run it when the index is
-    already scanned and only the image types need (re)building.
+    counterpart to ``analyze``: run it when the index is already scanned and
+    only the image types need (re)building. The old ``refine --classify``
+    spelling is kept for 0.4.x compatibility.
     """
     root = os.path.abspath(args.root)
     if not _require_root(root):
@@ -2998,7 +3006,7 @@ def cmd_tags(args: argparse.Namespace) -> int:
     if args.types:
         counts = db.type_counts()
         if not counts:
-            print("No image types yet. Run 'refine --classify' first.",
+            print("No image types yet. Run 'classify' first.",
                   file=sys.stderr)
             db.close()
             return 1
@@ -3250,7 +3258,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.5"
+_VERSION = "0.4.6"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -3811,8 +3819,10 @@ def main(argv: list[str] | None = None) -> int:
             "embedding. The pHash is only computed for new files, or for files "
             "changed since bootstrap; unchanged rows are skipped, so re-running "
             "is cheap. Use 'analyze' for the complete describe/embed/classify/"
-            "refine pass, or add --describe/--refine/--classify here to run "
-            "individual follow-up stages in the same command. --video includes "
+            "refine pass. The legacy --describe/--refine/--classify flags still "
+            "run those stages in this command for 0.4.x scripts, but 'scan' is "
+            "indexing; prefer 'analyze' or the standalone stage commands. "
+            "--video includes "
             "videos, and --prune drops index rows for files that have since "
             "been moved or deleted. --quick only stats files and writes basic "
             "rows (path/size/mtime) with stable ids — no reading, no GPU; "
@@ -3993,7 +4003,7 @@ def main(argv: list[str] | None = None) -> int:
                           help="search images only (skip videos)")
     p_search.add_argument("--type",
                           help="list images of a type, e.g. selfie/scene/object "
-                               "(needs 'refine --classify')")
+                               "(needs 'classify')")
     p_search.add_argument("--cluster",
                           help="list photos of a named person cluster "
                                "(needs 'people --label N=Name')")
@@ -4233,7 +4243,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_common(p_refine)
     _add_id_range(p_refine)
     p_refine.add_argument("--classify", action="store_true",
-                          help="also label each image's type with zero-shot CLIP")
+                          help="legacy: also label each image's type with "
+                               "zero-shot CLIP (prefer the 'classify' command)")
     p_refine.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
                           help=f"CLIP model for --classify (default: {DEFAULT_CLIP_MODEL})")
     p_refine.add_argument("--recompute", action="store_true",

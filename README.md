@@ -32,6 +32,13 @@ Everything runs locally: no cloud services, no PyTorch. Requires Apple Silicon.
   `describe` captions the media, `classify` types each photo, and `refine`
   turns captions into canonical tags/facets; `analyze` runs all of them in one
   pass. `people` clusters person photos and supports naming them.
+- **Phase 3 (audio): inventory only** — `bootstrap` recognizes music/audio
+  extensions and keeps them with `--media-only`, but audio is not scanned,
+  fingerprinted, transcribed or deduplicated yet. The design and TODO seams are
+  in [`docs/FEATURE-audio.md`](docs/FEATURE-audio.md).
+
+The full command/operation map, including the command-vs-argument decisions, is
+[`docs/CLI-LOGIC-MAP.md`](docs/CLI-LOGIC-MAP.md).
 
 ## Install
 
@@ -304,7 +311,7 @@ Ignored paths are skipped by `scan` and dropped by `scan --prune`.
 
 # tuning the scan pipeline — the defaults suit most trees
 .venv/bin/media-match scan ~/Pictures --io-workers 4    # disk reader threads
-.venv/bin/media-match scan ~/Pictures --describe --describe-batch 6  # caption 6/forward pass
+.venv/bin/media-match analyze ~/Pictures --describe-batch 6  # caption 6/forward pass
 ```
 
 Damaged files are reported by name, not as a wall of Pillow warnings. `scan`
@@ -427,7 +434,7 @@ first pass over a folder: inventory it, index it, confirm it loads
 | Command | What it does | Key options |
 |---|---|---|
 | `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index, then run the same loadability check as `check` and offer to repair truncated or quarantine corrupt files. Dry-run by default: asks before touching files; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--move-to DIR` moves the non-media files out instead of trashing them, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--move-to`, `--fix-extensions`, `--no-check`, `--quarantine`, `--video`, `--yes`, `--no-progress` |
-| `scan [root]` | walk the tree and index every new/changed media file: size, dimensions, capture date, pHash (for exact duplicates) and a CLIP embedding. pHash is only computed for new files or files changed since bootstrap; unchanged files are skipped. `--quick` writes basic rows (path/size/mtime) with stable ids without reading contents | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--quick`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--batch`, `--no-progress` |
+| `scan [root]` | walk the tree and index every new/changed media file: size, dimensions, capture date, pHash (for exact duplicates) and a CLIP embedding. pHash is only computed for new files or files changed since bootstrap; unchanged files are skipped. `--quick` writes basic rows (path/size/mtime) with stable ids without reading contents. The `--describe`/`--refine`/`--classify` switches are legacy 0.4.x stage shortcuts; prefer `analyze` or the standalone stage commands | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--quick`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--batch`, `--no-progress` |
 | `check [root]` | name every file that is not clean and say why: truncated (re-encodable), corrupt (quarantinable), or notable (loads fine — a malformed MPO container, a very large image — reported, never touched) | `--video`, `--quarantine`, `--yes` |
 
 ### Go deeper
@@ -440,7 +447,7 @@ embeddings, captions, tags, types and people — what makes search work well
 | `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch`, `--start-id`/`--stop-id`, `--no-progress` |
 | `embed [root]` | fill in missing CLIP embeddings for indexed images; `--recompute` re-embeds all of them (e.g. after changing `--clip-model`). Videos are embedded by `scan --video` | `--recompute`, `--clip-model`, `--batch`, `--start-id`/`--stop-id` |
 | `classify [root]` | type every untyped indexed image (selfie/portrait/group/scene/city/animal/object/food/document/art/other) with zero-shot CLIP. Needs embeddings, not captions; `--recompute` reclassifies everything | `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
-| `refine [root]` | refine captions/keywords into canonical tags + facets. Requires descriptions: run `describe` first (or use `analyze`). `--classify` also types each image | `--classify`, `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
+| `refine [root]` | refine captions/keywords into canonical tags + facets. Requires descriptions: run `describe` first (or use `analyze`). `--classify` is the legacy way to type each image; prefer the standalone `classify` | `--classify`, `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
 | `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
 
 ### Find things
@@ -507,7 +514,10 @@ grouping or CLIP search until a normal `scan` or `embed` fills them in.
 All commands take `--db` to override the index location. `root` defaults to
 the current directory. Supported image formats: JPEG, PNG, WebP, GIF, BMP,
 TIFF, HEIC/HEIF. Supported video formats (with `--video`): MP4, MOV, M4V, AVI,
-MKV, WebM, MPG/MPEG, WMV (anything `ffmpeg` can decode).
+MKV, WebM, MPG/MPEG, WMV (anything `ffmpeg` can decode). Audio formats (MP3,
+WAV, FLAC, AAC, OGG/OGA, M4A) are recognized by `bootstrap` and kept by
+`--media-only`, but audio analysis is not implemented yet — see
+[`docs/FEATURE-audio.md`](docs/FEATURE-audio.md).
 
 Default models are the smallest viable ones; for better accuracy use
 `--clip-model` / `--model` with any MLX-converted checkpoint, e.g.

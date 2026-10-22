@@ -7,6 +7,10 @@ to LIKE queries when the tokenizer or query is unsuitable.
 Two kinds of media live side by side: images (one row in `files`) and videos
 (one row in `videos` plus one row per sampled keyframe in `video_frames`). All
 the image code kept working unchanged; videos are additive.
+
+Audio is inventory-only today. It gets its own tables (not `videos` rows) when
+the audio scan lands; see the TODO before the schema and
+``docs/FEATURE-audio.md``.
 """
 
 from __future__ import annotations
@@ -20,6 +24,13 @@ DEFAULT_DB_NAME = ".media-match.db"
 
 # Bump when the schema changes and add the matching step to _MIGRATIONS.
 SCHEMA_VERSION = 3
+
+# TODO(audio): schema v4 adds an `audio` table (one row per file: sha1,
+# duration, codec/bitrate/sample_rate/channels, ID3/Vorbis tags, Chromaprint
+# fingerprint, description/keywords/embedding) plus `audio_segments` (CLAP
+# vectors per time window) and an `audio_fts` mirror. Reuse media_tags with
+# kind='audio'; do not store audio as 0x0 video rows. See docs/FEATURE-audio.md
+# and the AudioRecord contract there.
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -248,6 +259,10 @@ class VideoRecord:
         return self.signature
 
 
+# TODO(audio): add AudioRecord here with id/path/size/mtime/sha1/duration/
+# fingerprint/bitrate/sample_rate/channels plus description/keywords. It should
+# duck-type what groups/cleanup/TUI need, but duration and fingerprint are the
+# real dedupe fields; width/height have no audio meaning.
 class Database:
     def __init__(self, path: str):
         self.path = path

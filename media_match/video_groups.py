@@ -11,6 +11,10 @@ parent.
 independent, like the image path). `find_video_similarity_groups` uses one
 mean-pooled CLIP vector per video, so semantic grouping stays O(videos^2) even
 when each video has a hundred keyframes.
+
+TODO(audio): audio dedupe is a sibling of this module, not a reuse of keyframe
+pHash. Match Chromaprint sequences by alignment; use CLAP segments only for
+"same song, different recording" similarity. See docs/FEATURE-audio.md.
 """
 
 from __future__ import annotations

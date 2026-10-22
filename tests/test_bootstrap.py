@@ -34,6 +34,7 @@ def test_consolidated_path_normalises_case_and_alias():
     assert consolidated_path("/a/photo.JPEG") == "/a/photo.jpg"
     assert consolidated_path("/a/photo.jpeg") == "/a/photo.jpg"
     assert consolidated_path("/a/clip.MP4") == "/a/clip.mp4"
+    assert consolidated_path("/a/song.oga") == "/a/song.ogg"
     assert consolidated_path("/a/photo.jpg") is None  # already canonical
     assert consolidated_path("/a/archive.zip") is None  # not media
 
@@ -67,9 +68,11 @@ def test_walk_tree_records_all_kinds(tmp_path):
     _write_image(root / "a.jpg")
     (root / "notes.txt").write_text("hello")
     (root / "data.zip").write_bytes(b"PK\x03\x04")
+    (root / "song.mp3").write_bytes(b"ID3\x04\x00\x00")
     rows = walk_tree(str(root))
     kinds = {os.path.basename(r[0]): r[4] for r in rows}
     assert kinds["a.jpg"] == "image"
+    assert kinds["song.mp3"] == "audio"
     assert kinds["notes.txt"] == "other"
     assert kinds["data.zip"] == "other"
 
@@ -159,6 +162,24 @@ def test_bootstrap_media_only_consolidates_and_prunes(capsys, tmp_path):
     # extension consolidated, non-media pruned
     assert (root / "photo.jpg").exists()
     assert not (root / "photo.JPEG").exists()
+    assert not (root / "archive.zip").exists()
+
+
+def test_bootstrap_media_only_keeps_audio(tmp_path, capsys):
+    # Audio is media too: --media-only may prune notes and archives, but must
+    # not treat a music file as junk before audio analysis exists.
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "song.mp3").write_bytes(b"ID3\x04\x00\x00")
+    (root / "notes.txt").write_text("hello")
+    (root / "archive.zip").write_bytes(b"PK\x03\x04")
+
+    assert cli.main(["bootstrap", str(root), "--media-only", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "1 audio" in out
+    assert "pruned 2 non-media" in out
+    assert (root / "song.mp3").exists()
+    assert not (root / "notes.txt").exists()
     assert not (root / "archive.zip").exists()
 
 

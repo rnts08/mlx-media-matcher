@@ -3,6 +3,12 @@
 pHash is computed from the DCT of a canonical 32x32 grayscale version of the
 image, so a 4000px photo and a 150px thumbnail of the same picture produce
 nearly identical 64-bit hashes.
+
+TODO(audio): audio fingerprints are a different primitive. Chromaprint returns
+a variable-length sequence over time, matched by alignment/bit-error rate, not
+a 64-bit hamming comparison. Add an audio fingerprint module (or adapter around
+`fpcalc -raw`) rather than reusing ``phash``/``hamming``. See
+``docs/FEATURE-audio.md``.
 """
 
 from __future__ import annotations

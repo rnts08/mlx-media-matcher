@@ -9,6 +9,12 @@ everything else is a duplicate/variant.
 `find_similarity_groups` groups more loosely via CLIP embedding cosine
 similarity: it also links different photos of the same subject, not only
 re-encodes of the same photo.
+
+TODO(audio): add audio duplicate grouping here or in a sibling module. Exact
+SHA1 groups are shared, but encoded-copy detection uses Chromaprint (aligned
+bit-error rate), and best-version selection is lossless > bitrate > sample rate,
+not pixel count. Do not feed AudioRecord through `_megapixels()`. See
+``docs/FEATURE-audio.md``.
 """
 
 from __future__ import annotations

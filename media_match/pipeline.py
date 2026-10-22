@@ -33,11 +33,19 @@ IMAGE_EXTENSIONS = {
 VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".wmv",
 }
+# TODO(audio): make this the single extension registry for every media kind,
+# then teach iter_media()/prepare()/store_result() about audio together. Do not
+# add audio to iter_media() on its own: without an audio branch below it would
+# fall through to the video probe/extract path and be indexed as a 0x0 video.
+# See docs/FEATURE-audio.md.
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".oga", ".m4a",
+}
 
 
 @dataclass
 class ScanJob:
-    kind: str  # "image" | "video"
+    kind: str  # "image" | "video" (TODO(audio): add "audio")
     path: str
     size: int
     mtime: float
@@ -104,8 +112,10 @@ def iter_media(root: str, include_video: bool, *,
                 ignore: list[str] | None = None) -> list[tuple[str, str]]:
     """(kind, path) for every image (and, optionally, video) under root.
 
-    ``ignore`` is a list of .media-matchignore globs; matching paths are left
-    out of the index entirely.
+    Audio files are deliberately left out: inventory records them, but there
+    is no audio scan stage yet (see ``AUDIO_EXTENSIONS`` and
+    ``docs/FEATURE-audio.md``). ``ignore`` is a list of .media-matchignore
+    globs; matching paths are left out of the index entirely.
     """
     ignore = ignore or []
     paths: list[tuple[str, str]] = []
@@ -199,6 +209,8 @@ def build_jobs(
         except OSError:
             continue
         existing = db.get_file(path) if kind == "image" else db.get_video(path)
+        # TODO(audio): lookup an audio row by path and treat "sha1 == ''" as an
+        # incomplete quick row, exactly like the image/video branches.
         analysed = existing is not None and bool(existing["sha1"])
         unchanged = (
             analysed
@@ -340,6 +352,9 @@ def prepare(job: ScanJob, interval: float, max_frames: int) -> ScanResult:
         )
 
     meta = probe(job.path)
+    # TODO(audio): branch here before the video path. Audio needs ffprobe
+    # metadata, ID3/Vorbis tags, a Chromaprint fingerprint and CLAP windows —
+    # not probe()/extract_frames(). See docs/FEATURE-audio.md.
     count = sample_count(meta.duration, interval=interval, max_frames=max_frames)
     frames = extract_frames(job.path, meta, count=count)
     phashes: list[str] = []
@@ -944,6 +959,8 @@ def store_result(db: Database, result: ScanResult) -> None:
         )
         return
 
+    # TODO(audio): add an audio branch before this video branch. It needs an
+    # upsert_audio() plus set_audio_segments(), not video_meta/video_frames.
     video_id = db.upsert_video(
         path=job.path, size=job.size, mtime=job.mtime, sha1=result.sha1,
         duration=result.video_meta.duration, width=result.width,

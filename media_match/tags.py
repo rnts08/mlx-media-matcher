@@ -6,6 +6,11 @@ synonyms to one canonical tag, and then buckets every tag into a coarse
 *facet* (person / animal / object / scene / food / plant / text / activity /
 color). Facets let the library be browsed by kind as well as by word, and are
 what the people clustering and the type classifier build on.
+
+TODO(audio): add music facets (artist, album, genre, mood, instrument) and the
+audio keywords produced by Whisper/CLAP. `media_tags.kind='audio'` is already
+supported; only the vocabulary and extraction need extending. See
+``docs/FEATURE-audio.md``.
 """
 
 from __future__ import annotations
