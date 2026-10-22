@@ -257,7 +257,8 @@ tests have one entry point.
 | `embed` | CLIP before the bar | embed bar |
 | `classify` / `refine --classify` | CLIP before the bar | classify bar |
 | `search` | CLIP (index model, or `--clip-model`) before the text query | model spinner; query is a single forward pass |
-| `similar --image` | CLIP only when the target is not in the index | model spinner, then grouping spinner |
+| `similar` (group mode) | no model | grouping spinner |
+| `similar --image` | CLIP only when the target is not in the index | model spinner |
 | `duplicates` / `people` | no model | grouping/clustering spinner |
 | `check` | no model | check bar |
 | `bootstrap` | no model | inventory spinner, then check bar |
