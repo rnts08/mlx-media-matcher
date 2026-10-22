@@ -294,6 +294,11 @@ family would duplicate every stage and violate the command/flag rule in the
   version and reclaimable bytes, and require confirmation or `--yes`.
 - Do not add audio to `iter_media()` until `prepare()` and `store_result()` have
   the audio branch. That is the failure mode the current TODO comments guard.
+- Audio stages follow the same model/display contract as images and video:
+  load the fingerprint/CLAP/transcription model before the stage's progress
+  bar, and let the bar's rolling 60-second rate/ETA drive the estimate. A
+  music library is often thousands of small files, exactly where a lifetime
+  average becomes misleading.
 
 ## Implementation tickets
 

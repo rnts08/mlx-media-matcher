@@ -1,6 +1,6 @@
 # CLI logic map and command tree
 
-Status: describes **0.4.6**. This is a map and a decision record, not a
+Status: describes **0.4.7**. This is a map and a decision record, not a
 breaking CLI change. Audio is inventory-only today; the planned extension is
 in [`FEATURE-audio.md`](FEATURE-audio.md).
 
@@ -231,7 +231,50 @@ The CLI shape stays the same: `scan --audio`, `analyze --audio`,
 `bootstrap` needs no `--audio`: audio is part of the inventory and
 `--media-only` keeps it.
 
-## 5. Where the code encodes this
+## 5. Model loading and progress
+
+Two cross-cutting rules apply to every stage:
+
+1. **A model is loaded before the stage's progress display starts.** A
+   first-run download or MLX kernel compile is a named step (`loading ...`,
+   `model ready in ...`), not a pause hidden inside a bar.
+2. **A stage never draws two displays at once.** The model spinner finishes,
+   then the bar starts. When a stage ends, its bar leaves one final line:
+   `✓` on success, `!` if any item failed.
+
+`media_match.models.ModelCache` resolves and owns the models for one command
+(flag, then config, then the index's `clip_model`/`vlm_model` metadata, then the
+built-in default); `media_match.console` owns the terminal status and model-load animation;
+`media_match.progress` owns the bars and the rolling ETA. The CLI keeps thin
+aliases (`_load_model`, `_progress_enabled`, `_status`) so command code and
+tests have one entry point.
+
+| Command | Model work | Display |
+|---|---|---|
+| `scan` | CLIP before indexing; caption model before `--describe`; CLIP reloaded before `--classify` | index, describe and classify bars |
+| `analyze` | CLIP before indexing; released while the caption model runs; caption model before describe; CLIP reloaded before embed/classify | index/describe/embed bars, then a classify spinner; no model load inside either |
+| `describe` | caption model before the bar | describe bar |
+| `embed` | CLIP before the bar | embed bar |
+| `classify` / `refine --classify` | CLIP before the bar | classify bar |
+| `search` | CLIP (index model, or `--clip-model`) before the text query | model spinner; query is a single forward pass |
+| `similar --image` | CLIP only when the target is not in the index | model spinner, then grouping spinner |
+| `duplicates` / `people` | no model | grouping/clustering spinner |
+| `check` | no model | check bar |
+| `bootstrap` | no model | inventory spinner, then check bar |
+
+The ETA is extrapolated from the trailing **60 seconds** of completed items,
+with the sample just before the window used as a baseline. It is deliberately
+not a lifetime average: a pipeline that slows down halfway through a folder
+should change its estimate. While a stage has less than a second of samples it
+shows no rate or ETA rather than an absurd number. A `↗`/`↘` beside the rate
+shows whether throughput is rising or falling.
+
+`--no-progress`, `MEDIA_MATCH_NO_PROGRESS=1` and a non-terminal stderr all
+disable the live block; the commands fall back to periodic one-line status
+(and the scan heartbeat). This is a cross-cutting output flag, like `--json`,
+not a lifecycle stage.
+
+## 6. Where the code encodes this
 
 | Concern | Location |
 |---|---|
@@ -241,6 +284,9 @@ The CLI shape stays the same: `scan --audio`, `analyze --audio`,
 | duplicate grouping | `media_match/groups.py`, `media_match/video_groups.py` |
 | schema | `media_match/db.py` |
 | CLI grammar and help groups | `media_match/cli.py` (`_COMMAND_GROUPS`, parsers) |
+| model selection / preload lifetime | `media_match/models.py` |
+| status, model-load animation, progress flag | `media_match/console.py` |
+| rolling ETA, bar rendering, spinner | `media_match/progress.py` |
 | audio design | [`FEATURE-audio.md`](FEATURE-audio.md) |
 
 Code comments marked `TODO(audio)` point at the seams that must change first.

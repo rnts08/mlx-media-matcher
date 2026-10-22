@@ -103,6 +103,18 @@ def test_readme_documents_only_flags_that_exist():
     assert not sorted(quoted - real), f"README documents flags that do not exist: {sorted(quoted - real)}"
 
 
+def test_long_commands_expose_the_shared_progress_switch():
+    # These are the commands that can draw a live bar or spinner. A command
+    # that renders one but cannot turn it off is a scripting trap.
+    _commands()
+    for name in ("scan", "analyze", "describe", "embed", "classify",
+                 "refine", "search", "similar", "duplicates", "people",
+                 "check", "bootstrap"):
+        flags = {option for action in cli._SUBPARSERS[name]._actions
+                 for option in action.option_strings}
+        assert "--no-progress" in flags, name
+
+
 def test_every_flag_explains_itself():
     # A flag whose help is empty renders as "--limit LIMIT (default: 40)",
     # which tells you nothing about what the flag does.

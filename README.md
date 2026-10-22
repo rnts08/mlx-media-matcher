@@ -139,13 +139,24 @@ same-looking people group together. It is honest about its limits: CLIP groups
 needs a face-embedding model). `people --label N=Name` names a cluster and
 `search --cluster Name` lists it.
 
-**Watching a scan run.** On a terminal, `scan`, `analyze` and `describe` draw a
-live two-line status instead of periodic "preparing [n/total]" lines:
+**Watching a long stage run.** On a terminal, `scan`, `analyze`, `describe`,
+`embed`, `classify`, `check` and the inventory/check folded into `bootstrap`
+draw a live progress display — a two-line bar where there is a per-item count,
+or a spinner for an all-pairs walk — instead of periodic "preparing [n/total]"
+lines:
 
 ```
-indexing     14,208/20,000  [█████████████░░░░░░░░]  71%  186/s  eta 0:50
-now  Photos/IMG_4471.jpg, Photos/IMG_4472.jpg   ring 1.0GB/1.0GB  cpu 38.2s  gpu 11.4s (30%)  read 1.2GB
+⠹ indexing     14,208/20,000  [█████████████░░░░░░░░]  71%  186/s↗  eta 0:50
+now  Photos/IMG_4471.jpg, Photos/IMG_4472.jpg   ring 1.0GB/1.0GB  elapsed 1m16s  cpu 38.2s  gpu 11.4s (30%)  read 1.2GB
 ```
+
+The rate and ETA are **not** a lifetime average. They are extrapolated from the
+last 60 seconds of completed items, like the "about 40 seconds remaining" in
+an OS copy dialog: a stage that starts fast and then hits a folder of huge
+videos slows down instead of keeping the original promise. The arrow beside
+the rate shows whether it is speeding up (`↗`) or slowing down (`↘`). The
+spinner changes while work is moving; when the stage stops, it becomes `✓` (or
+`!` when files failed) and the ETA is removed.
 
 The counters are there to tell you whether to wait or interrupt:
 
@@ -163,14 +174,26 @@ frames the CPU has decoded ahead of the caption model. A **full** window means
 the GPU is the bottleneck and `--describe-workers` will not help; an **empty**
 one means the captioner is waiting on decodes and it will.
 
-`--no-progress` turns it off (implied when stderr is not a terminal, so piped
-output and CI keep one-event-per-line logs). `MEDIA_MATCH_NO_PROGRESS=1` does
-the same from the environment. With the bar off, progress lines still appear
-at 5% steps and at least every 10 seconds — naming the file being read or
-decoded, or `embedding` while a GPU batch is in flight — so one slow video
-cannot make a large scan look hung. Model weights load before the bar starts,
-with `loading <model> ...` and `model ready in ...` around the first-run
-download instead of surfacing in the middle of the scan.
+**Models are front-loaded.** Every stage loads the weights it needs before its
+bar starts, with `loading <model> ...` and `model ready in ...` around the
+first-run download. `scan` and `analyze` load CLIP before indexing; `analyze`
+then releases CLIP while the caption model runs, and reloads it before the
+embedding/classify bars. `scan`, `analyze`, `describe`, `search`,
+`similar --image`, `embed` and `classify` reuse the model recorded in the index
+(override with `--clip-model` / `--model`) instead
+of silently loading a different vector space. `embed` refuses to add vectors
+from a different model unless `--recompute` replaces the old ones, so a search
+can never compare two unrelated embedding spaces. The same load can be animated
+without fighting a full bar. Grouping steps (`similar`, `duplicates`, `people`)
+use a spinner rather than a percentage, because they run as one all-pairs
+operation with no natural per-item count.
+
+`--no-progress` turns the display off (implied when stderr is not a terminal,
+so piped output and CI keep one-event-per-line logs). `MEDIA_MATCH_NO_PROGRESS=1`
+does the same from the environment. With the bar off, progress lines still
+appear at 5% steps and at least every 10 seconds — naming the file being read
+or decoded, or `embedding` while a GPU batch is in flight — so one slow video
+cannot make a large scan look hung.
 
 ## Configuration
 
@@ -435,7 +458,7 @@ first pass over a folder: inventory it, index it, confirm it loads
 |---|---|---|
 | `bootstrap [root]` | first pass: walk the tree, record filename/type/size in the index, then run the same loadability check as `check` and offer to repair truncated or quarantine corrupt files. Dry-run by default: asks before touching files; `--prune` trashes exact duplicates (keeps newest), `--media-only` prunes non-media files and consolidates extensions, `--move-to DIR` moves the non-media files out instead of trashing them, `--fix-extensions` adds missing extensions | `--prune`, `--media-only`, `--move-to`, `--fix-extensions`, `--no-check`, `--quarantine`, `--video`, `--yes`, `--no-progress` |
 | `scan [root]` | walk the tree and index every new/changed media file: size, dimensions, capture date, pHash (for exact duplicates) and a CLIP embedding. pHash is only computed for new files or files changed since bootstrap; unchanged files are skipped. `--quick` writes basic rows (path/size/mtime) with stable ids without reading contents. The `--describe`/`--refine`/`--classify` switches are legacy 0.4.x stage shortcuts; prefer `analyze` or the standalone stage commands | `--video`, `--describe`, `--refine`, `--classify`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--quick`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--batch`, `--no-progress` |
-| `check [root]` | name every file that is not clean and say why: truncated (re-encodable), corrupt (quarantinable), or notable (loads fine — a malformed MPO container, a very large image — reported, never touched) | `--video`, `--quarantine`, `--yes` |
+| `check [root]` | name every file that is not clean and say why: truncated (re-encodable), corrupt (quarantinable), or notable (loads fine — a malformed MPO container, a very large image — reported, never touched). A live bar shows files checked and the rolling 60-second ETA | `--video`, `--quarantine`, `--yes`, `--no-progress` |
 
 ### Go deeper
 
@@ -445,10 +468,10 @@ embeddings, captions, tags, types and people — what makes search work well
 |---|---|---|
 | `analyze [root]` | complete analysis pass: index new/changed media, then caption everything that has no caption, fill missing CLIP embeddings, type every untyped image, and refine captions/keywords into canonical tags/facets. All stages run by default; use `scan` for indexing alone. The GPU stays busy: CPU decoding overlaps GPU embedding batches, and CPU frame extraction overlaps GPU caption generation | `--video`, `--model`, `--clip-model`, `--workers`, `--io-workers`, `--describe-workers`, `--describe-batch`, `--interval`, `--max-frames`, `--start-id`/`--stop-id`, `--limit`, `--reanalyze`, `--prune`, `--batch`, `--no-progress` |
 | `describe [root]` | caption indexed media that has no caption yet (images directly, videos via a mid-clip still). Best version of each duplicate group only | `--model`, `--video`, `--describe-workers`, `--describe-batch`, `--start-id`/`--stop-id`, `--no-progress` |
-| `embed [root]` | fill in missing CLIP embeddings for indexed images; `--recompute` re-embeds all of them (e.g. after changing `--clip-model`). Videos are embedded by `scan --video` | `--recompute`, `--clip-model`, `--batch`, `--start-id`/`--stop-id` |
-| `classify [root]` | type every untyped indexed image (selfie/portrait/group/scene/city/animal/object/food/document/art/other) with zero-shot CLIP. Needs embeddings, not captions; `--recompute` reclassifies everything | `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
-| `refine [root]` | refine captions/keywords into canonical tags + facets. Requires descriptions: run `describe` first (or use `analyze`). `--classify` is the legacy way to type each image; prefer the standalone `classify` | `--classify`, `--clip-model`, `--recompute`, `--start-id`/`--stop-id` |
-| `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json` |
+| `embed [root]` | fill in missing CLIP embeddings for indexed images; `--recompute` re-embeds all of them (e.g. after changing `--clip-model`). Uses the model recorded in the index unless overridden. Videos are embedded by `scan --video`; CLIP loads before the bar | `--recompute`, `--clip-model`, `--batch`, `--start-id`/`--stop-id`, `--no-progress` |
+| `classify [root]` | type every untyped indexed image (selfie/portrait/group/scene/city/animal/object/food/document/art/other) with zero-shot CLIP. Needs embeddings, not captions; `--recompute` reclassifies everything; CLIP loads before the bar | `--clip-model`, `--recompute`, `--start-id`/`--stop-id`, `--no-progress` |
+| `refine [root]` | refine captions/keywords into canonical tags + facets. Requires descriptions: run `describe` first (or use `analyze`). `--classify` is the legacy way to type each image; prefer the standalone `classify` | `--classify`, `--clip-model`, `--recompute`, `--start-id`/`--stop-id`, `--no-progress` |
+| `people [root]` | cluster person photos by CLIP similarity (singletons kept); name a cluster with `--label N=Name` | `--threshold` (cosine, default 0.80), `--label`, `--min-size`, `--limit`, `--json`, `--no-progress` |
 
 ### Find things
 
@@ -456,10 +479,10 @@ search and browse what is indexed
 
 | Command | What it does | Key options |
 |---|---|---|
-| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--start-id`/`--stop-id`, `--json`, `--limit` |
+| `search [root] [query...]` | find media. CLIP by default when embeddings exist; `--video` restricts to videos. Text search uses the index's model unless `--clip-model` overrides it | `--person`, `--object`, `--fts`, `--clip`, `--video`, `--image-only`, `--type`, `--cluster`, `--since`, `--until`, `--camera`, `--clip-model`, `--start-id`/`--stop-id`, `--json`, `--limit`, `--no-progress` |
 | `tags [root]` | refined tag counts (`--facets` groups them; `--types` shows image types; `--raw` shows the pre-refinement keywords) | `--facets`, `--types`, `--raw`, `--json`, `--limit`, `--video` |
 | `similar [root]` | group the tree into semantic near-duplicate clusters | `--threshold` (cosine, default 0.85), `--video`, `--start-id`/`--stop-id`, `--json` |
-| `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos | `--limit`, `--video`, `--start-id`/`--stop-id` |
+| `similar [root] --image F` | nearest neighbors of one image (indexed, or any standalone file); with `--video`, ranks videos. A non-indexed target uses the index's CLIP model unless overridden | `--limit`, `--video`, `--start-id`/`--stop-id`, `--clip-model`, `--no-progress` |
 
 ### Quality and file management
 
@@ -467,7 +490,7 @@ duplicates, folder consolidation, cleaning them up, and undoing that
 
 | Command | What it does | Key options |
 |---|---|---|
-| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (distance-0 matches only; ignores `--threshold`), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer`, `--start-id`/`--stop-id` |
+| `duplicates [root]` | group exact/near duplicates via pHash + sha1; best resolution wins | `--threshold` (hamming 0–64, default 8), `--exact-phash` (distance-0 matches only; ignores `--threshold`), `--json`, `--video`, `--frame-threshold`, `--ratio`, `--prefer`, `--start-id`/`--stop-id`, `--no-progress` |
 | `folders [root]` | find folders with the same name regardless of case and merge their files into a chosen destination, deciding each same-name conflict (replace / rename / skip, with `all` variants and EXIF compare); or gather whole folders with `--collapse`. Filesystem-only: reads and writes no index | `--name` (foldername filter), `--list`, `--collapse`, `--replace` / `--rename`, `--yes`, `--dry-run`, `--json` |
 | `clean [root]` | review duplicate groups in a visual bar UI with the key legend pinned at the top (hjkl/arrows, space=keep file, a=keep group, A=keep all, v=Quick Look, p=Preview, x=trash file, enter=dedupe all, e=dedupe up to the bar's group then keep reviewing, q/esc=quit — asks y/N if files are still marked) and move rejected copies to the system Trash (never deleted outright; index updated); falls back to line prompts without a TTY | `--yes`, `--dry-run`, `--threshold`, `--video`, `--frame-threshold`, `--ratio`, `--start-id`/`--stop-id`, `--json` (with `--dry-run`) |
 | `restore [root]` | list what `clean` moved to the system Trash and move it back on confirmation (best-effort: the OS Trash may have renamed a colliding name) | `--batch`, `--limit`, `--dry-run`, `--yes` |

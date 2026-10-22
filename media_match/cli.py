@@ -15,8 +15,16 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from .console import (
+    add_progress_flag,
+    fmt_bytes,
+    fmt_seconds,
+    progress_enabled,
+    status,
+)
 from .db import Database, db_path_for, open_db
 from .groups import find_duplicate_groups, find_similarity_groups
+from .models import ModelCache, resolve_names
 from .pipeline import (
     ScanStats,
     build_jobs,
@@ -123,25 +131,13 @@ def _dur(seconds: float) -> str:
 
 
 def _fmt_bytes(n: float) -> str:
-    """Human-readable byte size: 512.0B / 3.4MB / 1.2GB."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if abs(n) < 1024.0:
-            return f"{n:.1f}{unit}"
-        n /= 1024.0
-    return f"{n:.1f}TB"
+    """Human-readable byte size (kept as a CLI alias for older callers)."""
+    return fmt_bytes(n)
 
 
 def _fmt_seconds(s: float) -> str:
-    """Human duration: 0s / 3.2s / 4m12s / 2h05m."""
-    if s <= 0:
-        return "0s"
-    if s < 60:
-        return f"{s:.1f}s"
-    m, sec = divmod(int(round(s)), 60)
-    if m < 60:
-        return f"{m}m{sec:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h{m:02d}m"
+    """Human duration (kept as a CLI alias for older callers)."""
+    return fmt_seconds(s)
 
 
 def _reclaimable(groups) -> tuple[int, int]:
@@ -255,42 +251,20 @@ HEARTBEAT_SECONDS = 10.0
 
 
 def _status(line: str) -> None:
-    """Write one status line, even to a stream that cannot encode the bar.
-
-    The fallback exists for terminals where the live bar's block characters do
-    not survive; writing the same characters there would raise and silence the
-    heartbeat too. A non-UTF-8 stderr gets an ASCII approximation instead.
-    """
-    try:
-        print(line, file=sys.stderr)
-        sys.stderr.flush()
-    except UnicodeEncodeError:
-        try:
-            sys.stderr.write(line.encode("ascii", "replace").decode("ascii") + "\n")
-            sys.stderr.flush()
-        except (OSError, ValueError):  # pragma: no cover - closed stderr
-            pass
-    except (OSError, ValueError):  # pragma: no cover - closed stderr
-        pass
+    """Write one status line (kept as a CLI alias for tests and callers)."""
+    status(line)
 
 
-def _load_model(model_holder, what: str = "CLIP model") -> None:
+def _load_model(model_holder, what: str = "CLIP model", *,
+                enabled: bool | None = None) -> None:
     """Load model weights before a progress bar starts, and say so.
 
-    Loading is lazy, which used to put the first-run download inside the first
-    GPU batch: its Hugging Face bars then appeared in the middle of the scan,
-    could overwrite the scan bar, and the weight load looked like a hang. One
-    explicit step before the pipeline gives that pause a name and keeps the
-    bar the only thing redrawing.
+    Kept as a thin CLI alias so command code and tests share one entry point
+    while the terminal animation lives in :mod:`media_match.console`.
     """
-    ensure = getattr(model_holder, "ensure_loaded", None)
-    if not callable(ensure):
-        return  # a stand-in in tests has nothing to load
-    model = getattr(model_holder, "model_id", what)
-    _status(f"loading {model} (first run downloads it) ...")
-    started = time.perf_counter()
-    ensure()
-    _status(f"  model ready in {time.perf_counter() - started:.1f}s")
+    from .console import load_model
+
+    load_model(model_holder, what, enabled=enabled)
 
 
 def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
@@ -311,7 +285,9 @@ def _run_scan_with_progress(jobs, encoder, args, root, *, interval, max_frames,
 
     total_jobs = len(jobs)
     if jobs:
-        _load_model(encoder)  # announced, and before the bar claims stderr
+        # Announced, and before the bar claims stderr. Honour --no-progress
+        # here too: the model spinner is part of the live display.
+        _load_model(encoder, enabled=_progress_enabled(args))
 
     bar = ProgressBar(label, root, total_jobs,
                       enabled=_progress_enabled(args)).start()
@@ -369,22 +345,15 @@ def _progress_enabled(args) -> bool:
     """Progress bar unless --no-progress, or stderr is not a terminal.
 
     stderr is the test, not stdout: the bar is drawn there alongside the other
-    progress lines, while stdout keeps carrying only command output.
+    progress lines, while stdout keeps carrying only command output. Kept as a
+    CLI alias because tests patch this function by name.
     """
-    if getattr(args, "no_progress", False):
-        return False
-    if os.environ.get("MEDIA_MATCH_NO_PROGRESS"):
-        return False
-    try:
-        return bool(sys.stderr.isatty())
-    except (AttributeError, ValueError):  # pragma: no cover - detached stderr
-        return False
+    return progress_enabled(args)
 
 
 def _add_progress_flag(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--no-progress", action="store_true",
-                   help="no live progress bar (implied when stderr is not a "
-                        "terminal)")
+    """Attach the shared ``--no-progress`` flag to a command parser."""
+    add_progress_flag(p)
 
 
 def _quick_index(args: argparse.Namespace, root: str, ignore: list[str]) -> int:
@@ -405,7 +374,16 @@ def _quick_index(args: argparse.Namespace, root: str, ignore: list[str]) -> int:
         else:
             print("no stale index rows to remove")
 
-    media = iter_media(root, args.video, ignore=ignore)
+    from .progress import Spinner
+
+    spinner = Spinner("inventorying files",
+                      enabled=_progress_enabled(args)).start()
+    media = []
+    try:
+        media = iter_media(root, args.video, ignore=ignore)
+    finally:
+        spinner.stop(f"✓ found {len(media)} media file(s)")
+
     image_rows: list[tuple[str, int, float]] = []
     video_rows: list[tuple[str, int, float]] = []
     for kind, path in media:
@@ -461,16 +439,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     _register_heif()
 
-    # An explicit flag wins, then the config file, then the built-in default.
-    clip_model = args.clip_model or cfg.get("clip_model") or DEFAULT_CLIP_MODEL
-    model = args.model or cfg.get("model") or DEFAULT_MODEL
+    db = Database(db_path_for(root, args.db))
+
+    # An explicit flag wins, then the config file, then the model recorded in
+    # the index (so a re-scan does not silently switch embedding spaces), then
+    # the built-in default.
+    names = resolve_names(args, cfg, db)
+    clip_model, model = names.clip, names.caption
     workers = args.workers if args.workers is not None else (cfg.get("workers") or 4)
     batch = args.batch if args.batch is not None else (cfg.get("batch") or 16)
     interval = args.interval if args.interval is not None else (cfg.get("interval") or 1.0)
     max_frames = (args.max_frames if args.max_frames is not None
                   else (cfg.get("max_frames") or 120))
 
-    db = Database(db_path_for(root, args.db))
     db.set_meta("root", root)
     db.set_meta("clip_model", clip_model)
     if args.describe:
@@ -506,9 +487,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(f"{total} media found, {up_to_date} up to date, "
               f"{len(jobs)} to analyze")
 
-    from .clip import ClipEncoder
-
-    encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
+    cache = ModelCache(names, batch_size=batch)
+    # Keep the cache on the namespace so _describe_all can reuse the same
+    # caption model instead of constructing a second one behind the bar.
+    args._model_cache = cache
+    encoder = cache.clip()
     errors = 0
 
     def on_error(path: str, exc: Exception) -> None:
@@ -546,9 +529,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # Optional VLM captions first: the caption model needs the GPU and memory
     # to itself, and refinement below builds tags from the captions this pass
-    # just created. Best version of each duplicate group only.
+    # just created. Best version of each duplicate group only. CLIP is
+    # released here and reloaded before any later stage's bar, so two large
+    # models never compete for memory while one is generating.
     if args.describe:
-        encoder.unload()
+        cache.unload_clip()
         described = _describe_all(db, root, model, args, on_error)
         if described:
             print(f"described {described} item(s)")
@@ -568,18 +553,31 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 print(f"refined {refined} item(s)")
 
     if args.classify:
-        if args.describe:
-            # CLIP was released for the caption pass; reload it for typing.
-            encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
-            _load_model(encoder, "CLIP model")
-        classified = _classify_with(
-            db, encoder, recompute=False,
-            start_id=args.start_id, stop_id=args.stop_id,
-        )
+        # Front-load CLIP before the typing stage, not inside it.
+        from .progress import ProgressBar
+
+        encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+        bar = ProgressBar("classifying", root, 0,
+                          enabled=_progress_enabled(args)).start()
+
+        def classify_progress(done: int, count: int) -> None:
+            bar.set_total(count)
+            bar.set_done(done)
+            if not bar.enabled and (done == count or done == 0):
+                _status(f"  classifying {done}/{count}")
+
+        try:
+            classified = _classify_with(
+                db, encoder, recompute=False,
+                start_id=args.start_id, stop_id=args.stop_id,
+                progress=classify_progress,
+            )
+        finally:
+            bar.stop()
         if classified:
             print(f"classified {classified} image(s)")
 
-    encoder.unload()
+    cache.unload()
 
     described_count = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
@@ -617,10 +615,15 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
     counts = " + ".join(f"{n} {kind}(s)" for kind, n in plan.pending.items() if n)
     print(f"describing {len(plan.jobs)} item(s): {counts}")
 
-    from .vision import Describer
+    cache = getattr(args, "_model_cache", None)
+    if cache is not None:
+        describer = cache.prepare_caption(enabled=_progress_enabled(args))
+    else:
+        from .vision import Describer
 
-    describer = Describer(model_id=model)
-    _load_model(describer, "caption model")
+        describer = Describer(model_id=model)
+        _load_model(describer, "caption model",
+                    enabled=_progress_enabled(args))
     total = len(plan.jobs)
     done = 0
 
@@ -651,7 +654,10 @@ def _describe_all(db: Database, root: str, model: str, args, on_error) -> int:
     finally:
         # An exception mid-describe must not leave the cursor mid-line.
         bar.stop()
-        describer.unload()
+        if cache is not None:
+            cache.unload_caption()
+        else:
+            describer.unload()
     return described
 
 
@@ -662,13 +668,16 @@ def cmd_describe(args: argparse.Namespace) -> int:
 
     cfg = load_config()
     root = os.path.abspath(args.root)
-    model = args.model or cfg.get("model") or DEFAULT_MODEL
 
     db = open_db(root, args.db, create=False)
     if db is None:
         print(f"No index at {db_path_for(root, args.db)} — "
               f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
+
+    names = resolve_names(args, cfg, db)
+    model = names.caption
+    args._model_cache = ModelCache(names)
 
     errors = 0
 
@@ -806,13 +815,19 @@ def cmd_search(args: argparse.Namespace) -> int:
             use_clip = bool(blobs) or bool(db.video_embeddings())
 
     if use_clip:
+        from .config import load_config
+
+        names = resolve_names(args, load_config(), db)
+        cache = ModelCache(names)
+        encoder = cache.prepare_clip(enabled=_progress_enabled(args))
         allowed_images = db.file_ids_matching(img_filter, img_params) if img_filter else None
         allowed_videos = db.video_ids_matching(vid_filter, vid_params) if vid_filter else None
         hits = _clip_search(db, " ".join(terms), args.limit,
                             include_images=include_images,
                             include_videos=include_videos,
                             allowed_images=allowed_images,
-                            allowed_videos=allowed_videos)
+                            allowed_videos=allowed_videos,
+                            encoder=encoder)
         if hits is None:
             db.close()
             return 1
@@ -903,11 +918,15 @@ def _load_embedding_matrix(db: Database, start_id: int | None = None,
 def _clip_search(db: Database, query_text: str, limit: int, *,
                  include_images: bool = True, include_videos: bool = True,
                  allowed_images: set[int] | None = None,
-                 allowed_videos: set[int] | None = None) -> list[dict] | None:
-    """Rank media by CLIP similarity; None means 'no embeddings' (error shown)."""
-    import numpy as np
+                 allowed_videos: set[int] | None = None,
+                 encoder=None) -> list[dict] | None:
+    """Rank media by CLIP similarity; None means 'no embeddings' (error shown).
 
-    from .clip import ClipEncoder
+    ``encoder`` is preloaded by the command so the model step happens before
+    any progress display. Callers without one still get a working (lazy)
+    encoder for compatibility with direct/private use.
+    """
+    import numpy as np
 
     if not query_text.strip():
         print("Give a search query (CLIP search needs some text).")
@@ -923,7 +942,11 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
               file=sys.stderr)
         return None
 
-    query = ClipEncoder().embed_texts([query_text])[0]
+    if encoder is None:
+        from .clip import ClipEncoder
+
+        encoder = ClipEncoder()
+    query = encoder.embed_texts([query_text])[0]
 
     hits: list[dict] = []
     if include_images and matrix is not None:
@@ -1042,22 +1065,44 @@ def cmd_embed(args: argparse.Namespace) -> int:
     from PIL import Image  # noqa: F401  (HEIC support via registration below)
 
     _register_heif()
-    from .clip import ClipEncoder
+    from .config import load_config
+    from .progress import ProgressBar
 
-    encoder = ClipEncoder(model_id=args.clip_model, batch_size=args.batch)
-    _load_model(encoder, "CLIP model")
-    db.set_meta("clip_model", args.clip_model)
-    print(f"embedding {len(rows)} image(s) with {args.clip_model} ...")
+    names = resolve_names(args, load_config(), db)
+    indexed_model = (db.get_meta("clip_model", "") or "").strip()
+    existing_embeddings = db.conn.execute(
+        "SELECT COUNT(*) AS n FROM files WHERE embedding IS NOT NULL"
+    ).fetchone()["n"]
+    if (indexed_model and names.clip != indexed_model
+            and existing_embeddings and not args.recompute):
+        print(
+            f"The index already has embeddings from {indexed_model}; adding "
+            f"{names.clip} would mix vector spaces. Re-run with --recompute "
+            f"to replace them all.",
+            file=sys.stderr,
+        )
+        db.close()
+        return 2
+    db.set_meta("clip_model", names.clip)
+    cache = ModelCache(names, batch_size=args.batch)
+    encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+    print(f"embedding {len(rows)} image(s) with {names.clip} ...")
 
     t0 = time.perf_counter()
-    show_progress = _progress_enabled(args)
+    bar = ProgressBar("embedding", root, len(rows),
+                      enabled=_progress_enabled(args)).start()
+    last_report = 0
 
     def report(path: str, exc: Exception) -> None:
         print(f"  ERROR {path}: {exc}")
 
     def progress(done: int, total: int) -> None:
-        if show_progress:
-            print(f"  {done}/{total}", end="\r", flush=True)
+        nonlocal last_report
+        if bar.enabled:
+            bar.set_done(done)
+        elif done == total or done - last_report >= max(1, total // 20):
+            _status(f"  embedding {done}/{total}")
+            last_report = done
 
     try:
         done, errors = _embed_indexed(
@@ -1065,9 +1110,8 @@ def cmd_embed(args: argparse.Namespace) -> int:
             report=report, progress=progress,
         )
     finally:
-        encoder.unload()
-    if show_progress:
-        print()
+        bar.stop()
+        cache.unload()
 
     elapsed = time.perf_counter() - t0
     rate = done / elapsed if elapsed > 0 else 0
@@ -1101,8 +1145,6 @@ def cmd_similar(args: argparse.Namespace) -> int:
     id_to_record = {r.id: r for r in db.all_files(args.start_id, args.stop_id)}
 
     if args.image:
-        from .clip import ClipEncoder
-
         target = os.path.abspath(args.image)
         stored = db.embedding_for_path(target)
         if stored is not None:
@@ -1110,7 +1152,14 @@ def cmd_similar(args: argparse.Namespace) -> int:
             source = "indexed embedding"
         else:
             _register_heif()
-            query = ClipEncoder().embed_image_paths([target])[0]
+            from .config import load_config
+
+            cache = ModelCache(resolve_names(args, load_config(), db))
+            encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+            try:
+                query = encoder.embed_image_paths([target])[0]
+            finally:
+                cache.unload()
             source = "computed on the fly"
         sims = matrix @ query
 
@@ -1135,7 +1184,16 @@ def cmd_similar(args: argparse.Namespace) -> int:
         return 0
 
     records = [id_to_record[i] for i in ids]
-    groups = find_similarity_groups(records, matrix, threshold=args.threshold)
+    from .progress import Spinner
+
+    spinner = Spinner("grouping similar images",
+                      enabled=_progress_enabled(args)).start()
+    groups = []
+    try:
+        groups = find_similarity_groups(records, matrix,
+                                        threshold=args.threshold)
+    finally:
+        spinner.stop(f"✓ grouped {len(groups)} similar group(s)")
     if not groups:
         print(f"No semantic duplicate groups at cosine threshold {args.threshold}.")
         db.close()
@@ -1169,8 +1227,6 @@ def cmd_similar(args: argparse.Namespace) -> int:
 def _similar_videos(db: Database, args) -> int:
     import numpy as np
 
-    from .clip import ClipEncoder
-
     embeddings = db.video_embeddings(args.start_id, args.stop_id)
     if not embeddings:
         if args.start_id is not None or args.stop_id is not None:
@@ -1186,7 +1242,14 @@ def _similar_videos(db: Database, args) -> int:
 
     if args.image:
         target = os.path.abspath(args.image)
-        query = ClipEncoder().embed_image_paths([target])[0]
+        from .config import load_config
+
+        cache = ModelCache(resolve_names(args, load_config(), db))
+        encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+        try:
+            query = encoder.embed_image_paths([target])[0]
+        finally:
+            cache.unload()
         hits = []
         for vid, frames in embeddings.items():
             frame_map = {t: np.frombuffer(b, dtype=np.float32) for t, b in frames}
@@ -1254,16 +1317,24 @@ def cmd_duplicates(args: argparse.Namespace) -> int:
                  else (cfg.get("threshold") or 8))
     prefer = args.prefer or cfg.get("prefer") or "resolution"
 
-    if args.video:
-        groups = find_video_duplicate_groups(
-            db.all_videos_with_frames(args.start_id, args.stop_id),
-            frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
-        )
-    else:
-        groups = find_duplicate_groups(
-            db.all_files(args.start_id, args.stop_id), threshold=threshold,
-            prefer=prefer, exact_phash=args.exact_phash,
-        )
+    from .progress import Spinner
+
+    spinner = Spinner("grouping duplicates",
+                      enabled=_progress_enabled(args)).start()
+    groups = []
+    try:
+        if args.video:
+            groups = find_video_duplicate_groups(
+                db.all_videos_with_frames(args.start_id, args.stop_id),
+                frame_threshold=args.frame_threshold, merge_ratio=args.ratio,
+            )
+        else:
+            groups = find_duplicate_groups(
+                db.all_files(args.start_id, args.stop_id), threshold=threshold,
+                prefer=prefer, exact_phash=args.exact_phash,
+            )
+    finally:
+        spinner.stop(f"✓ grouped {len(groups)} duplicate group(s)")
     if not groups:
         print("No duplicate groups found in that id window."
               if args.start_id is not None or args.stop_id is not None
@@ -2233,8 +2304,20 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         if not rel.startswith(os.pardir):
             ignore = list(ignore) + [rel]
 
-    # Walk the whole tree (not just media) so --media-only can see the rest.
-    rows = walk_tree(root, include_video=args.video, ignore=ignore)
+    def inventory():
+        """Walk the whole tree (not just media) so --media-only sees the rest."""
+        from .progress import Spinner
+
+        spinner = Spinner("inventorying files",
+                          enabled=_progress_enabled(args)).start()
+        found = []
+        try:
+            found = walk_tree(root, include_video=args.video, ignore=ignore)
+        finally:
+            spinner.stop(f"✓ found {len(found)} file(s)")
+        return found
+
+    rows = inventory()
     db = Database(db_path_for(root, args.db))
     db.replace_bootstrap(rows)
 
@@ -2282,7 +2365,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
 
     if pruned:
         # Keep the bootstrap table free of files that were just trashed.
-        rows = walk_tree(root, include_video=args.video, ignore=ignore)
+        rows = inventory()
         db.replace_bootstrap(rows)
 
     # --media-only: fix extensions first, then consolidate, then prune non-media.
@@ -2366,14 +2449,19 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
                 print(f"pruned {len(trashed)} non-media file(s)")
             print(f"renamed {renamed} file(s)")
             # refresh the index so paths match the new filenames
-            rows = walk_tree(root, include_video=args.video, ignore=ignore)
+            rows = inventory()
             db.replace_bootstrap(rows)
             print("index refreshed")
 
     if not getattr(args, "no_check", False):
+        # Match _check_tree: if ffmpeg/ffprobe are unavailable, videos are
+        # skipped, so do not count them in the bar's denominator.
+        check_video = args.video and bool(
+            shutil.which("ffmpeg") and shutil.which("ffprobe")
+        )
         check_total = sum(
             1 for r in rows
-            if r[4] == "image" or (args.video and r[4] == "video")
+            if r[4] == "image" or (check_video and r[4] == "video")
         )
         changed = _bootstrap_loadability(
             root, include_video=args.video, ignore=ignore,
@@ -2385,7 +2473,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         if changed:
             # The check re-encoded or quarantined files; keep the bootstrap
             # table matching what is actually on disk.
-            rows = walk_tree(root, include_video=args.video, ignore=ignore)
+            rows = inventory()
             db.replace_bootstrap(rows)
 
     db.close()
@@ -2510,10 +2598,32 @@ def cmd_check(args: argparse.Namespace) -> int:
     if not _require_root(root):
         return 2
     ignore = load_ignore(root)
-    code, _changed = _check_tree(
-        root, include_video=args.video, ignore=ignore,
-        quarantine_dir=args.quarantine, yes=args.yes,
+    from .pipeline import iter_media
+    from .progress import ProgressBar
+
+    # _check_tree turns video checking off when ffmpeg/ffprobe are missing;
+    # count the same way so the bar cannot stop short of its denominator.
+    check_video = args.video and bool(
+        shutil.which("ffmpeg") and shutil.which("ffprobe")
     )
+    total = len(iter_media(root, check_video, ignore=ignore))
+    bar = ProgressBar("checking", root, total,
+                      enabled=_progress_enabled(args)).start()
+
+    def progress(done: int, _path: str) -> None:
+        bar.set_done(done)
+        if not bar.enabled and (done == total or done % 250 == 0):
+            _status(f"  checking {done}/{total}")
+
+    try:
+        code, _changed = _check_tree(
+            root, include_video=args.video, ignore=ignore,
+            quarantine_dir=args.quarantine, yes=args.yes,
+            announce=not bar.enabled,
+            progress=progress, stop_progress=bar.stop,
+        )
+    finally:
+        bar.stop()
     return code
 
 
@@ -2537,11 +2647,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     if not _require_root(root):
         return 2
 
-    # An explicit flag wins, then the config file, then the built-in default.
-    # Resolved once here and passed down — the raw flag can be None and must
-    # never reach the model loaders directly.
-    clip_model = args.clip_model or cfg.get("clip_model") or DEFAULT_CLIP_MODEL
-    model = args.model or cfg.get("model") or DEFAULT_MODEL
+    db = Database(db_path_for(root, args.db))
+
+    # An explicit flag wins, then the config file, then the model recorded in
+    # the index (so re-running analyze does not silently switch embedding or
+    # caption spaces), then the built-in default. Resolved once here and
+    # passed down — the raw flag can be None and must never reach the model
+    # loaders directly.
+    names = resolve_names(args, cfg, db)
+    clip_model, model = names.clip, names.caption
     workers = args.workers if args.workers is not None else (cfg.get("workers") or 4)
     batch = args.batch if args.batch is not None else (cfg.get("batch") or 16)
     interval = args.interval if args.interval is not None else (cfg.get("interval") or 1.0)
@@ -2550,7 +2664,6 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     describe_workers = (args.describe_workers if args.describe_workers is not None
                         else max(2, min(workers, 4)))
 
-    db = Database(db_path_for(root, args.db))
     db.set_meta("root", root)
     db.set_meta("clip_model", clip_model)
     db.set_meta("vlm_model", model)
@@ -2584,10 +2697,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"{total} media found, {up_to_date} up to date, "
               f"{len(jobs)} to analyze")
 
-    from .clip import ClipEncoder
-
-    encoder: ClipEncoder | None = ClipEncoder(model_id=clip_model,
-                                              batch_size=batch)
+    cache = ModelCache(names, batch_size=batch)
+    args._model_cache = cache
+    encoder = cache.clip()
     errors = 0
 
     def on_error(path: str, exc: Exception) -> None:
@@ -2626,8 +2738,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     # -- pass 2: VLM captions (GPU), with CPU frame prefetch -----------------
     # Give the caption model the GPU and memory to itself; CLIP is reloaded
-    # below only if missing embeddings or image types still need it.
-    encoder.unload()
+    # below only if missing embeddings or image types still need it. The
+    # caption weights are loaded by _describe_all before its bar starts.
+    cache.unload_clip()
     encoder = None
     described = _describe_all(db, root, model, args, on_error)
     if described:
@@ -2638,10 +2751,14 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     missing = db.files_missing_embedding(args.start_id, args.stop_id)
     embedded = 0
     if missing:
-        encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
-        _load_model(encoder, "CLIP model")
+        # Preload CLIP before the bar owns the terminal, then reuse it for any
+        # typing pass below.
+        encoder = cache.prepare_clip(enabled=_progress_enabled(args))
         print(f"embedding {len(missing)} image(s) without CLIP embeddings ...")
-        show_progress = _progress_enabled(args)
+        from .progress import ProgressBar
+
+        bar = ProgressBar("embedding", root, len(missing),
+                          enabled=_progress_enabled(args)).start()
         last_report = 0
 
         def report_embed(path: str, exc: Exception) -> None:
@@ -2649,8 +2766,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
         def embed_progress(done: int, count: int) -> None:
             nonlocal last_report
-            if show_progress:
-                print(f"  {done}/{count}", end="\r", flush=True)
+            if bar.enabled:
+                bar.set_done(done)
             elif done == count or done - last_report >= max(1, count // 20):
                 print(f"  embedding {done}/{count}", file=sys.stderr)
                 last_report = done
@@ -2661,8 +2778,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 report=report_embed, progress=embed_progress,
             )
         finally:
-            if show_progress:
-                print()
+            bar.stop()
         errors += embed_errors
         _summarize_bad_files(root)
         if embedded:
@@ -2673,16 +2789,21 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     needing_type = db.files_needing_type(args.start_id, args.stop_id)
     if needing_type:
         if encoder is None:
-            encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
-            _load_model(encoder, "CLIP model")
-        classified = _classify_with(
-            db, encoder, recompute=False,
-            start_id=args.start_id, stop_id=args.stop_id,
-        )
+            encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+        from .progress import Spinner
+
+        spinner = Spinner("classifying images",
+                          enabled=_progress_enabled(args)).start()
+        try:
+            classified = _classify_with(
+                db, encoder, recompute=False,
+                start_id=args.start_id, stop_id=args.stop_id,
+            )
+        finally:
+            spinner.stop(f"✓ classified {classified} image(s)")
         if classified:
             print(f"classified {classified} image(s)")
-    if encoder is not None:
-        encoder.unload()
+    cache.unload()
 
     # -- pass 5: refine captions/keywords into canonical tags ----------------
     refined = 0
@@ -2765,8 +2886,13 @@ def _refine_all(db: Database, *, quiet: bool = False,
 
 def _classify_with(db: Database, encoder, *, recompute: bool = False,
                    start_id: int | None = None,
-                   stop_id: int | None = None) -> int:
-    """Type every untyped image (or all images) using an already-loaded encoder."""
+                   stop_id: int | None = None,
+                   progress=None) -> int:
+    """Type every untyped image (or all images) using an already-loaded encoder.
+
+    ``progress(done, total)`` is called before the first chunk (0, total) and
+    after each chunk, so a caller can run the standard bar with a rolling ETA.
+    """
     import numpy as np
 
     from .db import _id_clause
@@ -2793,7 +2919,15 @@ def _classify_with(db: Database, encoder, *, recompute: bool = False,
 
     classifier = TypeClassifier(encoder)
     matrix = np.stack([v for _i, v in targets])
-    results = classifier.classify(matrix)
+    if progress is not None:
+        progress(0, len(targets))
+    results: list[tuple[str, float]] = []
+    chunk = 256
+    for start in range(0, len(targets), chunk):
+        stop = min(start + chunk, len(targets))
+        results.extend(classifier.classify(matrix[start:stop]))
+        if progress is not None:
+            progress(stop, len(targets))
     db.set_types([
         (targets[k][0], name, score) for k, (name, score) in enumerate(results)
     ])
@@ -2801,18 +2935,32 @@ def _classify_with(db: Database, encoder, *, recompute: bool = False,
 
 
 def _classify_images(db: Database, args) -> None:
-    from .clip import ClipEncoder
+    from .config import load_config
+    from .progress import ProgressBar
 
-    encoder = ClipEncoder(model_id=args.clip_model)
-    _load_model(encoder, "CLIP model")
+    names = resolve_names(args, load_config(), db)
+    cache = ModelCache(names)
+    encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+    root = getattr(args, "root", "") or os.getcwd()
+    bar = ProgressBar("classifying", root, 0,
+                      enabled=_progress_enabled(args)).start()
+
+    def progress(done: int, total: int) -> None:
+        bar.set_total(total)
+        bar.set_done(done)
+        if not bar.enabled and (done == total or done == 0):
+            _status(f"  classifying {done}/{total}")
+
     try:
         classified = _classify_with(
             db, encoder, recompute=args.recompute,
             start_id=getattr(args, "start_id", None),
             stop_id=getattr(args, "stop_id", None),
+            progress=progress,
         )
     finally:
-        encoder.unload()
+        bar.stop()
+        cache.unload()
     if classified:
         print(f"classified {classified} image(s)")
     else:
@@ -2873,17 +3021,30 @@ def cmd_classify(args: argparse.Namespace) -> int:
             db.close()
             return 0
 
-    from .clip import ClipEncoder
+    from .config import load_config
+    from .progress import ProgressBar
 
-    encoder = ClipEncoder(model_id=args.clip_model)
-    _load_model(encoder, "CLIP model")
+    names = resolve_names(args, load_config(), db)
+    cache = ModelCache(names)
+    encoder = cache.prepare_clip(enabled=_progress_enabled(args))
+    bar = ProgressBar("classifying", root, 0,
+                      enabled=_progress_enabled(args)).start()
+
+    def progress(done: int, count: int) -> None:
+        bar.set_total(count)
+        bar.set_done(done)
+        if not bar.enabled and (done == count or done == 0):
+            _status(f"  classifying {done}/{count}")
+
     try:
         classified = _classify_with(
             db, encoder, recompute=args.recompute,
             start_id=args.start_id, stop_id=args.stop_id,
+            progress=progress,
         )
     finally:
-        encoder.unload()
+        bar.stop()
+        cache.unload()
 
     unembedded = total - embedded
     if unembedded:
@@ -2924,9 +3085,16 @@ def cmd_people(args: argparse.Namespace) -> int:
         return 0
 
     from .groups import cluster_by_similarity
+    from .progress import Spinner
 
     matrix = np.stack([vec_by_id[i] for i in selected])
-    labels = cluster_by_similarity(matrix, threshold=args.threshold)
+    spinner = Spinner(f"clustering {len(selected)} person photo(s)",
+                      enabled=_progress_enabled(args)).start()
+    labels = []
+    try:
+        labels = cluster_by_similarity(matrix, threshold=args.threshold)
+    finally:
+        spinner.stop(f"✓ clustered {len(selected)} photo(s)")
 
     components: dict[int, list[int]] = {}
     for fid, comp in zip(selected, labels):
@@ -3258,7 +3426,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.6"
+_VERSION = "0.4.7"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -3406,6 +3574,13 @@ def _print_full_help() -> None:
         "Run 'media-match <command> --help' or 'media-match help <command>' for",
         "the full flag list of one command, with defaults and an example.",
         "Run 'media-match help' again to re-read this guide.",
+        "",
+        "Models and progress:",
+        "  Each stage loads the model it needs before its progress bar starts,",
+        "  so a first-run download is a named step instead of a pause inside",
+        "  the bar. Long stages draw a live bar with a rolling 60-second rate",
+        "  and ETA (like a copy dialog). --no-progress turns it off; piped",
+        "  stderr and MEDIA_MATCH_NO_PROGRESS=1 do the same.",
     ]
     print("\n".join(lines))
 
@@ -3826,7 +4001,10 @@ def main(argv: list[str] | None = None) -> int:
             "videos, and --prune drops index rows for files that have since "
             "been moved or deleted. --quick only stats files and writes basic "
             "rows (path/size/mtime) with stable ids — no reading, no GPU; "
-            "analyze the rows afterwards with --start-id/--stop-id windows."
+            "analyze the rows afterwards with --start-id/--stop-id windows. "
+            "The CLIP model is loaded before the indexing bar starts, and any "
+            "caption/classify model before its own bar. --no-progress keeps "
+            "one-event-per-line logs."
         ),
     )
     _add_common(p_scan)
@@ -3843,10 +4021,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="also index video files (keyframes each)")
     p_scan.add_argument("--model", default=None,
                         help="MLX vision model for --describe "
-                             f"(default: {DEFAULT_MODEL}, or config 'model')")
+                             f"(default: index 'vlm_model', config 'model', or {DEFAULT_MODEL})")
     p_scan.add_argument("--clip-model", default=None,
-                        help="CLIP model for embeddings "
-                             f"(default: {DEFAULT_CLIP_MODEL}, or config 'clip_model')")
+                        help="CLIP model for embeddings (default: index "
+                             f"'clip_model', config 'clip_model', or {DEFAULT_CLIP_MODEL})")
     p_scan.add_argument("--batch", type=int, default=None,
                         help="CLIP batch size (default: 16, or config 'batch')")
     p_scan.add_argument("--workers", type=int, default=None,
@@ -3894,7 +4072,12 @@ def main(argv: list[str] | None = None) -> int:
             "keeps the GPU busy by overlapping CPU decoding with GPU embedding "
             "batches, and the describe stage overlaps CPU frame extraction with "
             "GPU caption generation. With --start-id/--stop-id every stage is "
-            "limited to that id window."
+            "limited to that id window. Each stage loads its model before the "
+            "stage's progress bar; CLIP is released while the caption model "
+            "runs, then reloaded before the embedding/classify bars. The live "
+            "bar estimates the remaining time from the last 60 seconds of "
+            "completed work, so a slow folder changes the estimate instead of "
+            "leaving a stale one."
         ),
     )
     _add_common(p_analyze)
@@ -3907,11 +4090,11 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze.add_argument("--video", action="store_true",
                            help="also analyze video files (keyframes each)")
     p_analyze.add_argument("--model", default=None,
-                           help="MLX vision model for captions "
-                                f"(default: {DEFAULT_MODEL}, or config 'model')")
+                           help="MLX vision model for captions (default: index "
+                                f"'vlm_model', config 'model', or {DEFAULT_MODEL})")
     p_analyze.add_argument("--clip-model", default=None,
-                           help="CLIP model for embeddings "
-                                f"(default: {DEFAULT_CLIP_MODEL}, or config 'clip_model')")
+                           help="CLIP model for embeddings (default: index "
+                                f"'clip_model', config 'clip_model', or {DEFAULT_CLIP_MODEL})")
     p_analyze.add_argument("--batch", type=int, default=None,
                            help="CLIP batch size (default: 16, or config 'batch')")
     p_analyze.add_argument("--workers", type=int, default=None,
@@ -3956,6 +4139,7 @@ def main(argv: list[str] | None = None) -> int:
             "before captioning; the best version of each duplicate group is "
             "described, its copies inherit the match. Frames are prefetched on "
             "CPU workers so VLM generation (GPU) never waits on a decode. "
+            "The caption model is loaded before the progress bar starts. "
             "Use after 'scan' (or again later; it only touches items without "
             "a description)."
         ),
@@ -3963,8 +4147,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_common(p_describe)
     _add_id_range(p_describe)
     p_describe.add_argument("--model", default=None,
-                            help="MLX vision model "
-                                 f"(default: {DEFAULT_MODEL}, or config 'model')")
+                            help="MLX vision model (default: index "
+                                 f"'vlm_model', config 'model', or {DEFAULT_MODEL})")
     p_describe.add_argument("--video", action="store_true",
                             help="include videos (needs ffmpeg)")
     p_describe.add_argument("--describe-workers", type=int, default=None,
@@ -3984,7 +4168,9 @@ def main(argv: list[str] | None = None) -> int:
             "date/camera filter without words lists matching media. Narrow the "
             "result set with --since/--until/--camera, --person/--object, "
             "--type, --cluster, --image-only or --video. Add --json for "
-            "machine-readable output."
+            "machine-readable output. CLIP text search uses the model recorded "
+            "in the index (override with --clip-model) and loads it before "
+            "querying."
         ),
     )
     _add_common(p_search)
@@ -4018,6 +4204,10 @@ def main(argv: list[str] | None = None) -> int:
                           help="machine-readable output")
     p_search.add_argument("--limit", type=int, default=50,
                           help="max results to show")
+    p_search.add_argument("--clip-model", default=None,
+                          help="CLIP model for text queries "
+                               "(default: the model recorded in the index)")
+    _add_progress_flag(p_search)
     p_search.set_defaults(func=cmd_search)
 
     p_embed = sub.add_parser(
@@ -4027,17 +4217,22 @@ def main(argv: list[str] | None = None) -> int:
             "Fill in CLIP embeddings for indexed images that do not have one yet "
             "(the usual case after importing an index from elsewhere). With "
             "--recompute, every indexed image is embedded again, which is how "
-            "you switch to a different --clip-model. Videos are embedded during "
-            "'scan --video'; this command fills image rows only."
+            "you switch to a different --clip-model. The model recorded in the "
+            "index is used unless --clip-model overrides it. Videos are "
+            "embedded during 'scan --video'; this command fills image rows only. "
+            "CLIP is loaded before the bar starts, and the bar's ETA follows "
+            "the last 60 seconds of throughput."
         ),
     )
     _add_common(p_embed)
     _add_id_range(p_embed)
-    p_embed.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
-                         help=f"CLIP model (default: {DEFAULT_CLIP_MODEL})")
+    p_embed.add_argument("--clip-model", default=None,
+                         help="CLIP model (default: the model recorded in the "
+                              "index, then the configured/default model)")
     p_embed.add_argument("--batch", type=int, default=16, help="batch size")
     p_embed.add_argument("--recompute", action="store_true",
                          help="recompute embeddings even if present")
+    _add_progress_flag(p_embed)
     p_embed.set_defaults(func=cmd_embed)
 
     p_classify = sub.add_parser(
@@ -4049,15 +4244,18 @@ def main(argv: list[str] | None = None) -> int:
             "or other, using zero-shot CLIP. Needs CLIP embeddings (from scan "
             "or embed) but not captions; run 'describe'/'refine' separately if "
             "you also want tags. With --recompute, every image is classified "
-            "again instead of only the untyped ones."
+            "again instead of only the untyped ones. CLIP is loaded before the "
+            "classifying bar starts."
         ),
     )
     _add_common(p_classify)
     _add_id_range(p_classify)
-    p_classify.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
-                            help=f"CLIP model (default: {DEFAULT_CLIP_MODEL})")
+    p_classify.add_argument("--clip-model", default=None,
+                            help="CLIP model (default: the model recorded in "
+                                 "the index, then the configured/default model)")
     p_classify.add_argument("--recompute", action="store_true",
                             help="classify every image again, including typed ones")
+    _add_progress_flag(p_classify)
     p_classify.set_defaults(func=cmd_classify)
 
     p_sim = sub.add_parser(
@@ -4069,7 +4267,9 @@ def main(argv: list[str] | None = None) -> int:
             "semantic near-duplicate groups (photos of the same scene that "
             "pHash would not catch, shot a moment apart); with --image it ranks "
             "indexed media against that one image instead. --video searches "
-            "clips by their keyframes. --threshold tunes the cut-off."
+            "clips by their keyframes. --threshold tunes the cut-off. A target "
+            "image outside the index is embedded with the index's CLIP model "
+            "(or --clip-model), loaded before the comparison starts."
         ),
     )
     _add_common(p_sim)
@@ -4084,6 +4284,10 @@ def main(argv: list[str] | None = None) -> int:
     p_sim.add_argument("--limit", type=int, default=10,
                        help="max neighbors to show with --image")
     p_sim.add_argument("--json", action="store_true", help="machine-readable output")
+    p_sim.add_argument("--clip-model", default=None,
+                       help="CLIP model when --image is not in the index "
+                            "(default: the model recorded in the index)")
+    _add_progress_flag(p_sim)
     p_sim.set_defaults(func=cmd_similar)
 
     p_dup = sub.add_parser(
@@ -4115,6 +4319,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="which copy is 'best': largest (default) or newest "
                             "capture (or config 'prefer')")
     p_dup.add_argument("--json", action="store_true", help="machine-readable output")
+    _add_progress_flag(p_dup)
     p_dup.set_defaults(func=cmd_duplicates)
 
     p_clean = sub.add_parser(
@@ -4245,10 +4450,12 @@ def main(argv: list[str] | None = None) -> int:
     p_refine.add_argument("--classify", action="store_true",
                           help="legacy: also label each image's type with "
                                "zero-shot CLIP (prefer the 'classify' command)")
-    p_refine.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
-                          help=f"CLIP model for --classify (default: {DEFAULT_CLIP_MODEL})")
+    p_refine.add_argument("--clip-model", default=None,
+                          help="CLIP model for --classify (default: the model "
+                               "recorded in the index)")
     p_refine.add_argument("--recompute", action="store_true",
                           help="reclassify types even if already set")
+    _add_progress_flag(p_refine)
     p_refine.set_defaults(func=cmd_refine)
 
     p_people = sub.add_parser(
@@ -4272,6 +4479,7 @@ def main(argv: list[str] | None = None) -> int:
     p_people.add_argument("--limit", type=int, default=20,
                           help="max photos to list per cluster (default: 20)")
     p_people.add_argument("--json", action="store_true", help="machine-readable output")
+    _add_progress_flag(p_people)
     p_people.set_defaults(func=cmd_people)
 
     p_tags = sub.add_parser(
@@ -4381,7 +4589,9 @@ def main(argv: list[str] | None = None) -> int:
             "(recoverable with tolerance) or corrupt (not decodable). "
             "Truncated images can be re-encoded (originals kept as "
             "*.truncated) and corrupt files quarantined to a folder. Both "
-            "steps ask first in a terminal; --yes repairs without asking."
+            "steps ask first in a terminal; --yes repairs without asking. A "
+            "live bar shows files checked and the rolling 60-second ETA; "
+            "--no-progress keeps one-event-per-line logs."
         ),
     )
     _add_common(p_check)
@@ -4393,6 +4603,7 @@ def main(argv: list[str] | None = None) -> int:
                               "(default: .media-match-quarantine)")
     p_check.add_argument("--yes", action="store_true",
                          help="repair/quarantine without asking")
+    _add_progress_flag(p_check)
     p_check.set_defaults(func=cmd_check)
 
     p_bootstrap = sub.add_parser(

@@ -10,9 +10,11 @@ from media_match.progress import (
     PipelineState,
     ProgressBar,
     bar,
+    eta_seconds,
     human_bytes,
     human_time,
     render,
+    sampled_rate,
     short_name,
 )
 
@@ -321,6 +323,53 @@ def test_in_flight_reports_decoding_then_reading():
     snapshot = bar.in_flight()
     snapshot.append("/root/c.jpg")
     assert bar.in_flight() == ["/root/b.jpg"], "callers get a copy"
+
+
+# -- rolling ETA ---------------------------------------------------------------
+
+
+def test_sampled_rate_uses_the_trailing_window_not_lifetime_average():
+    # 100 items in the first second, then a slow folder: 40 more over 39s.
+    # Lifetime average is ~1.4/s; the last 60s is ~0.4/s.
+    samples = [(0.0, 0), (1.0, 100), (61.0, 110), (100.0, 140)]
+    rate = sampled_rate(samples, now=100.0, window=60.0)
+    assert rate == pytest.approx(40 / 99, rel=1e-6)
+    assert rate < 1.0
+
+
+def test_sampled_rate_waits_for_a_meaningful_span():
+    assert sampled_rate([(10.0, 0), (10.4, 50)], now=10.4) == 0.0
+
+
+def test_eta_seconds_has_no_estimate_when_rate_is_zero_or_work_is_done():
+    assert eta_seconds(0.0, 100, 50) is None
+    assert eta_seconds(2.0, 100, 100) is None
+    assert eta_seconds(2.0, 100, 50) == 25.0
+
+
+def test_render_uses_the_recorded_rolling_rate_for_eta():
+    state = _state(done=90, total=100, sampled_rate=1.0)
+    state.started = time.perf_counter() - 100  # lifetime average is 0.9/s
+    head = render(state, "/root", "embedding", width=100).split("\n")[0]
+    assert "1.0/s" in head
+    assert "eta 10.0s" in head
+
+
+def test_finished_bar_does_not_advertise_an_eta():
+    state = _state(done=10, total=10, sampled_rate=1.0)
+    state.finished = time.perf_counter()
+    lines = render(state, "/root", "embedding", width=100).split("\n")
+    assert "✓" in lines[0]
+    assert "eta" not in lines[0]
+    assert "complete" in lines[1]
+
+
+def test_set_total_corrects_a_bar_planned_before_the_stage_knew_its_size():
+    bar = ProgressBar("classifying", "/root", 0, stream=io.StringIO())
+    bar.set_total(12)
+    bar.set_done(3)
+    assert bar.state.total == 12
+    assert bar.state.done == 3
 
 
 # -- CLI scan: the model-load step and the no-bar heartbeat -----------------------
