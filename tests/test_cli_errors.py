@@ -41,6 +41,7 @@ MISSPELLED = "definitely-not-here"
 @pytest.mark.parametrize("argv", [
     ["scan"],
     ["analyze"],
+    ["classify"],
     ["check"],
     ["bootstrap"],
     ["folders"],

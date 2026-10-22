@@ -37,11 +37,13 @@ def check_image(path: str) -> str:
 
 
 def diagnose_tree(root: str, *, include_video: bool = False,
-                  ignore: list[str] | None = None) -> dict[str, list[tuple[str, str]]]:
+                  ignore: list[str] | None = None,
+                  progress=None) -> dict[str, list[tuple[str, str]]]:
     """Classify every image (and, optionally, video) under ``root``.
 
     Returns ``{"ok": [...], "truncated": [...], ...}`` as
-    ``(absolute_path, explanation)`` pairs, in tree order.
+    ``(absolute_path, explanation)`` pairs, in tree order. ``progress(done,
+    path)`` is called after each file, so a long check can show it is alive.
     """
     from .config import is_ignored
 
@@ -49,7 +51,8 @@ def diagnose_tree(root: str, *, include_video: bool = False,
     out: dict[str, list[tuple[str, str]]] = {
         OK: [], TRUNCATED: [], CORRUPT: [], NOTABLE: [],
     }
-    for kind, path in iter_media(root, include_video, ignore=ignore):
+    for done, (kind, path) in enumerate(iter_media(root, include_video,
+                                                   ignore=ignore), 1):
         if kind == "video":
             # videos are probed with ffmpeg during the scan; a file that
             # ffprobe cannot read is corrupt
@@ -60,9 +63,11 @@ def diagnose_tree(root: str, *, include_video: bool = False,
                 out[OK].append((path, ""))
             except Exception as exc:  # noqa: BLE001 - any probe failure is corrupt
                 out[CORRUPT].append((path, f"ffprobe cannot read it: {exc}"))
-            continue
-        found = diagnose_image(path)
-        out[found.status].append((path, found.message))
+        else:
+            found = diagnose_image(path)
+            out[found.status].append((path, found.message))
+        if progress is not None:
+            progress(done, path)
     return out
 
 

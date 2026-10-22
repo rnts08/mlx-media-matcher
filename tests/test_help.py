@@ -198,18 +198,27 @@ def test_command_help_flag_does_not_open_an_index(tmp_path):
     assert _run(["info", str(root)])[0] == 0
 
 
-def test_analyze_help_says_the_extra_passes_are_opt_in(capsys):
-    """The summary used to promise scan+describe+refine+classify by default.
-
-    Plain `analyze` only indexes; a run that was expected to caption and tag
-    finished with "described 0, refined 0, classified 0" and looked broken.
-    """
+def test_analyze_help_says_every_stage_runs_by_default(capsys):
+    """`analyze` is the complete pass; the old summary promised that but the
+    implementation made each later stage opt-in. It now runs them all."""
     assert cli.main(["help", "analyze"]) == 0
     out = capsys.readouterr().out
-    assert "optional" in out.lower()
-    assert "Without those flags" in out
-    assert "same work as 'scan'" in out
-    assert "one integrated pass: scan, describe, refine and classify" not in out
+    assert "complete analysis pass" in out
+    assert "every undescribed item is captioned" in out
+    assert "every untyped image is classified" in out
+    assert "No stage flags are needed" in out
+    # compatibility flags are accepted but not advertised
+    assert "--describe " not in out
+    assert "--refine " not in out
+    assert "--classify" not in out
+
+
+def test_classify_has_its_own_command(capsys):
+    assert cli.main(["help", "classify"]) == 0
+    out = capsys.readouterr().out
+    assert "classify —" in out
+    assert "zero-shot CLIP" in out
+    assert "--recompute" in out
 
 
 def test_search_help_matches_its_clip_default(capsys):

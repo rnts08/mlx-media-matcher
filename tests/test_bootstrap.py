@@ -190,6 +190,12 @@ def test_bootstrap_prune_keeps_newest(capsys, tmp_path):
     assert "trashed 1 duplicate" in out
     assert (root / "new.jpg").exists()
 
+    db = Database(str(root / ".media-match.db"))
+    paths = {r["path"] for r in db.all_bootstrap()}
+    db.close()
+    assert str(root / "new.jpg") in paths
+    assert str(root / "old.jpg") not in paths
+
 
 def test_bootstrap_fix_extensions(capsys, tmp_path):
     root = tmp_path / "tree"
@@ -318,3 +324,45 @@ def test_command_help_word_is_ignored_as_an_option_value(capsys, tmp_path):
     out = capsys.readouterr().out
     assert "1 non-media file(s) to prune" in out
     assert (tmp_path / "help").exists()
+
+
+def test_bootstrap_checks_loadability_by_default(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "ok.jpg")
+    (root / "broken.jpg").write_bytes(b"not an image")
+    assert cli.main(["bootstrap", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "1 ok" in out and "1 corrupt" in out
+    assert "broken.jpg" in out
+    assert "Quarantine 1 corrupt file(s)?" in out
+    # a non-terminal means the repair prompt is skipped; the file stays put
+    assert (root / "broken.jpg").exists()
+
+
+def test_bootstrap_no_check_skips_the_loadability_pass(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "ok.jpg")
+    (root / "broken.jpg").write_bytes(b"not an image")
+    assert cli.main(["bootstrap", str(root), "--no-check"]) == 0
+    out = capsys.readouterr().out
+    assert "corrupt" not in out
+    assert "Quarantine" not in out
+
+
+def test_bootstrap_yes_applies_check_repairs_and_refreshes_index(capsys, tmp_path):
+    root = tmp_path / "tree"
+    _write_image(root / "ok.jpg")
+    bad = root / "broken.jpg"
+    bad.write_bytes(b"not an image")
+    assert cli.main(["bootstrap", str(root), "--yes"]) == 0
+    assert not bad.exists()
+    quarantined = root / ".media-match-quarantine" / "broken.jpg"
+    assert quarantined.exists()
+
+    from media_match.db import Database
+
+    db = Database(str(root / ".media-match.db"))
+    paths = {r["path"] for r in db.all_bootstrap()}
+    db.close()
+    assert str(root / "ok.jpg") in paths
+    assert str(bad) not in paths

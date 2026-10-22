@@ -256,3 +256,59 @@ def test_window_is_reported_after_the_stage(tmp_path):
     assert bar.state.ring_used == 0
     # The window is clamped to the job count but never below two.
     assert bar.state.ring_cap == 2
+
+
+def test_analyze_runs_every_stage_in_order(tmp_path, monkeypatch):
+    """The complete pass is not opt-in: describe -> embed -> classify -> refine."""
+    from media_match import cli
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    _write_image(root / "a.png")
+    assert cli.main(["scan", str(root), "--quick"]) == 0
+
+    calls: list[str] = []
+
+    class FakeEncoder:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def ensure_loaded(self):
+            pass
+
+        def unload(self):
+            pass
+
+    def fake_scan(jobs, encoder, args, scan_root, **kwargs):
+        calls.append("scan")
+        return 0
+
+    def fake_describe(db, scan_root, model, args, on_error):
+        calls.append("describe")
+        first = db.all_files()[0]
+        db.set_description(first.id, "a purple square", "purple, square")
+        return 1
+
+    def fake_embed(db, rows, *, batch, encoder, report=None, progress=None):
+        calls.append("embed")
+        db.set_embeddings([(r["id"], b"\0" * 2048) for r in rows])
+        return len(rows), 0
+
+    def fake_classify(db, encoder, *, recompute=False, start_id=None,
+                      stop_id=None):
+        calls.append("classify")
+        return 1
+
+    def fake_refine(db, *, quiet=False, start_id=None, stop_id=None):
+        calls.append("refine")
+        return 1
+
+    monkeypatch.setattr("media_match.clip.ClipEncoder", FakeEncoder)
+    monkeypatch.setattr(cli, "_run_scan_with_progress", fake_scan)
+    monkeypatch.setattr(cli, "_describe_all", fake_describe)
+    monkeypatch.setattr(cli, "_embed_indexed", fake_embed)
+    monkeypatch.setattr(cli, "_classify_with", fake_classify)
+    monkeypatch.setattr(cli, "_refine_all", fake_refine)
+
+    assert cli.main(["analyze", str(root)]) == 0
+    assert calls == ["scan", "describe", "embed", "classify", "refine"]

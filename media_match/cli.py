@@ -537,15 +537,34 @@ def cmd_scan(args: argparse.Namespace) -> int:
               f"{_fmt_seconds(scan_stats.cpu)} cpu, "
               f"{_fmt_bytes(scan_stats.bytes_read)} read")
 
+    # Optional VLM captions first: the caption model needs the GPU and memory
+    # to itself, and refinement below builds tags from the captions this pass
+    # just created. Best version of each duplicate group only.
+    if args.describe:
+        encoder.unload()
+        described = _describe_all(db, root, model, args, on_error)
+        if described:
+            print(f"described {described} item(s)")
+        _summarize_bad_files(root)
+
     # Optional keep-tags-fresh step: refine keywords into canonical tags/facets
-    # (and, with --classify, type each image) before releasing the CLIP model.
+    # (and, with --classify, type each image). Refinement needs captions; a
+    # raw keyword-only index gets a clear hint instead of silently producing
+    # empty tags.
     if args.refine or args.classify:
-        refined = _refine_all(
-            db, quiet=True, start_id=args.start_id, stop_id=args.stop_id
-        )
-        if refined:
-            print(f"refined {refined} item(s)")
+        if _require_descriptions(db, root, start_id=args.start_id,
+                                 stop_id=args.stop_id):
+            refined = _refine_all(
+                db, quiet=True, start_id=args.start_id, stop_id=args.stop_id
+            )
+            if refined:
+                print(f"refined {refined} item(s)")
+
     if args.classify:
+        if args.describe:
+            # CLIP was released for the caption pass; reload it for typing.
+            encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
+            _load_model(encoder, "CLIP model")
         classified = _classify_with(
             db, encoder, recompute=False,
             start_id=args.start_id, stop_id=args.stop_id,
@@ -554,12 +573,6 @@ def cmd_scan(args: argparse.Namespace) -> int:
             print(f"classified {classified} image(s)")
 
     encoder.unload()
-
-    # Optional VLM captions, best version of each duplicate group only.
-    if args.describe:
-        described = _describe_all(db, root, model, args, on_error)
-        if described:
-            print(f"described {described} item(s)")
 
     described_count = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
@@ -661,6 +674,38 @@ def cmd_describe(args: argparse.Namespace) -> int:
     print(f"Done: described {described}, errors {errors} ({db.path})")
     db.close()
     return 0
+
+
+def _description_count(db: Database, *, start_id: int | None = None,
+                       stop_id: int | None = None,
+                       include_video: bool = True) -> int:
+    """How many indexed items in scope have a caption."""
+    from .db import _id_clause
+
+    total = 0
+    for table, enabled in (("files", True), ("videos", include_video)):
+        if not enabled:
+            continue
+        where, params = _id_clause(start_id, stop_id)
+        sql = f"SELECT COUNT(*) AS n FROM {table} WHERE description != ''"
+        if where:
+            sql += f" AND {where}"
+        total += db.conn.execute(sql, params).fetchone()["n"]
+    return total
+
+
+def _require_descriptions(db: Database, root: str, *,
+                          start_id: int | None = None,
+                          stop_id: int | None = None) -> bool:
+    """False (with the reason) when refinement has no captions to work from."""
+    if _description_count(db, start_id=start_id, stop_id=stop_id) > 0:
+        return True
+    scope = (" in this id window"
+             if start_id is not None or stop_id is not None
+             else " in this index")
+    print(f"No descriptions{scope}. Refinement builds tags from captions, so "
+          f"run 'media-match describe {root}' first.", file=sys.stderr)
+    return False
 
 
 def _list_by_type(db: Database, args) -> int:
@@ -915,6 +960,49 @@ def _clip_search(db: Database, query_text: str, limit: int, *,
     return hits[:limit]
 
 
+def _embed_indexed(db: Database, rows, *, batch: int, encoder,
+                   report=None, progress=None) -> tuple[int, int]:
+    """Embed image rows with an already-loaded encoder.
+
+    Returns ``(done, errors)``. ``report(path, exc)`` handles a bad file;
+    without it the reason is printed directly. ``progress(done, total)`` is
+    called after each batch.
+    """
+    done = errors = 0
+    for start in range(0, len(rows), batch):
+        chunk = rows[start:start + batch]
+        ids, paths = [], []
+        for r in chunk:
+            try:
+                if not os.path.exists(r["path"]):
+                    raise FileNotFoundError("file missing")
+                ids.append(r["id"])
+                paths.append(r["path"])
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                if report is not None:
+                    report(r["path"], exc)
+                else:
+                    print(f"  ERROR {r['path']}: {exc}", file=sys.stderr)
+        if not paths:
+            continue
+        try:
+            vectors = encoder.embed_image_paths(paths)
+        except Exception as exc:  # noqa: BLE001
+            errors += len(paths)
+            if report is not None:
+                for path in paths:
+                    report(path, exc)
+            else:
+                print(f"  ERROR embedding batch: {exc}", file=sys.stderr)
+            continue
+        db.set_embeddings([(fid, v.tobytes()) for fid, v in zip(ids, vectors)])
+        done += len(paths)
+        if progress is not None:
+            progress(done, len(rows))
+    return done, errors
+
+
 def cmd_embed(args: argparse.Namespace) -> int:
     import time
 
@@ -950,39 +1038,33 @@ def cmd_embed(args: argparse.Namespace) -> int:
     from .clip import ClipEncoder
 
     encoder = ClipEncoder(model_id=args.clip_model, batch_size=args.batch)
+    _load_model(encoder, "CLIP model")
     db.set_meta("clip_model", args.clip_model)
     print(f"embedding {len(rows)} image(s) with {args.clip_model} ...")
 
-    done = 0
-    errors = 0
     t0 = time.perf_counter()
-    for start in range(0, len(rows), args.batch):
-        chunk = rows[start : start + args.batch]
-        ids, paths = [], []
-        for r in chunk:
-            try:
-                if not os.path.exists(r["path"]):
-                    raise FileNotFoundError("file missing")
-                ids.append(r["id"])
-                paths.append(r["path"])
-            except Exception as exc:  # noqa: BLE001
-                errors += 1
-                print(f"  ERROR {r['path']}: {exc}")
-        if not paths:
-            continue
-        try:
-            vectors = encoder.embed_image_paths(paths)
-        except Exception as exc:  # noqa: BLE001
-            errors += len(paths)
-            print(f"  ERROR embedding batch: {exc}")
-            continue
-        db.set_embeddings([(fid, v.tobytes()) for fid, v in zip(ids, vectors)])
-        done += len(paths)
-        print(f"  {start + len(chunk)}/{len(rows)}", end="\r")
+    show_progress = _progress_enabled(args)
+
+    def report(path: str, exc: Exception) -> None:
+        print(f"  ERROR {path}: {exc}")
+
+    def progress(done: int, total: int) -> None:
+        if show_progress:
+            print(f"  {done}/{total}", end="\r", flush=True)
+
+    try:
+        done, errors = _embed_indexed(
+            db, rows, batch=args.batch, encoder=encoder,
+            report=report, progress=progress,
+        )
+    finally:
+        encoder.unload()
+    if show_progress:
+        print()
 
     elapsed = time.perf_counter() - t0
     rate = done / elapsed if elapsed > 0 else 0
-    print(f"\nDone: embedded {done} images in {elapsed:.1f}s ({rate:.1f} img/s), "
+    print(f"Done: embedded {done} images in {elapsed:.1f}s ({rate:.1f} img/s), "
           f"errors {errors}")
     db.close()
     return 0
@@ -2076,14 +2158,50 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bootstrap_loadability(root: str, *, include_video: bool,
+                           ignore: list[str], total: int, enabled: bool,
+                           yes: bool, quarantine_dir: str) -> bool:
+    """Run the shared loadability check after bootstrap's inventory.
+
+    This is `check` folded into bootstrap: report truncated/corrupt/notable
+    files, then offer the same repairs (prompted; ``--yes`` applies them
+    without asking). It changes nothing when the user declines or when stdin
+    is not a terminal.
+    """
+    if total <= 0:
+        print("\nloadability: no media files to check")
+        return False
+
+    from .progress import ProgressBar
+
+    print()
+    bar = ProgressBar("checking", root, total, enabled=enabled).start()
+
+    def progress(_done: int, _path: str) -> None:
+        bar.note_completed()
+
+    try:
+        _code, changed = _check_tree(
+            root, include_video=include_video, ignore=ignore,
+            quarantine_dir=quarantine_dir, yes=yes, announce=False,
+            progress=progress, stop_progress=bar.stop,
+        )
+    finally:
+        bar.stop()
+    return changed
+
+
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     """First pass over a tree: walk it, record filename/type/size in the index.
 
-    Dry-run by default — builds the database but touches no files. Add
-    --prune to trash exact duplicates (keeping the newest), --media-only to
-    prune non-media files and consolidate extensions, and --fix-extensions
-    (with --media-only) to add/update missing extensions. With --move-to DIR,
-    --media-only moves the non-media files there instead of trashing them.
+    Inventory and file operations are dry-run by default: nothing is touched
+    without confirmation (or --yes). Add --prune to trash exact duplicates
+    (keeping the newest), --media-only to prune non-media files and consolidate
+    extensions, and --fix-extensions (with --media-only) to add/update missing
+    extensions. With --move-to DIR, --media-only moves the non-media files
+    there instead of trashing them. After inventorying it runs the same
+    loadability check as `check` and offers repairs; --no-check skips that
+    pass.
     """
     from .config import load_ignore
 
@@ -2154,6 +2272,11 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
                 print(f"trashed {pruned} duplicate file(s)")
         else:
             print("\nno exact duplicates found")
+
+    if pruned:
+        # Keep the bootstrap table free of files that were just trashed.
+        rows = walk_tree(root, include_video=args.video, ignore=ignore)
+        db.replace_bootstrap(rows)
 
     # --media-only: fix extensions first, then consolidate, then prune non-media.
     # Fixing must come first: an extensionless JPEG is classified "other" until
@@ -2240,6 +2363,24 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
             db.replace_bootstrap(rows)
             print("index refreshed")
 
+    if not getattr(args, "no_check", False):
+        check_total = sum(
+            1 for r in rows
+            if r[4] == "image" or (args.video and r[4] == "video")
+        )
+        changed = _bootstrap_loadability(
+            root, include_video=args.video, ignore=ignore,
+            total=check_total, enabled=_progress_enabled(args),
+            yes=args.yes,
+            quarantine_dir=getattr(args, "quarantine",
+                                   ".media-match-quarantine"),
+        )
+        if changed:
+            # The check re-encoded or quarantined files; keep the bootstrap
+            # table matching what is actually on disk.
+            rows = walk_tree(root, include_video=args.video, ignore=ignore)
+            db.replace_bootstrap(rows)
+
     db.close()
     return 0
 
@@ -2255,29 +2396,28 @@ def _confirm(prompt: str, *, yes: bool = False) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def cmd_check(args: argparse.Namespace) -> int:
-    """Check which media files are loadable, and offer to repair them.
+def _check_tree(root: str, *, include_video: bool, ignore: list[str],
+                quarantine_dir: str, yes: bool, announce: bool = True,
+                progress=None, stop_progress=None) -> tuple[int, bool]:
+    """The shared loadability check used by `check` and `bootstrap`.
 
-    Every file that is not clean is named with the reason it was flagged and
-    what can be done about it:
-
-      * truncated -> re-encoded, the original kept as ``<name>.truncated``
-      * corrupt   -> moved to a quarantine folder (never deleted outright)
-      * notable   -> loads fine (malformed MPO, very large image); reported
-                     for information, no action taken
-
-    The two repairs ask first in a terminal and can be skipped with --yes.
+    Reports every file that is not clean. Truncated images can be re-encoded
+    and corrupt files quarantined; both ask first in a terminal (``yes`` skips
+    the prompt), and neither ever deletes a file outright.
     """
-    from .config import load_ignore
+    from shutil import which
 
-    root = os.path.abspath(args.root)
-    if not _require_root(root):
-        return 2
-    ignore = load_ignore(root)
-    include_video = args.video
+    if include_video and not (which("ffmpeg") and which("ffprobe")):
+        print("video loadability check skipped: ffmpeg/ffprobe not on PATH",
+              file=sys.stderr)
+        include_video = False
 
-    print(f"checking media under {root} ...")
-    result = diagnose_tree(root, include_video=include_video, ignore=ignore)
+    if announce:
+        print(f"checking media under {root} ...")
+    result = diagnose_tree(root, include_video=include_video, ignore=ignore,
+                           progress=progress)
+    if stop_progress is not None:
+        stop_progress()
     ok = result[OK]
     truncated = result[TRUNCATED]
     corrupt = result[CORRUPT]
@@ -2302,14 +2442,14 @@ def cmd_check(args: argparse.Namespace) -> int:
             print("\nnothing to repair — the notable files above all load fine.")
         else:
             print("\neverything is loadable; nothing to repair.")
-        return 0
+        return 0, False
 
     repaired = failed = 0
     if truncated:
         print(f"\n{len(truncated)} file(s) can be repaired by re-encoding them "
               f"(the readable part is kept, the original becomes <name>.truncated).")
         if _confirm(f"Repair {len(truncated)} truncated image(s)?",
-                    yes=args.yes):
+                    yes=yes):
             for path, _why in truncated:
                 rel = os.path.relpath(path, root)
                 try:
@@ -2321,10 +2461,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     quarantined = 0
     if corrupt:
-        qdir = os.path.join(root, args.quarantine)
+        qdir = os.path.join(root, quarantine_dir)
         print(f"\n{len(corrupt)} file(s) are unreadable and can be moved to "
               f"{qdir} (never deleted outright).")
-        if _confirm(f"Quarantine {len(corrupt)} corrupt file(s)?", yes=args.yes):
+        if _confirm(f"Quarantine {len(corrupt)} corrupt file(s)?", yes=yes):
             for path, _why in corrupt:
                 rel = os.path.relpath(path, root)
                 try:
@@ -2341,15 +2481,43 @@ def cmd_check(args: argparse.Namespace) -> int:
           + (f", {failed} failed" if failed else ""))
     if repaired or quarantined:
         print("run 'media-match scan --prune' to sync the index")
-    return 1 if failed else 0
+    return (1 if failed else 0), bool(repaired or quarantined)
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Check which media files are loadable, and offer to repair them.
+
+    Every file that is not clean is named with the reason it was flagged and
+    what can be done about it:
+
+      * truncated -> re-encoded, the original kept as ``<name>.truncated``
+      * corrupt   -> moved to a quarantine folder (never deleted outright)
+      * notable   -> loads fine (malformed MPO, very large image); reported
+                     for information, no action taken
+
+    The two repairs ask first in a terminal; --yes applies them without asking.
+    """
+    from .config import load_ignore
+
+    root = os.path.abspath(args.root)
+    if not _require_root(root):
+        return 2
+    ignore = load_ignore(root)
+    code, _changed = _check_tree(
+        root, include_video=args.video, ignore=ignore,
+        quarantine_dir=args.quarantine, yes=args.yes,
+    )
+    return code
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
-    """One integrated pass: scan, describe, refine and classify everything.
+    """Complete analysis pass: index, describe, embed, classify and refine.
 
-    Images and videos share every stage. The scan pipeline overlaps CPU
-    decoding with GPU CLIP batches; the describe stage overlaps CPU frame
-    extraction with GPU VLM captions, so the GPU is never waiting on the CPU.
+    Indexing is the same incremental work as ``scan``. After it, every later
+    stage always runs: missing captions are generated, missing CLIP embeddings
+    are filled in, images are typed, and captions/keywords are turned into tags
+    and facets. Use ``scan`` when only the index is wanted, or ``describe``,
+    ``classify`` and ``refine`` for one stage at a time.
     """
     _register_heif()
 
@@ -2378,8 +2546,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     db = Database(db_path_for(root, args.db))
     db.set_meta("root", root)
     db.set_meta("clip_model", clip_model)
-    if args.describe:
-        db.set_meta("vlm_model", model)
+    db.set_meta("vlm_model", model)
 
     if args.video and not _require_ffmpeg():
         db.close()
@@ -2412,7 +2579,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     from .clip import ClipEncoder
 
-    encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
+    encoder: ClipEncoder | None = ClipEncoder(model_id=clip_model,
+                                              batch_size=batch)
     errors = 0
 
     def on_error(path: str, exc: Exception) -> None:
@@ -2450,36 +2618,75 @@ def cmd_analyze(args: argparse.Namespace) -> int:
               f"{_fmt_bytes(scan_stats.bytes_read)} read")
 
     # -- pass 2: VLM captions (GPU), with CPU frame prefetch -----------------
-    # the CLIP encoder stays loaded when --classify needs it afterwards;
-    # otherwise it is unloaded first so the VLM has the memory to itself
-    if not args.classify:
-        encoder.unload()
+    # Give the caption model the GPU and memory to itself; CLIP is reloaded
+    # below only if missing embeddings or image types still need it.
+    encoder.unload()
+    encoder = None
+    described = _describe_all(db, root, model, args, on_error)
+    if described:
+        print(f"described {described} item(s)")
+    _summarize_bad_files(root)
 
-    described = 0
-    if args.describe:
-        described = _describe_all(db, root, model, args, on_error)
-        if described:
-            print(f"described {described} item(s)")
+    # -- pass 3: fill in embeddings that scan/quick/import left NULL ---------
+    missing = db.files_missing_embedding(args.start_id, args.stop_id)
+    embedded = 0
+    if missing:
+        encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
+        _load_model(encoder, "CLIP model")
+        print(f"embedding {len(missing)} image(s) without CLIP embeddings ...")
+        show_progress = _progress_enabled(args)
+        last_report = 0
 
-    # -- pass 3: refine keywords into canonical tags -------------------------
-    refined = 0
-    if args.refine or args.classify:
-        refined = _refine_all(
-            db, quiet=True, start_id=args.start_id, stop_id=args.stop_id
-        )
-        if refined:
-            print(f"refined {refined} item(s)")
+        def report_embed(path: str, exc: Exception) -> None:
+            _report_bad_file(path, _diagnose_failure(path, exc))
 
-    # -- pass 4: type each image with the already-loaded CLIP encoder --------
+        def embed_progress(done: int, count: int) -> None:
+            nonlocal last_report
+            if show_progress:
+                print(f"  {done}/{count}", end="\r", flush=True)
+            elif done == count or done - last_report >= max(1, count // 20):
+                print(f"  embedding {done}/{count}", file=sys.stderr)
+                last_report = done
+
+        try:
+            embedded, embed_errors = _embed_indexed(
+                db, missing, batch=batch, encoder=encoder,
+                report=report_embed, progress=embed_progress,
+            )
+        finally:
+            if show_progress:
+                print()
+        errors += embed_errors
+        _summarize_bad_files(root)
+        if embedded:
+            print(f"embedded {embedded} image(s)")
+
+    # -- pass 4: type each image with CLIP -----------------------------------
     classified = 0
-    if args.classify:
+    needing_type = db.files_needing_type(args.start_id, args.stop_id)
+    if needing_type:
+        if encoder is None:
+            encoder = ClipEncoder(model_id=clip_model, batch_size=batch)
+            _load_model(encoder, "CLIP model")
         classified = _classify_with(
             db, encoder, recompute=False,
             start_id=args.start_id, stop_id=args.stop_id,
         )
         if classified:
             print(f"classified {classified} image(s)")
-    encoder.unload()
+    if encoder is not None:
+        encoder.unload()
+
+    # -- pass 5: refine captions/keywords into canonical tags ----------------
+    refined = 0
+    if (db.count_files() + db.count_videos() > 0
+            and _require_descriptions(db, root, start_id=args.start_id,
+                                      stop_id=args.stop_id)):
+        refined = _refine_all(
+            db, quiet=True, start_id=args.start_id, stop_id=args.stop_id
+        )
+        if refined:
+            print(f"refined {refined} item(s)")
 
     described_count = db.conn.execute(
         "SELECT COUNT(*) AS n FROM files WHERE description != ''"
@@ -2488,9 +2695,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         "SELECT COUNT(*) AS n FROM videos WHERE description != ''"
     ).fetchone()["n"]
     print(f"Done: analyzed {analyzed}, described {described}, "
-          f"refined {refined}, classified {classified}, errors {errors}. "
-          f"Index: {db.count_files()} images ({described_count} described), "
-          f"{db.count_videos()} videos ({vdescribed} described) ({db.path})")
+          f"embedded {embedded}, classified {classified}, refined {refined}, "
+          f"errors {errors}. Index: {db.count_files()} images "
+          f"({described_count} described), {db.count_videos()} videos "
+          f"({vdescribed} described) ({db.path})")
     db.close()
     return 0
 
@@ -2503,9 +2711,14 @@ def cmd_refine(args: argparse.Namespace) -> int:
               f"run 'media-match scan {root}' first.", file=sys.stderr)
         return 1
 
+    if not _require_descriptions(db, root, start_id=args.start_id,
+                                 stop_id=args.stop_id):
+        db.close()
+        return 1
+
     total = _refine_all(db, start_id=args.start_id, stop_id=args.stop_id)
     if not total:
-        print("Nothing to refine. Run 'scan' (and optionally '--describe') first.")
+        print("Nothing to refine: no caption keywords in this scope.")
 
     if args.classify:
         _classify_images(db, args)
@@ -2584,6 +2797,7 @@ def _classify_images(db: Database, args) -> None:
     from .clip import ClipEncoder
 
     encoder = ClipEncoder(model_id=args.clip_model)
+    _load_model(encoder, "CLIP model")
     try:
         classified = _classify_with(
             db, encoder, recompute=args.recompute,
@@ -2597,6 +2811,79 @@ def _classify_images(db: Database, args) -> None:
     else:
         print("No images need a type (run 'scan'/'embed' first, "
               "or they are all classified).")
+
+
+def cmd_classify(args: argparse.Namespace) -> int:
+    """Type indexed images with zero-shot CLIP.
+
+    Classification needs CLIP embeddings but not captions. It is the standalone
+    counterpart to ``analyze``/``refine --classify``: run it when the index is
+    already scanned and only the image types need (re)building.
+    """
+    root = os.path.abspath(args.root)
+    if not _require_root(root):
+        return 2
+
+    db = open_db(root, args.db, create=False)
+    if db is None:
+        print(f"No index at {db_path_for(root, args.db)} — "
+              f"run 'media-match scan {root}' first.", file=sys.stderr)
+        return 1
+
+    from .db import _id_clause
+
+    where, params = _id_clause(args.start_id, args.stop_id)
+    suffix = f" AND {where}" if where else ""
+    total = db.conn.execute(
+        f"SELECT COUNT(*) AS n FROM files WHERE 1=1{suffix}", params
+    ).fetchone()["n"]
+    embedded = db.conn.execute(
+        f"SELECT COUNT(*) AS n FROM files WHERE embedding IS NOT NULL{suffix}",
+        params,
+    ).fetchone()["n"]
+
+    if total == 0:
+        print("No indexed images to classify. Run 'media-match scan' first.")
+        db.close()
+        return 0
+    if embedded == 0:
+        print("No CLIP embeddings to classify. Run 'media-match scan' or "
+              "'media-match embed' first.", file=sys.stderr)
+        db.close()
+        return 1
+
+    if not args.recompute:
+        rows = db.files_needing_type(args.start_id, args.stop_id)
+        if not rows:
+            if embedded < total:
+                print(f"All images with CLIP embeddings already have a type; "
+                      f"{total - embedded} image(s) have no embedding. Run "
+                      f"'media-match embed' to classify them.")
+            else:
+                print("All indexed images already have a type "
+                      "(use --recompute to classify them again).")
+            db.close()
+            return 0
+
+    from .clip import ClipEncoder
+
+    encoder = ClipEncoder(model_id=args.clip_model)
+    _load_model(encoder, "CLIP model")
+    try:
+        classified = _classify_with(
+            db, encoder, recompute=args.recompute,
+            start_id=args.start_id, stop_id=args.stop_id,
+        )
+    finally:
+        encoder.unload()
+
+    unembedded = total - embedded
+    if unembedded:
+        print(f"{unembedded} image(s) have no CLIP embedding; run "
+              f"'media-match embed' to include them.")
+    print(f"Done: classified {classified} image(s) ({db.path})")
+    db.close()
+    return 0
 
 
 def cmd_people(args: argparse.Namespace) -> int:
@@ -2615,7 +2902,7 @@ def cmd_people(args: argparse.Namespace) -> int:
 
     person_ids = set(db.media_ids_with_facet("person", kind))
     if not person_ids:
-        print("No person tags yet. Run 'scan --describe' then 'refine' first.",
+        print("No person tags yet. Run 'describe' then 'refine' first.",
               file=sys.stderr)
         db.close()
         return 1
@@ -2904,8 +3191,8 @@ _SUBPARSERS: dict[str, argparse.ArgumentParser] = {}
 
 # One-line summary for the top-level command listing and the `help` command.
 _COMMAND_SUMMARIES = {
-    "analyze": "scan, plus optional captions, tags and types in one pass",
-    "scan": "index new/changed media (hash + pHash + CLIP)",
+    "analyze": "complete pass: describe, embed, classify and refine everything",
+    "scan": "index new/changed media (dimensions, pHash, CLIP)",
     "describe": "caption indexed media that has no caption yet",
     "search": "find media by person/object/text (CLIP by default)",
     "embed": "fill in missing CLIP embeddings for indexed images",
@@ -2914,7 +3201,8 @@ _COMMAND_SUMMARIES = {
     "clean": "review duplicate groups and move rejected copies to the Trash",
     "folders": "find same-named folders; merge or gather the duplicates",
     "restore": "move files back from the system Trash (undo 'clean')",
-    "refine": "rewrite keywords into canonical tags/facets; type photos",
+    "classify": "type indexed images with zero-shot CLIP",
+    "refine": "build canonical tags/facets from captions (describe first)",
     "people": "cluster person photos by similarity and name the clusters",
     "tags": "list refined tags, facets or image types",
     "export": "dump the index to JSON, CSV or Markdown",
@@ -2933,8 +3221,8 @@ _COMMAND_SUMMARIES = {
 
 # A runnable example per command, shown in `media-match help <cmd>`.
 _EXAMPLES = {
-    "analyze": "media-match analyze ~/Pictures --video --describe --classify",
-    "scan": "media-match scan ~/Pictures --describe --refine --classify",
+    "analyze": "media-match analyze ~/Pictures --video",
+    "scan": "media-match scan ~/Pictures --video",
     "describe": "media-match describe ~/Pictures --video",
     "search": "media-match search ~/Pictures --object bicycle",
     "embed": "media-match embed ~/Pictures",
@@ -2943,7 +3231,8 @@ _EXAMPLES = {
     "clean": "media-match clean ~/Pictures --dry-run",
     "folders": "media-match folders ~/Pictures --list",
     "restore": "media-match restore ~/Pictures --yes",
-    "refine": "media-match refine ~/Pictures --classify",
+    "classify": "media-match classify ~/Pictures",
+    "refine": "media-match refine ~/Pictures",
     "people": "media-match people ~/Pictures --label 1=Alice",
     "tags": "media-match tags ~/Pictures --facets",
     "export": "media-match export ~/Pictures --format json --out index.json",
@@ -2961,7 +3250,7 @@ _EXAMPLES = {
 }
 
 # Project metadata shown by 'about', 'version' and 'info'.
-_VERSION = "0.4.4"
+_VERSION = "0.4.5"
 _LICENSE = "Non-Commercial Licence"
 _AUTHOR = "Timh Bergström"
 _REPO = "https://github.com/rnts08/mlx-media-matcher"
@@ -3069,7 +3358,7 @@ _COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
      ("bootstrap", "scan", "check")),
     ("go deeper",
      "embeddings, captions, tags, types and people — what makes search work well",
-     ("analyze", "embed", "describe", "refine", "people")),
+     ("analyze", "describe", "embed", "classify", "refine", "people")),
     ("find things",
      "search and browse what is indexed",
      ("search", "tags", "similar")),
@@ -3515,17 +3804,19 @@ def main(argv: list[str] | None = None) -> int:
 
     p_scan = sub.add_parser(
         "scan",
-        help="analyze new/changed media in a folder",
+        help="index new/changed media in a folder",
         description=(
             "Walk the tree and index every new or changed media file: size, "
             "dimensions, capture date, pHash (for exact duplicates) and a CLIP "
-            "embedding. Files already in the index are skipped, so re-running is "
-            "cheap. Add --describe to caption them, --refine/--classify to tidy "
-            "the keywords, --video to include videos, and --prune to drop index "
-            "rows for files that have since been moved or deleted. --quick only "
-            "stats files and writes basic rows (path/size/mtime) with stable "
-            "ids — no reading, no GPU; analyze the rows afterwards with "
-            "--start-id/--stop-id windows."
+            "embedding. The pHash is only computed for new files, or for files "
+            "changed since bootstrap; unchanged rows are skipped, so re-running "
+            "is cheap. Use 'analyze' for the complete describe/embed/classify/"
+            "refine pass, or add --describe/--refine/--classify here to run "
+            "individual follow-up stages in the same command. --video includes "
+            "videos, and --prune drops index rows for files that have since "
+            "been moved or deleted. --quick only stats files and writes basic "
+            "rows (path/size/mtime) with stable ids — no reading, no GPU; "
+            "analyze the rows afterwards with --start-id/--stop-id windows."
         ),
     )
     _add_common(p_scan)
@@ -3580,33 +3871,33 @@ def main(argv: list[str] | None = None) -> int:
 
     p_analyze = sub.add_parser(
         "analyze",
-        help="scan, plus optional captions, tags and types in one pass",
+        help="complete pass: describe, embed, classify and refine everything",
         description=(
-            "Index new or changed media and, when asked, run the later passes "
-            "in the same command. Indexing (hash + pHash + CLIP) always "
-            "happens; --describe adds VLM captions, --refine rebuilds canonical "
-            "tags/facets, and --classify types images (it implies --refine). "
-            "Without those flags 'analyze' does the same work as 'scan'. The "
-            "scan pipeline keeps the GPU busy by overlapping CPU decoding with "
-            "GPU embedding batches, and the describe stage overlaps CPU frame "
-            "extraction with GPU caption generation. With --start-id/--stop-id "
-            "every stage is limited to that id window."
+            "Run the complete analysis pass over a media tree. Indexing (hash + "
+            "pHash + CLIP) runs first and picks up new or changed files; then "
+            "every undescribed item is captioned, every indexed image missing a "
+            "CLIP embedding gets one, every untyped image is classified, and "
+            "the captions and keywords are refined into canonical tags/facets. "
+            "No stage flags are needed. Use 'scan' when only the index (pHash "
+            "and duplicate cleanup) is wanted, or 'describe', 'embed', "
+            "'classify' and 'refine' for one stage at a time. The scan pipeline "
+            "keeps the GPU busy by overlapping CPU decoding with GPU embedding "
+            "batches, and the describe stage overlaps CPU frame extraction with "
+            "GPU caption generation. With --start-id/--stop-id every stage is "
+            "limited to that id window."
         ),
     )
     _add_common(p_analyze)
-    p_analyze.add_argument("--describe", action="store_true",
-                           help="caption media with the vision model "
-                                "(best version of each duplicate group only)")
-    p_analyze.add_argument("--refine", action="store_true",
-                           help="after scanning, rewrite keywords into canonical "
-                                "tags + facets (see 'refine')")
-    p_analyze.add_argument("--classify", action="store_true",
-                           help="after scanning, also type each image with CLIP "
-                                "(selfie/scene/object/...; implies --refine)")
+    # Accepted for compatibility with 0.4.x scripts; analyze now always runs
+    # every stage, so these no longer change what happens.
+    for _flag in ("--describe", "--refine", "--classify"):
+        p_analyze.add_argument(_flag, action="store_true",
+                               default=argparse.SUPPRESS,
+                               help=argparse.SUPPRESS)
     p_analyze.add_argument("--video", action="store_true",
                            help="also analyze video files (keyframes each)")
     p_analyze.add_argument("--model", default=None,
-                           help="MLX vision model for --describe "
+                           help="MLX vision model for captions "
                                 f"(default: {DEFAULT_MODEL}, or config 'model')")
     p_analyze.add_argument("--clip-model", default=None,
                            help="CLIP model for embeddings "
@@ -3635,8 +3926,9 @@ def main(argv: list[str] | None = None) -> int:
                            help="cap on keyframes per video (default: 120, or config 'max_frames')")
     _add_id_range(p_analyze)
     p_analyze.add_argument("--limit", type=int,
-                           help="only analyze first N media items (with "
-                                "--start-id, cap the selected window)")
+                           help="only scan the first N media items; the later "
+                                "stages still cover the index (or the id "
+                                "window)")
     p_analyze.add_argument("--reanalyze", action="store_true",
                            help="re-analyze files even if unchanged")
     p_analyze.add_argument("--prune", action="store_true",
@@ -3737,6 +4029,26 @@ def main(argv: list[str] | None = None) -> int:
     p_embed.add_argument("--recompute", action="store_true",
                          help="recompute embeddings even if present")
     p_embed.set_defaults(func=cmd_embed)
+
+    p_classify = sub.add_parser(
+        "classify",
+        help="type indexed images with zero-shot CLIP",
+        description=(
+            "Label every indexed image that has no type yet as selfie, "
+            "portrait, group, scene, city, animal, object, food, document, art "
+            "or other, using zero-shot CLIP. Needs CLIP embeddings (from scan "
+            "or embed) but not captions; run 'describe'/'refine' separately if "
+            "you also want tags. With --recompute, every image is classified "
+            "again instead of only the untyped ones."
+        ),
+    )
+    _add_common(p_classify)
+    _add_id_range(p_classify)
+    p_classify.add_argument("--clip-model", default=DEFAULT_CLIP_MODEL,
+                            help=f"CLIP model (default: {DEFAULT_CLIP_MODEL})")
+    p_classify.add_argument("--recompute", action="store_true",
+                            help="classify every image again, including typed ones")
+    p_classify.set_defaults(func=cmd_classify)
 
     p_sim = sub.add_parser(
         "similar",
@@ -3907,15 +4219,15 @@ def main(argv: list[str] | None = None) -> int:
 
     p_refine = sub.add_parser(
         "refine",
-        help="clean keywords into canonical tags + facets; optionally type them",
+        help="build canonical tags/facets from captions (describe first)",
         description=(
-            "Rewrite each item's free-text keywords into canonical tags "
+            "Rewrite each item's caption keywords into canonical tags "
             "(lowercased, singularized, synonyms merged, filler dropped) and "
             "bucket them into facets (person/animal/object/scene/food/plant/"
-            "text/activity/color). The original keywords are kept in "
-            "raw_keywords. With --classify, also label every image's type "
-            "(selfie/portrait/group/scene/city/animal/object/food/document/"
-            "art) with zero-shot CLIP."
+            "text/activity/color). Requires descriptions: run 'describe' first "
+            "(or let 'analyze' run both). The original keywords are kept in "
+            "raw_keywords. With --classify, also label every image's type; the "
+            "standalone form is the 'classify' command."
         ),
     )
     _add_common(p_refine)
@@ -4077,14 +4389,18 @@ def main(argv: list[str] | None = None) -> int:
         help="first pass: walk the tree, record filename/type/size in the index",
         description=(
             "Walk the whole tree and record every file's name, type and size in "
-            "the index — no decoding or hashing, so it is fast. Dry-run by "
-            "default: builds the database but touches no files. Add --prune to "
-            "trash exact duplicates (keeping the newest), --media-only to prune "
-            "non-media files and consolidate extensions, --move-to DIR (with "
-            "--media-only) to move the non-media files to a folder instead of "
-            "trashing them, and --fix-extensions "
-            "(with --media-only) to add/update missing extensions. Works for "
-            "images and videos."
+            "the index — the inventory itself does no decoding or hashing. "
+            "After it, the same loadability check as 'check' decodes each image "
+            "(and probes videos with --video), reports ok/truncated/corrupt/"
+            "notable files, and offers to re-encode truncated or quarantine "
+            "corrupt ones; --no-check keeps the pass to the fast inventory. "
+            "Dry-run by default: builds the database and asks before touching "
+            "files. Add --prune to trash exact duplicates (keeping the "
+            "newest), --media-only to prune non-media files and consolidate "
+            "extensions, --move-to DIR (with --media-only) to move the "
+            "non-media files to a folder instead of trashing them, and "
+            "--fix-extensions (with --media-only) to add/update missing "
+            "extensions. Works for images and videos."
         ),
     )
     _add_common(p_bootstrap)
@@ -4099,10 +4415,20 @@ def main(argv: list[str] | None = None) -> int:
     p_bootstrap.add_argument("--fix-extensions", action="store_true",
                              help="with --media-only: detect and add/update missing "
                                   "extensions (e.g. IMG_1234 -> IMG_1234.jpg)")
+    p_bootstrap.add_argument("--no-check", action="store_true",
+                             help="skip the loadability check that normally "
+                                  "follows the inventory")
+    p_bootstrap.add_argument("--quarantine", default=".media-match-quarantine",
+                             metavar="DIR",
+                             help="folder for corrupt files found by the "
+                                  "loadability check, relative to root "
+                                  "(default: .media-match-quarantine)")
     p_bootstrap.add_argument("--video", action="store_true",
                              help="include videos (probed with ffprobe)")
     p_bootstrap.add_argument("--yes", action="store_true",
-                             help="execute file operations without asking")
+                             help="execute file operations and check repairs "
+                                  "without asking")
+    _add_progress_flag(p_bootstrap)
     p_bootstrap.set_defaults(func=cmd_bootstrap)
 
     p_export = sub.add_parser(
@@ -4205,7 +4531,8 @@ def main(argv: list[str] | None = None) -> int:
     # '<command> help') report it as unknown.
     for name, parser_obj in (
         ("analyze", p_analyze), ("scan", p_scan), ("describe", p_describe),
-        ("search", p_search), ("embed", p_embed), ("similar", p_sim),
+        ("search", p_search), ("embed", p_embed), ("classify", p_classify),
+        ("similar", p_sim),
         ("duplicates", p_dup), ("folders", p_folders),
         ("clean", p_clean), ("restore", p_restore),
         ("refine", p_refine), ("people", p_people), ("tags", p_tags),

@@ -10,10 +10,10 @@ def _vec(*values):
     return v / np.linalg.norm(v)
 
 
-def _add(db, path, vec, keywords, sha1):
+def _add(db, path, vec, keywords, sha1, description="a test photo"):
     db.upsert_file(
         path=path, size=10, mtime=1.0, sha1=sha1, width=100, height=80,
-        phash="0" * 16, description="", keywords=keywords,
+        phash="0" * 16, description=description, keywords=keywords,
         embedding=vec.tobytes(),
     )
 
@@ -106,3 +106,18 @@ def test_cluster_by_similarity_keeps_singletons():
     assert labels[0] == labels[1]
     assert labels[2] not in (labels[0],)
     assert len(set(labels)) == 2
+
+
+def test_refine_requires_descriptions(tmp_path, capsys):
+    """Refinement needs captions; an undescribed tree must say so, not no-op."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    db = Database(str(root / ".media-match.db"))
+    _add(db, str(root / "a.jpg"), _vec(1.0, 0.0), "woman, jacket", "a1",
+         description="")
+    db.close()
+
+    assert cli.main(["refine", str(root)]) == 1
+    err = capsys.readouterr().err
+    assert "No descriptions" in err
+    assert "media-match describe" in err
