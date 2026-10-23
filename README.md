@@ -440,15 +440,12 @@ the same order `media-match help` uses.
 
 ### Get oriented
 
-what this is, what is installed, what the index holds
+what this is and what is installed
 
 | Command | What it does | Key options |
 |---|---|---|
 | `help [command]` | the full guide: every command, every flag with its default, and a runnable example | optional command name |
-| `about` | what the program does, licence and links; `about bench` measures this machine and recommends `--batch`/`--io-workers`/`--workers` | `bench`, `ROOT`, `--files`, `--repeat`, `--clip-model`, `--video` |
-| `info [root]` | models in use, when the index was last scanned, free disk space | `--db` |
-| `version` | version, licence and author | |
-| `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters, dates, duplicates, reclaimable space | `--json` |
+| `about [root]` | one command for everything about the program: what it does, its version, the models it uses, what the index at `root` holds, free disk space, support links and the licence text. `about bench` measures this machine and recommends `--batch`/`--io-workers`/`--workers` | `bench`, `ROOT`, `--db`, `--files`, `--repeat`, `--clip-model`, `--video` |
 
 ### Build the index
 
@@ -513,6 +510,7 @@ the index database itself, not your media files
 |---|---|---|
 | `export [root]` | dump the index (path, kind, size, capture date, camera, description, keywords, type, tags, cluster, duration) | `--format` (json/csv/md, default json), `--out`, `--start-id`/`--stop-id` |
 | `reset [root]` | delete the index database (media files are never touched); the next `scan` rebuilds from scratch | `--yes` |
+| `stats [root]` | index info: models, described/embedded coverage, tags/types/clusters, dates, duplicates, reclaimable space — after the initial scans this is what changes, so it lives here with the other index commands | `--json` |
 
 #### ID windows
 
@@ -528,7 +526,7 @@ selects indexed rows only — run `scan --quick` first to give every file an id.
 range. `--prune` always reconciles the whole index even when a window is set.
 Commands that do not take a window, and why: `restore` (trash batches, not
 media ids), `bootstrap` (its own re-numbered table), `people` (rebuilds every
-cluster, so a partial run would erase the rest), `tags`/`stats`/`info`
+cluster, so a partial run would erase the rest), `tags`/`stats`/`about`
 (whole-index aggregates).
 
 Basic rows from `--quick` carry no hashes, so they never enter duplicate

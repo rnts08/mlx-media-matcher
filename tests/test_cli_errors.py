@@ -154,3 +154,30 @@ def test_unknown_flag_is_argparse_neat(tmp_path):
     assert code == 2
     assert "unrecognized arguments" in err
     assert "Traceback" not in err
+
+
+def test_tuning_flags_reject_zero_and_negative(tmp_path):
+    # A falsy value must not fall back to its default silently: 0 workers,
+    # 0 batch or a 0-second keyframe interval are mistakes, and the
+    # `x if x is not None else default` / `x or default` fallbacks would
+    # otherwise hide them.
+    root = _tree(tmp_path)
+    for argv in (
+        ["scan", str(root), "--limit", "0"],
+        ["scan", str(root), "--limit", "-3"],
+        ["scan", str(root), "--batch", "0"],
+        ["scan", str(root), "--workers", "0"],
+        ["scan", str(root), "--io-workers", "-1"],
+        ["scan", str(root), "--interval", "0"],
+        ["scan", str(root), "--max-frames", "0"],
+        ["scan", str(root), "--describe-batch", "0"],
+        ["analyze", str(root), "--describe-workers", "0"],
+        ["describe", str(root), "--describe-workers", "0"],
+        ["embed", str(root), "--batch", "0"],
+        ["about", "bench", "--files", "0"],
+        ["about", "bench", "--repeat", "0"],
+    ):
+        code, _out, err = _main(argv)
+        assert code == 2, argv
+        assert "positive" in err, argv
+        assert "Traceback" not in err, argv

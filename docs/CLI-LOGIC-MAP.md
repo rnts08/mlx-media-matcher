@@ -89,10 +89,14 @@ Cross-cutting flags (`--db`, `--start-id`/`--stop-id`, `--json`,
 media-match
 ├── orientation
 │   ├── `help` [COMMAND]
-│   ├── `about` [bench [ROOT]]
-│   ├── `info` [ROOT]
-│   ├── `version`
-│   └── `stats` [ROOT]
+│   └── `about` [bench [ROOT] | ROOT]
+│       ├── --db                    index to summarise
+│       ├── bench [ROOT]            benchmark this machine instead
+│       │   ├── --files N
+│       │   ├── --repeat N
+│       │   ├── --clip-model ID
+│       │   └── --video
+│       └── (0.4.x aliases, hidden: `info` [ROOT], `version`)
 │
 ├── build the index
 │   ├── `bootstrap` [ROOT]
@@ -165,7 +169,8 @@ media-match
 │
 └── index maintenance
     ├── `export` [ROOT]               dump the index: json / csv / md
-    └── `reset` [ROOT]                  delete the database only
+    ├── `reset` [ROOT]                delete the database only
+    └── `stats` [ROOT]                index statistics (media, compute, formats)
 ```
 
 ## 3. Command or argument?
@@ -186,6 +191,8 @@ stage selection.
 | `duplicates` vs `clean` | report vs destructive action | **keep separate**. Never make `duplicates --clean`; the destructive step needs its own confirmation surface. |
 | `folders --list/--collapse` | modes of one filesystem operation | **keep as flags**. |
 | `people --label` | a write mode on the cluster listing | **keep as a flag**. The command is still "people". |
+| `about` vs `info` vs `version` | three commands answering "what is this / what is installed" | **collapse into `about`** (0.4.7). `about [ROOT]` shows blurb, version, models, index summary, storage, support and licence; `about bench` benchmarks. `info`/`version` stay runnable as hidden 0.4.x aliases, not in the guide. |
+| `stats` in "get oriented" | index statistics read like orientation | **move to index maintenance** (0.4.7). After the initial scans, stats changes only when the index is maintained, so it belongs next to `export` and `reset`. |
 | `about bench` | benchmark topic of program information | **keep as a topic**. `bench` is not a media lifecycle stage. |
 | `export-metadata` / `import-metadata` / `clear-metadata` | a metadata command family | **keep for now**. A `metadata export|import|clear` namespace is cosmetic and would break scripts. |
 | `export` vs `export-metadata` | index dump vs editable metadata | **keep distinct names**. They answer different questions. |

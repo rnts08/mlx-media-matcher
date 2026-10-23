@@ -46,6 +46,19 @@ from .clip import DEFAULT_CLIP_MODEL
 from .video_groups import find_video_duplicate_groups, find_video_similarity_groups
 from .video_search import best_moment, format_timestamp
 
+# The Hugging Face loader draws its download bars with tqdm, whose TMonitor
+# would otherwise leave a daemon thread behind after every command that loads
+# a model. This tool is a foreground CLI and must stay background-free: a
+# stray thread shows up in process inspectors and survives into frozen
+# builds. tqdm's own switch for this is monitor_interval = 0 (its monitor
+# only refreshes bar display, which the loader does not need).
+try:
+    import tqdm as _tqdm
+
+    _tqdm.tqdm.monitor_interval = 0
+except ImportError:  # pragma: no cover - tqdm ships with the HF hub loader
+    pass
+
 _mp = lambda w, h: f"{w * h / 1_000_000:.1f}MP"
 
 # TODO(audio): keep audio as a kind flag (`--audio`) on the existing lifecycle
@@ -3389,10 +3402,17 @@ _COMMAND_SUMMARIES = {
     "check": "check which media files are loadable, and offer to repair them",
     "bootstrap": "first pass: walk the tree, record filename/type/size in the index",
     "stats": "show index statistics (media, compute, formats)",
-    "about": "show what this program does, its license and project links",
-    "version": "print version, license and author",
-    "info": "print program information (models, last scan, storage)",
+    "about": "version, licence, models, index summary and project links",
+    "version": "legacy alias for 'about' (version, licence, author)",
+    "info": "legacy alias for 'about' (models, last scan, storage)",
     "help": "show this guide; 'help <cmd>' describes one command",
+}
+
+# 0.4.x compatibility: these commands still run, but the guide points at
+# 'about'. They are excluded from the grouped listing and startup validation.
+_LEGACY_COMMANDS: dict[str, str] = {
+    "info": "about",
+    "version": "about",
 }
 
 # A runnable example per command, shown in `media-match help <cmd>`.
@@ -3527,8 +3547,8 @@ def _command_section(name: str) -> str:
 # Each entry is (heading, one-line purpose, commands in reading order).
 _COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("get oriented",
-     "what this is, what is installed, what the index holds",
-     ("help", "about", "info", "version", "stats")),
+     "what this is and what is installed",
+     ("help", "about")),
     ("build the index",
      "first pass over a folder: inventory it, index it, confirm it loads",
      ("bootstrap", "scan", "check")),
@@ -3546,7 +3566,7 @@ _COMMAND_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
      ("export-metadata", "import-metadata", "clear-metadata")),
     ("index maintenance",
      "the index database itself, not your media files",
-     ("export", "reset")),
+     ("export", "reset", "stats")),
 )
 
 
@@ -3557,11 +3577,15 @@ def _print_full_help() -> None:
         "commands, grouped by what they are for:",
         "",
     ]
-    width = max(len(c) for c in _COMMAND_SUMMARIES)
+    # Column width comes from advertised commands only; legacy aliases are
+    # hidden and must not affect the layout.
+    visible = {n: s for n, s in _COMMAND_SUMMARIES.items()
+               if n not in _LEGACY_COMMANDS}
+    width = max(len(c) for c in visible)
     for heading, purpose, names in _COMMAND_GROUPS:
         lines.append(f"{heading}: {purpose}")
         for name in names:
-            lines.append(f"  {name:<{width}}  {_COMMAND_SUMMARIES[name]}")
+            lines.append(f"  {name:<{width}}  {visible[name]}")
         lines.append("")
     lines += [
         "Every command accepts --db to override the index location and takes a",
@@ -3654,26 +3678,68 @@ def _license_text() -> str:
     return f"{_LICENSE}\nFull text: {_LICENSE_URL}"
 
 
+def _info_lines(root: str, db_path: str | None) -> list[str]:
+    """What is installed and what the index at `root` holds, as label lines.
+
+    Shared by `about` (the single orientation command) and the 0.4.x legacy
+    `info` alias, so the two never drift apart.
+    """
+    lines = [
+        f"Model engine: CLIP on Apple MLX (local, no cloud)",
+        f"Models:       {DEFAULT_CLIP_MODEL} (CLIP embeddings)",
+        f"              {DEFAULT_MODEL} (vision captions)",
+    ]
+    db = open_db(root, db_path, create=False)
+    if db is not None:
+        summary = db.scan_summary()
+        if summary["scans"]:
+            lines.append(f"Last scan:    {summary['last_scan_at'] or 'unknown'} "
+                         f"({summary['scans']} run(s), {summary['items']} items, "
+                         f"{_fmt_seconds(summary['wall'])} wall, "
+                         f"{_fmt_seconds(summary['gpu'])} gpu)")
+        else:
+            lines.append("Last scan:    no scan runs recorded yet")
+        db.close()
+    else:
+        lines.append("Last scan:    no index at this folder yet")
+    lines.append(f"Free storage: {_free_storage(root)}")
+    return lines
+
+
 def cmd_about(args: argparse.Namespace) -> int:
     # 'about bench' measures this machine instead of printing the blurb, so
     # the tuning advice lives next to what the program says about itself.
-    if (getattr(args, "topic", None) or "").lower() in ("bench", "benchmark"):
+    topic = (getattr(args, "topic", None) or "").strip()
+    root_arg = getattr(args, "root", None)
+    if topic.lower() in ("bench", "benchmark"):
+        args.root = root_arg
         return cmd_bench(args)
-    text = (
-        f"{_ABOUT_BLURB}\n"
-        "\n"
-        f"Version:    {_VERSION}\n"
-        f"Author:     {_AUTHOR}\n"
-        f"License:    {_LICENSE}\n"
-        f"Repository: {_REPO}\n"
-        f"Report:     {_ISSUES_URL}\n"
-        f"Support:    media-match info\n"
-        "\n"
-        "License text\n"
-        "------------\n"
-        f"{_license_text()}"
-    )
-    _page(text)
+    if root_arg is not None:
+        print("Give 'about' one folder, or 'bench' with a folder — not two "
+              "paths.", file=sys.stderr)
+        return 2
+    root = os.path.abspath(topic or ".")
+    # A typo'd folder should be named, not answered with "no index at <path>"
+    # and an n/a storage line — same rule as 'scan <typo>'.
+    if not _require_root(root):
+        return 2
+    lines = [
+        _ABOUT_BLURB,
+        "",
+        f"Version:      {_VERSION}",
+        f"Author:       {_AUTHOR}",
+        f"License:      {_LICENSE}",
+        f"Repository:   {_REPO}",
+        f"Report:       {_ISSUES_URL}",
+        *_info_lines(root, getattr(args, "db", None)),
+        "",
+        *_SUPPORT_LINES,
+        "",
+        "License text",
+        "------------",
+        _license_text(),
+    ]
+    _page("\n".join(lines))
     return 0
 
 
@@ -3788,25 +3854,8 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"License:      {_LICENSE}")
     print(f"Author:       {_AUTHOR}")
     print(f"Repository:   {_REPO}")
-    print(f"Model engine: CLIP on Apple MLX (local, no cloud)")
-    print(f"Models:       {DEFAULT_CLIP_MODEL} (CLIP embeddings)")
-    print(f"              {DEFAULT_MODEL} (vision captions)")
-
-    db = open_db(root, args.db, create=False)
-    if db is not None:
-        summary = db.scan_summary()
-        if summary["scans"]:
-            print(f"Last scan:    {summary['last_scan_at'] or 'unknown'} "
-                  f"({summary['scans']} run(s), {summary['items']} items, "
-                  f"{_fmt_seconds(summary['wall'])} wall, "
-                  f"{_fmt_seconds(summary['gpu'])} gpu)")
-        else:
-            print("Last scan:    no scan runs recorded yet")
-        db.close()
-    else:
-        print("Last scan:    no index at this folder yet")
-
-    print(f"Free storage: {_free_storage(root)}")
+    for line in _info_lines(root, args.db):
+        print(line)
     print()
     for line in _SUPPORT_LINES:
         print(line)
@@ -3823,6 +3872,16 @@ def _positive_int(text: str) -> int:
         raise argparse.ArgumentTypeError("expected a positive integer") from None
     if value < 1:
         raise argparse.ArgumentTypeError("expected a positive integer")
+    return value
+
+
+def _positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive number") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("expected a positive number")
     return value
 
 
@@ -3946,13 +4005,12 @@ def main(argv: list[str] | None = None) -> int:
             cmd_version(argparse.Namespace())
             return 0
         if token in ("--info", "--about"):
+            # Same as 'about [folder]': the optional path rides in as the
+            # topic so the one-command behaviour applies to both spellings.
             root = None
             if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
                 root = argv[i + 1]
-            if token == "--about":
-                cmd_about(argparse.Namespace())
-            else:
-                cmd_info(argparse.Namespace(root=root or ".", db=None))
+            cmd_about(argparse.Namespace(topic=root, root=None, db=None))
             return 0
 
     parser = argparse.ArgumentParser(
@@ -3960,9 +4018,9 @@ def main(argv: list[str] | None = None) -> int:
         add_help=False,
         epilog=(
             "Run 'media-match help' (or -h/--help) for this guide, "
-            "'media-match help <command>' for one command, "
-            "'media-match version' for version/license, and "
-            "'media-match info [folder]' for program information."
+            "'media-match help <command>' for one command, and "
+            "'media-match about [folder]' for version, models, index "
+            "summary, licence and links."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3976,11 +4034,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--info", action="store_true",
-        help="print program information (models, last scan, free storage)",
+        help="same as 'about': version, models, index summary, licence, links",
     )
     parser.add_argument(
         "--about", action="store_true",
-        help="show what the program does, its license and project links",
+        help="same as 'about': version, models, index summary, licence, links",
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>",
                             parser_class=_CommandParser)
@@ -4025,27 +4083,27 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--clip-model", default=None,
                         help="CLIP model for embeddings (default: index "
                              f"'clip_model', config 'clip_model', or {DEFAULT_CLIP_MODEL})")
-    p_scan.add_argument("--batch", type=int, default=None,
+    p_scan.add_argument("--batch", type=_positive_int, default=None,
                         help="CLIP batch size (default: 16, or config 'batch')")
-    p_scan.add_argument("--workers", type=int, default=None,
+    p_scan.add_argument("--workers", type=_positive_int, default=None,
                         help="parallel CPU prep threads feeding the GPU "
                              "(default: 4, or config 'workers')")
-    p_scan.add_argument("--io-workers", type=int, default=None,
+    p_scan.add_argument("--io-workers", type=_positive_int, default=None,
                         help="reader threads feeding the ring buffer from disk "
                              "(default: 2)")
-    p_scan.add_argument("--describe-batch", type=int, default=None,
+    p_scan.add_argument("--describe-batch", type=_positive_int, default=None,
                         help="VLM batch size: caption N frames per forward pass "
                              "(default: 1, higher is faster but uses more memory)")
-    p_scan.add_argument("--interval", type=float, default=None,
+    p_scan.add_argument("--interval", type=_positive_float, default=None,
                         help="target seconds between video keyframes "
                              "(default: 1.0, or config 'interval')")
-    p_scan.add_argument("--max-frames", type=int, default=None,
+    p_scan.add_argument("--max-frames", type=_positive_int, default=None,
                         help="cap on keyframes per video (default: 120, or config 'max_frames')")
     p_scan.add_argument("--quick", action="store_true",
                         help="only stat files and create basic index rows "
                              "(path/size/mtime); no hashes, EXIF, pHash or CLIP")
     _add_id_range(p_scan)
-    p_scan.add_argument("--limit", type=int,
+    p_scan.add_argument("--limit", type=_positive_int,
                         help="only scan first N media items (with --quick, "
                              "insert at most N new rows; with --start-id, cap "
                              "the selected window)")
@@ -4095,30 +4153,30 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze.add_argument("--clip-model", default=None,
                            help="CLIP model for embeddings (default: index "
                                 f"'clip_model', config 'clip_model', or {DEFAULT_CLIP_MODEL})")
-    p_analyze.add_argument("--batch", type=int, default=None,
+    p_analyze.add_argument("--batch", type=_positive_int, default=None,
                            help="CLIP batch size (default: 16, or config 'batch')")
-    p_analyze.add_argument("--workers", type=int, default=None,
+    p_analyze.add_argument("--workers", type=_positive_int, default=None,
                            help="parallel CPU prep threads feeding the GPU "
                                 "(default: 4, or config 'workers')")
-    p_analyze.add_argument("--describe-workers", type=int, default=None,
+    p_analyze.add_argument("--describe-workers", type=_positive_int, default=None,
                            metavar="N",
                            help="CPU threads prefetching frames for the VLM "
                                 "(default: 2-4, bounded by --workers)")
-    p_analyze.add_argument("--describe-batch", type=int, default=None,
+    p_analyze.add_argument("--describe-batch", type=_positive_int, default=None,
                            metavar="N",
                            help="VLM batch size: caption N frames per forward pass "
                                 "(default: 1, higher is faster but uses more memory)")
-    p_analyze.add_argument("--io-workers", type=int, default=None,
+    p_analyze.add_argument("--io-workers", type=_positive_int, default=None,
                            metavar="N",
                            help="reader threads feeding the ring buffer from disk "
                                 "(default: 2)")
-    p_analyze.add_argument("--interval", type=float, default=None,
+    p_analyze.add_argument("--interval", type=_positive_float, default=None,
                            help="target seconds between video keyframes "
                                 "(default: 1.0, or config 'interval')")
-    p_analyze.add_argument("--max-frames", type=int, default=None,
+    p_analyze.add_argument("--max-frames", type=_positive_int, default=None,
                            help="cap on keyframes per video (default: 120, or config 'max_frames')")
     _add_id_range(p_analyze)
-    p_analyze.add_argument("--limit", type=int,
+    p_analyze.add_argument("--limit", type=_positive_int,
                            help="only scan the first N media items; the later "
                                 "stages still cover the index (or the id "
                                 "window)")
@@ -4151,7 +4209,7 @@ def main(argv: list[str] | None = None) -> int:
                                  f"'vlm_model', config 'model', or {DEFAULT_MODEL})")
     p_describe.add_argument("--video", action="store_true",
                             help="include videos (needs ffmpeg)")
-    p_describe.add_argument("--describe-workers", type=int, default=None,
+    p_describe.add_argument("--describe-workers", type=_positive_int, default=None,
                             metavar="N",
                             help="CPU threads prefetching frames "
                                  "(default: 3)")
@@ -4229,7 +4287,7 @@ def main(argv: list[str] | None = None) -> int:
     p_embed.add_argument("--clip-model", default=None,
                          help="CLIP model (default: the model recorded in the "
                               "index, then the configured/default model)")
-    p_embed.add_argument("--batch", type=int, default=16, help="batch size")
+    p_embed.add_argument("--batch", type=_positive_int, default=16, help="batch size")
     p_embed.add_argument("--recompute", action="store_true",
                          help="recompute embeddings even if present")
     _add_progress_flag(p_embed)
@@ -4697,9 +4755,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_about = sub.add_parser(
         "about",
-        help="show what this program does, its license and project links",
+        help="what this program does, what is installed, licence and links",
         description=(
-            "Print what media-match is for, who wrote it, where the source "
+            "Print what media-match is for, its version, the models it uses, "
+            "what the index at a folder holds, who wrote it, where the source "
             "lives, and the licence it ships under.\n"
             "\n"
             "With 'bench', measure this machine instead: it times disk reads, "
@@ -4708,16 +4767,18 @@ def main(argv: list[str] | None = None) -> int:
             "--workers. Nothing is indexed and no file is changed."
         ),
     )
-    p_about.add_argument("topic", nargs="?", metavar="TOPIC",
-                         choices=("bench",),
-                         help="'bench' to benchmark this machine (default: "
-                              "print the blurb)")
+    p_about.add_argument("topic", nargs="?", metavar="TOPIC|ROOT",
+                         help="'bench' to benchmark this machine, or a media "
+                              "folder to summarise its index (default: print "
+                              "about the current folder)")
     p_about.add_argument("root", nargs="?", metavar="ROOT",
                          help="with 'bench': a folder of real media to benchmark "
                               "against (default: a synthetic corpus)")
-    p_about.add_argument("--files", type=int, default=32, metavar="N",
+    p_about.add_argument("--db", help="index database path "
+                         "(default: <root>/.media-match.db)")
+    p_about.add_argument("--files", type=_positive_int, default=32, metavar="N",
                          help="with 'bench': how many files to use (default: 32)")
-    p_about.add_argument("--repeat", type=int, default=1, metavar="N",
+    p_about.add_argument("--repeat", type=_positive_int, default=1, metavar="N",
                          help="with 'bench': run each configuration N times and "
                               "keep the best (default: 1)")
     p_about.add_argument("--clip-model", default=None,
@@ -4776,11 +4837,14 @@ def main(argv: list[str] | None = None) -> int:
     # Every command must appear in exactly one guide group: missing means the
     # guide hides it, duplicated means it is listed twice under different
     # headings — which is how 'check' and 'export' came out ambiguous before.
+    # Legacy aliases (0.4.x spellings of 'about') stay runnable but are not
+    # advertised, so they are exempt from the grouping check.
     grouped = [n for _h, _p, names in _COMMAND_GROUPS for n in names]
-    unknown = sorted(set(grouped) - set(_COMMAND_SUMMARIES))
+    visible = set(_COMMAND_SUMMARIES) - set(_LEGACY_COMMANDS)
+    unknown = sorted(set(grouped) - visible)
     if unknown:
         raise RuntimeError(f"guide groups name unknown commands: {unknown}")
-    ungrouped = sorted(set(_COMMAND_SUMMARIES) - set(grouped))
+    ungrouped = sorted(visible - set(grouped))
     if ungrouped:
         raise RuntimeError(f"commands missing from the guide groups: {ungrouped}")
     duplicated = sorted({n for n in grouped if grouped.count(n) > 1})

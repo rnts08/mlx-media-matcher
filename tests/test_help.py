@@ -38,8 +38,10 @@ def test_help_groups_commands_by_workflow_not_alphabetically(capsys):
     assert cli.main(["help"]) == 0
     out = capsys.readouterr().out
     positions = [out.index(f"  {n} ") for n in
-                 ("help", "about", "info", "version", "stats")]
+                 ("help", "about")]
     assert positions == sorted(positions), "first group is not in reading order"
+    # 'stats' moved down into index maintenance, after the orientation block
+    assert out.index("  stats ") > out.index("  about ")
     # a command whose name sorts early must not appear first
     assert out.index("  scan ") > out.index("  help ")
 
@@ -138,11 +140,13 @@ def test_flag_lines_have_no_ragged_spacing():
 
 def test_every_command_appears_in_exactly_one_guide_group():
     grouped = [n for _h, _p, names in cli._COMMAND_GROUPS for n in names]
-    assert sorted(grouped) == sorted(cli._COMMAND_SUMMARIES)
+    # Legacy 0.4.x aliases stay runnable but are not advertised.
+    visible = set(cli._COMMAND_SUMMARIES) - set(cli._LEGACY_COMMANDS)
+    assert sorted(grouped) == sorted(visible)
     # 'check' and 'export' each appeared under two headings in the first
     # draft of the grouping, which left it ambiguous where to look for them.
     assert len(grouped) == len(set(grouped)), "a command is listed twice"
-    assert not set(grouped) - set(cli._COMMAND_SUMMARIES)
+    assert not set(grouped) - set(visible)
 
 
 def test_main_refuses_to_start_with_a_misgrouped_command(monkeypatch):

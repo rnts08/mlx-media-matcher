@@ -87,3 +87,18 @@ def test_cache_loads_caption_once(monkeypatch, capsys):
     assert first is second
     assert first.loads == 1
     assert "loading fake/vlm" in capsys.readouterr().err
+
+
+def test_cli_stays_background_free_no_tqdm_monitor_thread():
+    # 'media-match' is a foreground CLI: no thread it starts may outlive a
+    # command. tqdm (pulled in by the Hugging Face loader) starts a TMonitor
+    # daemon thread on the first bar unless monitor_interval is 0; cli.py
+    # switches that off at import so model downloads leave nothing behind.
+    import threading
+
+    import tqdm
+
+    from media_match import cli  # noqa: F401  (the guard lives at import)
+
+    assert tqdm.tqdm.monitor_interval == 0
+    assert [t.name for t in threading.enumerate()] == ["MainThread"]
